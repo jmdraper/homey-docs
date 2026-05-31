@@ -1,0 +1,148 @@
+{
+  "id": "com.draper.homey-docs",
+  "version": "1.0.4",
+  "compatibility": ">=12.0.0",
+  "sdk": 3,
+  "platforms": [
+    "local"
+  ],
+  "name": {
+    "en": "Homey Docs Companion"
+  },
+  "description": {
+    "en": "Flow change tracking, cross-reference viewer, and AI assistant integration for Homey Pro."
+  },
+  "category": "tools",
+  "permissions": [
+    "homey:manager:api"
+  ],
+  "images": {
+    "small": "./assets/images/small.png",
+    "large": "./assets/images/large.png"
+  },
+  "author": {
+    "name": "Jonathan Draper"
+  },
+  "brandColor": "#2d6cdf",
+  "flow": {
+    "triggers": [
+      {
+        "id": "sync_completed",
+        "title": {
+          "en": "Documentation sync completed"
+        },
+        "hint": {
+          "en": "Fires when an AI assistant has finished syncing Homey documentation. Use this to trigger follow-up actions after a sync."
+        }
+      }
+    ],
+    "actions": [
+      {
+        "id": "regenerate_xref",
+        "title": {
+          "en": "Update cross-reference index"
+        },
+        "hint": {
+          "en": "Rebuilds the cross-reference viewer showing which flows use each variable, FlowBits event, timer, and label. The viewer is accessible at http://[homey-ip]:8734/ on your local network."
+        }
+      }
+    ]
+  },
+  "settings": [
+    {
+      "id": "xref_port",
+      "type": "text",
+      "title": {
+        "en": "Cross-reference viewer port"
+      },
+      "value": "8734",
+      "hint": {
+        "en": "Local network port for the cross-reference viewer (http://[homey-ip]:8734/). Change this if port 8734 is already in use. Restart the app after changing."
+      }
+    },
+    {
+      "id": "mcp_port",
+      "type": "text",
+      "title": {
+        "en": "AI assistant (MCP) server port"
+      },
+      "value": "8735",
+      "hint": {
+        "en": "Local network port for the MCP server used by AI assistants such as Claude. Change this if port 8735 is already in use. Restart the app after changing."
+      }
+    },
+    {
+      "id": "xref_base_url",
+      "type": "text",
+      "title": {
+        "en": "Homey web app URL"
+      },
+      "value": "https://my.homey.app",
+      "hint": {
+        "en": "The root URL used to build links to the Homey flow editor. Leave as default unless you access Homey via a custom domain (e.g. https://homey.example.com). Do not include /web — it is added automatically."
+      }
+    }
+  ],
+  "api": {
+    "changelog": {
+      "method": "GET",
+      "path": "/changelog"
+    },
+    "snapshot": {
+      "method": "GET",
+      "path": "/snapshot"
+    },
+    "flows_metadata": {
+      "method": "GET",
+      "path": "/flows_metadata"
+    },
+    "variables": {
+      "method": "GET",
+      "path": "/variables"
+    },
+    "devices": {
+      "method": "GET",
+      "path": "/devices"
+    },
+    "apps": {
+      "method": "GET",
+      "path": "/apps"
+    },
+    "zones": {
+      "method": "GET",
+      "path": "/zones"
+    },
+    "clear_changelog": {
+      "method": "DELETE",
+      "path": "/clear_changelog"
+    },
+    "reset_snapshot": {
+      "method": "DELETE",
+      "path": "/reset_snapshot"
+    },
+    "diagnostics": {
+      "method": "GET",
+      "path": "/diagnostics"
+    },
+    "poll": {
+      "method": "POST",
+      "path": "/poll"
+    },
+    "flow_snapshot": {
+      "method": "GET",
+      "path": "/flow_snapshot"
+    },
+    "app_actions": {
+      "method": "GET",
+      "path": "/app_actions"
+    },
+    "sync_complete": {
+      "method": "POST",
+      "path": "/sync_complete"
+    },
+    "cross_references": {
+      "method": "GET",
+      "path": "/cross_references"
+    }
+  }
+}

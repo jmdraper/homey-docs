@@ -1,0 +1,15 @@
+{
+  "name": "homey-docs-companion",
+  "version": "1.0.0",
+  "description": "Tracks Homey changes for documentation sync",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "devDependencies": {
+    "homey": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

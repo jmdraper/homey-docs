@@ -1,0 +1,17 @@
+{
+  "1.0.0": {
+    "en": "Initial release. Tracks changes to flows, devices, variables, and zones. Includes a local cross-reference viewer showing which flows use each variable, FlowBits event, label, timer, and programmatic trigger. Provides an MCP server for AI assistant integration (Claude)."
+  },
+  "1.0.1": {
+    "en": "Fixed AI prompt scope"
+  },
+  "1.0.2": {
+    "en": "Actually fixed the AI prompt text scope this time"
+  },
+  "1.0.3": {
+    "en": "Added Better Logic Library (BLL) variable support: BLL variables now appear in list_variables and have their own tab in the cross-reference viewer, showing which flows trigger on, check, or write each BLL variable."
+  },
+  "1.0.4": {
+    "en": "Fixed Flow triggers tab in the cross-reference index"
+  }
+}
