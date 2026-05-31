@@ -13,5 +13,8 @@
   },
   "1.0.4": {
     "en": "Fixed Flow triggers tab in the cross-reference index"
+  },
+  "1.0.5": {
+    "en": "Added public repo link"
   }
 }
