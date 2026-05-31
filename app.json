@@ -23,6 +23,7 @@
   "author": {
     "name": "Jonathan Draper"
   },
+  "source": "https://github.com/jmdraper/homey-docs",
   "brandColor": "#2d6cdf",
   "flow": {
     "triggers": [
