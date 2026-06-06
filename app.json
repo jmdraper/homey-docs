@@ -143,7 +143,8 @@
     },
     "cross_references": {
       "method": "GET",
-      "path": "/cross_references"
+      "path": "/cross_references",
+      "public": true
     }
   }
 }
