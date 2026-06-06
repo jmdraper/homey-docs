@@ -425,6 +425,7 @@ function startLogin() {
     `${ATHOM_API}/oauth2/authorise?response_type=code` +
     `&client_id=${encodeURIComponent(CLIENT_ID)}` +
     `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+    `&scope=${encodeURIComponent('homey.user.self homey.app.readonly')}` +
     `&state=${encodeURIComponent(state)}`;
 }
 
