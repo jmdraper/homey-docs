@@ -3,7 +3,7 @@ Homey Docs Companion tracks changes to your flows, devices, variables, and zones
 
 CROSS-REFERENCE VIEWER
 
-Shows which flows use each variable, FlowBits event, label, timer, and programmatic trigger. Use it to answer questions like "which flows write to this variable?" or "what fires this FlowBits event?" without reading through every flow individually.
+Shows which flows use each variable (Homey or Better Logic Library), FlowBits event, label, timer, and programmatic trigger. Use it to answer questions like "which flows write to this variable?" or "what fires this FlowBits event?" without reading through every flow individually.
 
 Flows link directly to the Homey flow editor. The viewer has a search filter, collapsible entries, and role badges (reads, writes, triggers on, fires, checks, etc.) with tooltip descriptions.
 
