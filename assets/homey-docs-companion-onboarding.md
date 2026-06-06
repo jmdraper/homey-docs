@@ -78,7 +78,6 @@ Every documentation file must have this YAML frontmatter at the top. Use this
 exact flat structure — do not use nested YAML objects, as some markdown tools
 don't handle them reliably.
 
-```yaml
 ---
 flow_ids:
   - 00000000-0000-0000-0000-000000000001
@@ -88,7 +87,6 @@ flow_hashes:
   - "00000000-0000-0000-0000-000000000002: Example flow two | disabled | cards:7 | hash:e5f6a7b8"
 last_synced: "2026-05-24T10:30:00Z"
 ---
-```
 
 The `flow_hashes` list uses a compact string format so each flow's state is
 readable in plain text and works in any markdown tool. The format is:
@@ -224,7 +222,6 @@ before you move on.
 
 Once all areas are documented, output a "homey-flow-manifest.md" file with:
 
-```markdown
 ---
 last_synced: [current ISO datetime]
 ---
@@ -246,13 +243,11 @@ Central index of all documented Homey flows.
 [empty for now]
 | Flow ID | Flow name | Was in file | Deleted at |
 |---|---|---|---|
-```
 
 ## Step 5 — Create the change log
 
 Output a "homey-change-log.md" file:
 
-```markdown
 ---
 last_synced: [current ISO datetime]
 ---
@@ -263,7 +258,6 @@ Entries added automatically during sync. ✅ = documented, ⏳ = pending.
 
 ## [today's date]
 Initial documentation created.
-```
 
 ## Keeping documentation up to date
 
