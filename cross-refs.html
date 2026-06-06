@@ -479,7 +479,7 @@ async function getHomeySession(accessToken) {
   if (!homey) throw new Error('No Homey found on this account');
   const remoteUrl = homey.remoteUrl;
 
-  const delegationRes = await fetch(`${ATHOM_API}/delegation/token?audience=homey`, {
+  const delegationRes = await fetch(`${ATHOM_API}/delegation/token?audience=homey&scope=${encodeURIComponent('homey.app.readonly')}`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${accessToken}` },
   });
