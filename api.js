@@ -66,7 +66,19 @@ module.exports = {
   },
 
   async cross_references({ homey }) {
-    return await homey.app.getCrossReferences();
+    const data = await homey.app.getCrossReferences();
+    const flowTypes = {};
+    for (const [id, f] of Object.entries(homey.app.snapshot.flows)) {
+      flowTypes[id] = f.isAdvanced ? 'advanced' : 'basic';
+    }
+    return {
+      data,
+      meta: {
+        homeyId: homey.app._homeyId || null,
+        flowTypes,
+        mcpPort: homey.app._mcpPort || 8735,
+      },
+    };
   },
 
 };

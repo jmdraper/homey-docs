@@ -3,9 +3,29 @@ Homey Docs Companion tracks changes to your flows, devices, variables, and zones
 
 CROSS-REFERENCE VIEWER
 
-A local web page (accessible at http://[homey-ip]:8734/) showing which flows use each variable, FlowBits event, label, timer, and programmatic trigger. Use it to answer questions like "which flows write to this variable?" or "what fires this FlowBits event?" without reading through every flow individually.
+Shows which flows use each variable, FlowBits event, label, timer, and programmatic trigger. Use it to answer questions like "which flows write to this variable?" or "what fires this FlowBits event?" without reading through every flow individually.
 
 Flows link directly to the Homey flow editor. The viewer has a search filter, collapsible entries, and role badges (reads, writes, triggers on, fires, checks, etc.) with tooltip descriptions.
+
+
+ACCESSING THE CROSS-REFERENCE VIEWER
+
+Option A — Via GitHub Pages (recommended, works in all browsers including Safari)
+
+  https://jmdraper.github.io/homey-docs/cross-refs.html
+
+  Log in with your Athom account when prompted. Your session is remembered so
+  subsequent visits load directly without logging in again.
+
+  Requires the companion app to be installed and running on your Homey.
+
+Option B — Local network (advanced users)
+
+  http://[homey-ip]:8734/
+
+  Works in Chrome and Firefox on your local network without any additional setup.
+  Safari requires either a reverse proxy providing HTTPS, or a one-time insecure
+  content exception in Safari Settings → Websites.
 
 
 AI ASSISTANT INTEGRATION (MCP)
