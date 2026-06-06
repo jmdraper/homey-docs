@@ -422,7 +422,7 @@ function startLogin() {
   const state = crypto.randomUUID();
   store.set('oauth_state', state);
   window.location.href =
-    `${ATHOM_API}/oauth2/authorise?authorization_type=code` +
+    `${ATHOM_API}/oauth2/authorise?response_type=code` +
     `&client_id=${encodeURIComponent(CLIENT_ID)}` +
     `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
     `&state=${encodeURIComponent(state)}`;
