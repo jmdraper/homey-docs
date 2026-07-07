@@ -19,5 +19,8 @@
   },
   "1.0.6": {
     "en": "Cross-ref index available via public https endpoint as well as local http"
+  },
+  "1.0.7": {
+    "en": "Add caching to fix possible memory leak"
   }
 }
