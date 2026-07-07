@@ -839,6 +839,7 @@ function copyPrompt(){
   async regenerateXrefPage() {
     try {
       const xref = await this.getCrossReferences();
+      this._xrefCache = xref;
       const flowTypes = {};
       for (const [id, f] of Object.entries(this.snapshot.flows)) {
         flowTypes[id] = f.isAdvanced ? 'advanced' : 'basic';
@@ -872,6 +873,17 @@ function copyPrompt(){
   }
 
   // ─── Cross-reference index ───────────────────────────────────────────────────
+
+  // Cheap accessor for callers (public API, MCP tool) that don't need to force
+  // a rebuild — reuses whatever regenerateXrefPage() last computed, falling
+  // back to a one-off build if the cache hasn't been populated yet (e.g. right
+  // after a restart that skipped regeneration because xref_html already existed).
+  async getCachedCrossReferences() {
+    if (!this._xrefCache) {
+      this._xrefCache = await this.getCrossReferences();
+    }
+    return this._xrefCache;
+  }
 
   async getCrossReferences() {
     const result = {

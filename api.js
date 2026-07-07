@@ -66,7 +66,7 @@ module.exports = {
   },
 
   async cross_references({ homey }) {
-    const data = await homey.app.getCrossReferences();
+    const data = await homey.app.getCachedCrossReferences();
     const flowTypes = {};
     for (const [id, f] of Object.entries(homey.app.snapshot.flows)) {
       flowTypes[id] = f.isAdvanced ? 'advanced' : 'basic';

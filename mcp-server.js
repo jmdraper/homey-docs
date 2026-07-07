@@ -473,7 +473,7 @@ class HomeyMcpServer {
           return this._text({ polled: true, changelog: app.changelog.length });
 
         case 'get_cross_references': {
-          const xref = await app.getCrossReferences();
+          const xref = await app.getCachedCrossReferences();
           return this._text(args.type ? { [args.type]: xref[args.type] } : xref);
         }
 
