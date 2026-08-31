@@ -22,5 +22,8 @@
   },
   "1.0.7": {
     "en": "Add caching to fix possible memory leak"
+  },
+  "1.0.8": {
+    "en": "Extended list_devices"
   }
 }
