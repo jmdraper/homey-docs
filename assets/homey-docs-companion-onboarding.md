@@ -144,9 +144,15 @@ this to resolve those IDs to readable names when documenting or updating the
 Dependencies table.
 
 **`list_devices`**
-Returns a map of `{ [device_id]: { name, driverId, zone, available, capabilities[] } }`.
-Flow cards reference devices by ID; use this to resolve IDs to names. Also use
-it to check whether devices mentioned in documentation still exist in Homey.
+Returns an array of devices: `{ id, name, class, capabilities[], available,
+zoneId, zoneName, address, appId }`. `zoneId` is the raw zone ID and `zoneName`
+is already resolved to a readable room name (no need to cross-reference
+`list_zones` just to get a name). `address` is the device's LAN IP/hostname
+when one is known (locally-addressable devices like Shelly), otherwise `null`.
+`appId` is the ID of the app/driver that owns the device (e.g. `cloud.shelly`),
+useful for filtering "all devices from app X". Flow cards reference devices by
+ID; use this to resolve IDs to names. Also use it to check whether devices
+mentioned in documentation still exist in Homey, or to group devices by room.
 
 **`list_apps`**
 Returns a map of `{ [app_id]: { name, version, enabled, crashed } }`. Use when

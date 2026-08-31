@@ -8,6 +8,28 @@ function vals(data) {
   return Array.isArray(data) ? data : Object.values(data);
 }
 
+const PLAUSIBLE_ADDRESS_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
+const ADDRESS_KEYS = ['address', 'ip', 'ipAddress', 'host', 'hostname'];
+
+function findAddress(...sources) {
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue;
+    for (const key of ADDRESS_KEYS) {
+      const value = source[key];
+      if (typeof value === 'string' && PLAUSIBLE_ADDRESS_RE.test(value.trim())) {
+        return value.trim();
+      }
+    }
+  }
+  return null;
+}
+
+function appIdFromDriverUri(driverUri) {
+  if (typeof driverUri !== 'string') return null;
+  const match = driverUri.match(/^homey:app:(.+)$/);
+  return match ? match[1] : null;
+}
+
 const TOOLS = [
   {
     name: 'list_advanced_flows',
@@ -57,7 +79,7 @@ const TOOLS = [
   },
   {
     name: 'list_devices',
-    description: 'List all devices connected to Homey, with their names, zones, and capabilities',
+    description: 'List all devices connected to Homey, with their names, zone (zoneId + resolved zoneName), capabilities, network address (when locally known), and owning app ID',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -411,10 +433,21 @@ class HomeyMcpServer {
         }
 
         case 'list_devices': {
-          const data = await app._apiGet('/manager/devices/device');
+          const [data, zonesData] = await Promise.all([
+            app._apiGet('/manager/devices/device'),
+            app._apiGet('/manager/zones/zone').catch(() => ({})),
+          ]);
+          const zoneNames = {};
+          for (const [zoneId, zone] of Object.entries(zonesData || {})) {
+            zoneNames[zoneId] = zone.name;
+          }
           return this._text(vals(data).map(d => ({
-            id: d.id, name: d.name, zone: d.zoneName, class: d.class,
-            capabilities: d.capabilities, available: d.available
+            id: d.id, name: d.name, class: d.class,
+            capabilities: d.capabilities, available: d.available,
+            zoneId: d.zone || null,
+            zoneName: (d.zone && zoneNames[d.zone]) || null,
+            address: findAddress(d.settings, d.store),
+            appId: appIdFromDriverUri(d.driverUri),
           })));
         }
 
