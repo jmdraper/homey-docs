@@ -6,6 +6,7 @@
 //   PUT  /api/app/net.i-dev.betterlogic/:name/:value     — set value
 
 const http = require('http');
+const https = require('https');
 
 const BLL_APP_ID = 'net.i-dev.betterlogic';
 const BLL_TIMEOUT_MS = 5000;
@@ -16,20 +17,32 @@ let _cacheAt = 0;
 
 function _httpGet(app, path) {
   const url = `${app._baseUrl}/api${path}`;
+  const client = url.startsWith('https:') ? https : http;
   return new Promise((resolve, reject) => {
     let settled = false;
+    // Declared before the timer: if .get() throws synchronously (e.g. a scheme
+    // mismatch) the timer still fires, and referencing an uninitialised const
+    // there crashes the process from inside a timer callback.
+    let req = null;
     const done = (fn, val) => { if (!settled) { settled = true; clearTimeout(timer); fn(val); } };
-    const timer = setTimeout(() => { req.destroy(); done(reject, new Error(`Timeout: ${path}`)); }, BLL_TIMEOUT_MS);
-    const req = http.get(url, { headers: { Authorization: `Bearer ${app._token}` } }, (res) => {
-      let body = '';
-      res.on('data', chunk => { body += chunk; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) { done(reject, new Error(`HTTP ${res.statusCode}`)); return; }
-        try { done(resolve, JSON.parse(body)); }
-        catch (e) { done(reject, new Error('JSON parse failed')); }
+    const timer = setTimeout(() => {
+      if (req) req.destroy();
+      done(reject, new Error(`Timeout: ${path}`));
+    }, BLL_TIMEOUT_MS);
+    try {
+      req = client.get(url, { headers: { Authorization: `Bearer ${app._token}` } }, (res) => {
+        let body = '';
+        res.on('data', chunk => { body += chunk; });
+        res.on('end', () => {
+          if (res.statusCode !== 200) { done(reject, new Error(`HTTP ${res.statusCode}`)); return; }
+          try { done(resolve, JSON.parse(body)); }
+          catch (e) { done(reject, new Error('JSON parse failed')); }
+        });
       });
-    });
-    req.on('error', err => done(reject, err));
+      req.on('error', err => done(reject, err));
+    } catch (e) {
+      done(reject, e);
+    }
   });
 }
 

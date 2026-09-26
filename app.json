@@ -10,7 +10,7 @@
     "en": "Homey Docs Companion"
   },
   "description": {
-    "en": "Flow change tracking, cross-reference viewer, and AI assistant integration for Homey Pro."
+    "en": "Cross-reference viewer and AI assistant integration for Homey Pro."
   },
   "category": "tools",
   "permissions": [
@@ -26,17 +26,6 @@
   "source": "https://github.com/jmdraper/homey-docs",
   "brandColor": "#2d6cdf",
   "flow": {
-    "triggers": [
-      {
-        "id": "sync_completed",
-        "title": {
-          "en": "Documentation sync completed"
-        },
-        "hint": {
-          "en": "Fires when an AI assistant has finished syncing Homey documentation. Use this to trigger follow-up actions after a sync."
-        }
-      }
-    ],
     "actions": [
       {
         "id": "regenerate_xref",
@@ -85,10 +74,6 @@
     }
   ],
   "api": {
-    "changelog": {
-      "method": "GET",
-      "path": "/changelog"
-    },
     "snapshot": {
       "method": "GET",
       "path": "/snapshot"
@@ -113,10 +98,6 @@
       "method": "GET",
       "path": "/zones"
     },
-    "clear_changelog": {
-      "method": "DELETE",
-      "path": "/clear_changelog"
-    },
     "reset_snapshot": {
       "method": "DELETE",
       "path": "/reset_snapshot"
@@ -125,21 +106,13 @@
       "method": "GET",
       "path": "/diagnostics"
     },
-    "poll": {
+    "refresh": {
       "method": "POST",
-      "path": "/poll"
-    },
-    "flow_snapshot": {
-      "method": "GET",
-      "path": "/flow_snapshot"
+      "path": "/refresh"
     },
     "app_actions": {
       "method": "GET",
       "path": "/app_actions"
-    },
-    "sync_complete": {
-      "method": "POST",
-      "path": "/sync_complete"
     },
     "cross_references": {
       "method": "GET",

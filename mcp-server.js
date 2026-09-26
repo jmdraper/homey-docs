@@ -98,28 +98,8 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
-    name: 'get_changelog',
-    description: 'Get recent Homey changes tracked by the companion app — flow creates/renames/modifications/deletions, device changes, variable changes.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        since: { type: 'string', description: 'ISO 8601 date-time string. Only return entries after this timestamp. Omit to get all entries.' },
-        types: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'Filter by change type(s). Valid values: flow_created, flow_modified, flow_renamed, flow_deleted, flow_enabled, flow_disabled, device_created, device_modified, device_deleted, variable_created, variable_modified, variable_deleted. Omit to get all types.',
-        },
-      },
-    },
-  },
-  {
     name: 'list_flows_metadata',
-    description: 'List all flows (basic and advanced) with lightweight metadata — name, enabled, broken, card count, hash, folder. Faster than get_all_advanced_flows when you only need an overview.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'clear_changelog',
-    description: 'Clear all entries from the companion app changelog. Use after the sync skill has processed and documented all pending changes.',
+    description: 'List all flows (basic and advanced) with lightweight metadata — name, enabled, broken, card count, folder. Faster than get_all_advanced_flows when you only need an overview.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -136,17 +116,12 @@ const TOOLS = [
   },
   {
     name: 'get_app_actions',
-    description: 'Returns human-readable titles for all triggers, conditions, and actions exposed by each installed Homey app, keyed by their full card ID strings. Use this to translate opaque app card IDs in flow diffs into readable labels.',
+    description: 'Returns human-readable titles for all triggers, conditions, and actions exposed by each installed Homey app, keyed by their full card ID strings. Use this to translate opaque app card IDs into readable labels.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
-    name: 'trigger_sync_complete',
-    description: "Trigger the Homey 'sync completed' flow card, firing any flows that use it as a WHEN trigger. Call this at the end of a successful sync.",
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'poll_now',
-    description: 'Force the companion app to poll Homey immediately for changes, rather than waiting for the next 5-minute interval. Call this at the start of the sync process to ensure the changelog is up to date.',
+    name: 'refresh_snapshot',
+    description: 'Force the companion app to re-read Homey immediately, refreshing its cached flow/device/variable/zone data and rebuilding the cross-reference index, rather than waiting for the next 5-minute refresh. Call this if you suspect the cached data is stale.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -417,7 +392,7 @@ class HomeyMcpServer {
         }
 
         case 'get_all_advanced_flows':
-          return this._text(await app._fetchAdvancedFlows());
+          return this._text(await app._fetchAdvancedFlows() || {});
 
         case 'list_flows': {
           const data = await app._apiGet('/manager/flow/flow');
@@ -474,17 +449,8 @@ class HomeyMcpServer {
           return this._text([...native, ...bll]);
         }
 
-        case 'get_changelog': {
-          const since = args.since || null;
-          const types = Array.isArray(args.types) && args.types.length > 0 ? args.types : null;
-          return this._text(app.getChangelog(since, types));
-        }
-
         case 'list_flows_metadata':
           return this._text(app.getFlowsMetadata());
-
-        case 'clear_changelog':
-          return this._text(app.clearChangelog());
 
         case 'get_logs': {
           const data = await app._apiGet('/app/nl.nielsdeklerk.log/');
@@ -498,12 +464,8 @@ class HomeyMcpServer {
         case 'get_app_actions':
           return this._text(await app.getAppActions());
 
-        case 'trigger_sync_complete':
-          return this._text(await app.triggerSyncCompleted());
-
-        case 'poll_now':
-          await app._poll();
-          return this._text({ polled: true, changelog: app.changelog.length });
+        case 'refresh_snapshot':
+          return this._text(await app._refreshSnapshot());
 
         case 'get_cross_references': {
           const xref = await app.getCachedCrossReferences();

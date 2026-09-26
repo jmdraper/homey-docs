@@ -6,12 +6,6 @@
 
 module.exports = {
 
-  async changelog({ homey, query }) {
-    const since = query.since || null;
-    const types = query.types ? query.types.split(',').map(t => t.trim()) : null;
-    return homey.app.getChangelog(since, types);
-  },
-
   async snapshot({ homey }) {
     return homey.app.getSnapshot();
   },
@@ -36,10 +30,6 @@ module.exports = {
     return homey.app.getZones();
   },
 
-  async clear_changelog({ homey }) {
-    return homey.app.clearChangelog();
-  },
-
   async reset_snapshot({ homey }) {
     return homey.app.resetSnapshot();
   },
@@ -48,21 +38,12 @@ module.exports = {
     return homey.app.getDiagnostics();
   },
 
-  async poll({ homey }) {
-    await homey.app._poll();
-    return { polled: true, changelog: homey.app.changelog.length };
-  },
-
-  async flow_snapshot({ homey, query }) {
-    return homey.app.getFlowSnapshot(query.id);
+  async refresh({ homey }) {
+    return homey.app._refreshSnapshot();
   },
 
   async app_actions({ homey }) {
     return homey.app.getAppActions();
-  },
-
-  async sync_complete({ homey }) {
-    return homey.app.triggerSyncCompleted();
   },
 
   async cross_references({ homey }) {

@@ -1,14 +1,12 @@
 'use strict';
 
 const Homey = require('homey');
-const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const MAX_CHANGELOG_ENTRIES = 1000;
-const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 // Candidate paths for advanced flows — tried in order, first success wins
 const ADVANCED_FLOW_PATHS = [
@@ -27,7 +25,11 @@ class HomeyDocsCompanion extends Homey.App {
       flows: {}, variables: {}, devices: {}, apps: {}, zones: {},
       initialised_at: null
     };
-    this.changelog = this.homey.settings.get('changelog') || [];
+    // One-time cleanup: change tracking was removed, so drop its persisted data
+    if (this.homey.settings.get('changelog') !== null) {
+      this.homey.settings.unset('changelog');
+      this.log('Removed obsolete changelog data');
+    }
 
     try {
       this._baseUrl = await this.homey.api.getLocalUrl();
@@ -50,33 +52,28 @@ class HomeyDocsCompanion extends Homey.App {
     // Cache base URL so it's always current without a settings round-trip
     this._xrefBaseUrl = (this.homey.settings.get('xref_base_url') || 'https://my.homey.app').replace(/\/$/, '');
 
+    // Resolved before the snapshot refresh, which regenerates the xref page and
+    // needs the port to render the MCP setup instructions
+    this._mcpPort = parseInt(this.homey.settings.get('mcp_port'), 10) || 8735;
+
     // Discover advanced flow path once and cache it
     this._advancedFlowPath = this.homey.settings.get('advancedFlowPath') || null;
 
-    if (!this.snapshot.initialised_at) {
-      this.log('Building initial snapshot...');
-      await this._buildSnapshot();
+    // The snapshot is a cache, not a record — rebuild it on every start.
+    // Non-fatal: a bad refresh must not stop the servers from coming up, or a
+    // single malformed card would take the MCP server down with it. The
+    // interval below retries.
+    try {
+      await this._refreshSnapshot();
+    } catch (e) {
+      this.error('Initial snapshot refresh failed (continuing):', e.message);
     }
 
-    // One-time migration: add isAdvanced flag to snapshot entries that predate this feature
-    if (this.snapshot.initialised_at && Object.values(this.snapshot.flows).some(f => f.isAdvanced === undefined)) {
-      this.log('Migrating snapshot: fetching flow types...');
-      try {
-        const refreshed = await this._fetchAllFlows();
-        for (const [id, meta] of Object.entries(refreshed)) {
-          if (this.snapshot.flows[id]) this.snapshot.flows[id].isAdvanced = meta.isAdvanced;
-        }
-        await this._saveState();
-        this.log('Flow type migration complete');
-      } catch (e) {
-        this.log('Flow type migration failed (non-fatal):', e.message);
-      }
-    }
-
-    this._syncCompletedTrigger = this.homey.flow.getTriggerCard('sync_completed');
-
-    // Poll for changes every 5 minutes
-    this.homey.setInterval(() => this._poll().catch(e => this.error('Poll error:', e.message)), POLL_INTERVAL_MS);
+    // Keep the cache warm
+    this.homey.setInterval(
+      () => this._refreshSnapshot().catch(e => this.error('Refresh error:', e.message)),
+      REFRESH_INTERVAL_MS
+    );
 
     // Start the cross-reference HTTP server
     await this._startXrefServer();
@@ -91,11 +88,6 @@ class HomeyDocsCompanion extends Homey.App {
         await this.regenerateXrefPage();
         return true;
       });
-
-    // Generate the page on first start if not already stored
-    if (!this.homey.settings.get('xref_html')) {
-      await this.regenerateXrefPage();
-    }
 
     this.log(`Ready. Tracking ${Object.keys(this.snapshot.flows).length} flows, ${Object.keys(this.snapshot.devices).length} devices.`);
   }
@@ -120,8 +112,11 @@ class HomeyDocsCompanion extends Homey.App {
 
   _apiGet(path) {
     const url = `${this._baseUrl}/api${path}`;
+    // getLocalUrl() returns http:// or https:// depending on how the app is
+    // running — picking the wrong client throws "Protocol not supported"
+    const client = url.startsWith('https:') ? https : http;
     return new Promise((resolve, reject) => {
-      const req = http.get(url, { headers: { Authorization: `Bearer ${this._token}` } }, (res) => {
+      const req = client.get(url, { headers: { Authorization: `Bearer ${this._token}` } }, (res) => {
         let body = '';
         res.on('data', chunk => { body += chunk; });
         res.on('end', () => {
@@ -136,21 +131,6 @@ class HomeyDocsCompanion extends Homey.App {
       req.on('error', reject);
       req.setTimeout(15000, () => { req.destroy(); reject(new Error(`Timeout: ${path}`)); });
     });
-  }
-
-  // ─── Hashing ────────────────────────────────────────────────────────────────
-
-  _computeHash(obj) {
-    const normalized = JSON.stringify(this._sortKeys(obj));
-    return crypto.createHash('sha256').update(normalized).digest('hex').substring(0, 16);
-  }
-
-  _sortKeys(obj) {
-    if (Array.isArray(obj)) return obj.map(v => this._sortKeys(v));
-    if (obj !== null && typeof obj === 'object') {
-      return Object.keys(obj).sort().reduce((acc, k) => { acc[k] = this._sortKeys(obj[k]); return acc; }, {});
-    }
-    return obj;
   }
 
   // ─── Snapshot helpers ───────────────────────────────────────────────────────
@@ -170,7 +150,6 @@ class HomeyDocsCompanion extends Homey.App {
       enabled: flow.enabled !== false,
       broken: flow.broken || false,
       cards: cardCount,
-      hash: this._computeHash(cardPayload),
       isAdvanced,
       cards_snapshot: JSON.parse(JSON.stringify(cardPayload))
     };
@@ -235,52 +214,27 @@ class HomeyDocsCompanion extends Homey.App {
     }
 
     this.log('Advanced flow path not found — only basic flows tracked');
-    return {};
-  }
-
-  // ─── Changelog ──────────────────────────────────────────────────────────────
-
-  _addChange(entry) {
-    this.changelog.push({ ts: new Date().toISOString(), ...entry });
-    if (this.changelog.length > MAX_CHANGELOG_ENTRIES) {
-      this.changelog = this.changelog.slice(-MAX_CHANGELOG_ENTRIES);
-    }
+    return null;
   }
 
   async _saveState() {
     this.homey.settings.set('snapshot', this.snapshot);
-    this.homey.settings.set('changelog', this.changelog);
-  }
-
-  // ─── Card diffing ───────────────────────────────────────────────────────────
-
-  _diffCards(oldCards, newCards) {
-    const changes = [];
-    const allIds = new Set([...Object.keys(oldCards || {}), ...Object.keys(newCards || {})]);
-    for (const id of allIds) {
-      const o = (oldCards || {})[id];
-      const n = (newCards || {})[id];
-      if (!o && n) { changes.push({ type: 'card_added', cardInternalId: id, cardType: n.type, ownerUri: n.ownerUri || null, cardId: n.id || null }); continue; }
-      if (o && !n) { changes.push({ type: 'card_removed', cardInternalId: id, cardType: o.type, ownerUri: o.ownerUri || null, cardId: o.id || null }); continue; }
-      const oldArgs = JSON.stringify(this._sortKeys(o.args || {}));
-      const newArgs = JSON.stringify(this._sortKeys(n.args || {}));
-      if (oldArgs !== newArgs) {
-        changes.push({ type: 'args_changed', cardInternalId: id, cardType: n.type, ownerUri: n.ownerUri || null, cardId: n.id || null, from: o.args || {}, to: n.args || {} });
-      }
-    }
-    return changes;
   }
 
   // ─── Fetch all current state ─────────────────────────────────────────────────
 
+  // Returns null when nothing could be fetched, so callers can tell a genuinely
+  // empty Homey from a failed read and avoid clobbering a good cache.
   async _fetchAllFlows() {
     const flows = {};
+    let ok = false;
 
     try {
       const basic = await this._apiGet('/manager/flow/flow');
       for (const [id, flow] of Object.entries(basic || {})) {
         flows[id] = this._flowMeta(flow, false);
       }
+      ok = true;
       this.log('Basic flows fetched:', Object.keys(flows).length);
     } catch (e) {
       this.log('Could not fetch basic flows:', e.message);
@@ -288,14 +242,17 @@ class HomeyDocsCompanion extends Homey.App {
 
     try {
       const advanced = await this._fetchAdvancedFlows();
-      for (const [id, flow] of Object.entries(advanced || {})) {
-        flows[id] = this._flowMeta(flow, true);
+      if (advanced) {
+        for (const [id, flow] of Object.entries(advanced)) {
+          flows[id] = this._flowMeta(flow, true);
+        }
+        ok = true;
       }
     } catch (e) {
       this.log('Could not fetch advanced flows:', e.message);
     }
 
-    return flows;
+    return ok ? flows : null;
   }
 
   async _fetchAllDevices() {
@@ -344,10 +301,14 @@ class HomeyDocsCompanion extends Homey.App {
     }
   }
 
-  // ─── Initial snapshot ────────────────────────────────────────────────────────
+  // ─── Snapshot ────────────────────────────────────────────────────────────────
 
-  async _buildSnapshot() {
-    this.snapshot.flows = await this._fetchAllFlows();
+  // The snapshot is a read cache for the cross-reference builder and the listing
+  // tools — not a record of history. Refreshing overwrites it wholesale.
+  async _refreshSnapshot() {
+    const flows = await this._fetchAllFlows();
+    if (flows) this.snapshot.flows = flows;
+    else this.error('Flow read failed — keeping the cached index rather than emptying it');
 
     const devices = await this._fetchAllDevices();
     if (devices) this.snapshot.devices = devices;
@@ -358,130 +319,16 @@ class HomeyDocsCompanion extends Homey.App {
     const zones = await this._fetchAllZones();
     if (zones) this.snapshot.zones = zones;
 
-    this.snapshot.initialised_at = new Date().toISOString();
+    if (!this.snapshot.initialised_at) this.snapshot.initialised_at = new Date().toISOString();
+
     await this._saveState();
-    this.log(`Snapshot built: ${Object.keys(this.snapshot.flows).length} flows, ${Object.keys(this.snapshot.devices).length} devices, ${Object.keys(this.snapshot.zones).length} zones`);
-    this.regenerateXrefPage().catch(e => this.error('Auto-regenerate xref after snapshot build failed:', e.message));
-  }
+    this.log(`Snapshot refreshed: ${Object.keys(this.snapshot.flows).length} flows, ${Object.keys(this.snapshot.devices).length} devices, ${Object.keys(this.snapshot.zones).length} zones`);
 
-  // ─── Polling ─────────────────────────────────────────────────────────────────
-
-  async _poll() {
-    this.log('Polling for changes...');
-    let changed = false;
-
-    // Flows
-    const newFlows = await this._fetchAllFlows();
-    const flowIds = new Set([...Object.keys(newFlows), ...Object.keys(this.snapshot.flows)]);
-    for (const id of flowIds) {
-      const oldMeta = this.snapshot.flows[id];
-      const newMeta = newFlows[id];
-
-      if (!oldMeta && newMeta) {
-        this._addChange({ type: 'flow_created', id, name: newMeta.name, to: { enabled: newMeta.enabled, broken: newMeta.broken, cards: newMeta.cards, hash: newMeta.hash } });
-        changed = true;
-      } else if (oldMeta && !newMeta) {
-        this._addChange({ type: 'flow_deleted', id, name: oldMeta.name, from: { enabled: oldMeta.enabled, cards: oldMeta.cards } });
-        changed = true;
-      } else if (oldMeta && newMeta) {
-        const hashChanged = oldMeta.hash !== newMeta.hash;
-        const enabledChanged = oldMeta.enabled !== newMeta.enabled;
-        const brokenChanged = oldMeta.broken !== newMeta.broken;
-        const nameChanged = oldMeta.name !== newMeta.name;
-        if (hashChanged || enabledChanged || brokenChanged || nameChanged) {
-          const diff = hashChanged ? this._diffCards(oldMeta.cards_snapshot || {}, newMeta.cards_snapshot || {}) : [];
-          this._addChange({
-            type: 'flow_modified', id, name: newMeta.name,
-            from: { name: oldMeta.name, enabled: oldMeta.enabled, broken: oldMeta.broken, cards: oldMeta.cards, hash: oldMeta.hash },
-            to: { name: newMeta.name, enabled: newMeta.enabled, broken: newMeta.broken, cards: newMeta.cards, hash: newMeta.hash },
-            diff,
-            ...(hashChanged && {
-              from_cards: oldMeta.cards_snapshot || {},
-              to_cards: newMeta.cards_snapshot || {}
-            })
-          });
-          changed = true;
-        }
-      }
-    }
-    this.snapshot.flows = newFlows;
-
-    // Devices (track name/zone/availability changes only)
-    const newDevices = await this._fetchAllDevices();
-    if (newDevices) {
-      const deviceIds = new Set([...Object.keys(newDevices), ...Object.keys(this.snapshot.devices)]);
-      for (const id of deviceIds) {
-        const o = this.snapshot.devices[id];
-        const n = newDevices[id];
-        if (!o && n) {
-          this._addChange({ type: 'device_added', id, name: n.name, to: n });
-          changed = true;
-        } else if (o && !n) {
-          this._addChange({ type: 'device_removed', id, name: o.name, from: o });
-          changed = true;
-        } else if (o && n && (o.name !== n.name || o.zone !== n.zone || o.available !== n.available)) {
-          this._addChange({
-            type: !n.available && o.available ? 'device_unavailable' : n.available && !o.available ? 'device_available' : 'device_modified',
-            id, name: n.name,
-            from: { name: o.name, zone: o.zone, available: o.available },
-            to: { name: n.name, zone: n.zone, available: n.available }
-          });
-          changed = true;
-        }
-      }
-      this.snapshot.devices = newDevices;
-    }
-
-    // Variables (track name/type changes)
-    const newVars = await this._fetchAllVariables();
-    if (newVars) {
-      const varIds = new Set([...Object.keys(newVars), ...Object.keys(this.snapshot.variables)]);
-      for (const id of varIds) {
-        const o = this.snapshot.variables[id];
-        const n = newVars[id];
-        if (!o && n) { this._addChange({ type: 'variable_created', id, name: n.name, to: n }); changed = true; }
-        else if (o && !n) { this._addChange({ type: 'variable_deleted', id, name: o.name, from: o }); changed = true; }
-        else if (o && n && (o.name !== n.name || o.type !== n.type)) {
-          this._addChange({ type: 'variable_modified', id, name: n.name, from: { name: o.name, type: o.type }, to: { name: n.name, type: n.type } });
-          changed = true;
-        }
-      }
-      this.snapshot.variables = newVars;
-    }
-
-    // Zones
-    const newZones = await this._fetchAllZones();
-    if (newZones) {
-      const zoneIds = new Set([...Object.keys(newZones), ...Object.keys(this.snapshot.zones)]);
-      for (const id of zoneIds) {
-        const o = this.snapshot.zones[id];
-        const n = newZones[id];
-        if (!o && n) { this._addChange({ type: 'zone_created', id, name: n.name, to: n }); changed = true; }
-        else if (o && !n) { this._addChange({ type: 'zone_deleted', id, name: o.name, from: o }); changed = true; }
-        else if (o && n && (o.name !== n.name || o.parent !== n.parent)) {
-          this._addChange({ type: 'zone_modified', id, name: n.name, from: o, to: n });
-          changed = true;
-        }
-      }
-      this.snapshot.zones = newZones;
-    }
-
-    if (changed) {
-      await this._saveState();
-      this.log('Changes detected and saved');
-    } else {
-      this.log('No changes detected');
-    }
+    await this.regenerateXrefPage();
+    return { refreshed: true, flows: Object.keys(this.snapshot.flows).length };
   }
 
   // ─── Public API (called by api.js) ───────────────────────────────────────────
-
-  getChangelog(since, types) {
-    let entries = this.changelog;
-    if (since) { const d = new Date(since); entries = entries.filter(e => new Date(e.ts) >= d); }
-    if (types && types.length > 0) { entries = entries.filter(e => types.includes(e.type)); }
-    return entries;
-  }
 
   getSnapshot() {
     const slim = {
@@ -494,13 +341,6 @@ class HomeyDocsCompanion extends Homey.App {
       slim.flows[id] = rest;
     }
     return slim;
-  }
-
-  getFlowSnapshot(id) {
-    if (!id) return { error: 'id query param required' };
-    const flow = this.snapshot.flows[id];
-    if (!flow) return { error: `Flow ${id} not in snapshot` };
-    return { id, name: flow.name, hash: flow.hash, cards_snapshot: flow.cards_snapshot || null };
   }
 
   getFlowsMetadata() {
@@ -561,11 +401,6 @@ class HomeyDocsCompanion extends Homey.App {
     return result;
   }
 
-  async triggerSyncCompleted() {
-    await this._syncCompletedTrigger.trigger();
-    return { triggered: true };
-  }
-
   async onUninit() {
     if (this._xrefServer) {
       this._xrefServer.close(() => this.log('Cross-reference server stopped'));
@@ -580,7 +415,6 @@ class HomeyDocsCompanion extends Homey.App {
 
   async _startMcpServer() {
     const HomeyMcpServer = require('./mcp-server.js');
-    this._mcpPort = parseInt(this.homey.settings.get('mcp_port'), 10) || 8735;
     this._mcpServer = new HomeyMcpServer(this);
     await this._mcpServer.start(this._mcpPort);
   }
@@ -798,7 +632,9 @@ function copyPrompt(){
       }
 
       if (req.method === 'POST' && req.url === '/refresh') {
-        this.regenerateXrefPage()
+        // Re-read Homey as well as redrawing — otherwise the button rebuilds the
+        // page from cached data and appears to do nothing after a flow changes
+        this._refreshSnapshot()
           .then(() => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true }));
@@ -1255,16 +1091,10 @@ function copyPrompt(){
   getApps() { return this.snapshot.apps; }
   getZones() { return this.snapshot.zones; }
 
-  clearChangelog() {
-    this.changelog = [];
-    this.homey.settings.set('changelog', this.changelog);
-    return { cleared: true };
-  }
-
   async resetSnapshot() {
     this.snapshot = { flows: {}, variables: {}, devices: {}, apps: {}, zones: {}, initialised_at: null };
     this.homey.settings.set('snapshot', this.snapshot);
-    await this._buildSnapshot();
+    await this._refreshSnapshot();
     return { reset: true, flows: Object.keys(this.snapshot.flows).length, devices: Object.keys(this.snapshot.devices).length };
   }
 
