@@ -1324,15 +1324,31 @@ class HomeyDocsCompanion extends Homey.App {
     });
 
     // Sweeping one way settles each card against its parents, the other way
-    // against its children; neither alone is right, and whichever the last
-    // sweep was would otherwise win by default. Keep the best.
+    // against its children. Neither alone is right, and the useful answer is
+    // often a mix: a gate feeding six cards wants to stay beside the two
+    // conditions that feed it while those six spread out below — which no
+    // single sweep produces, because each re-places a whole column by one rule
+    // and so collapses whatever the previous sweep spread out. Running a second
+    // sweep over all but the end column keeps that spread while settling
+    // everything upstream of it.
     const reversed = order.slice().reverse();
-    sweep(order, parents);
-    let best = { y: snapshot(), cost: travel() };
-    for (const [sequence, side] of [[reversed, children], [order, parents], [reversed, children]]) {
-      sweep(sequence, side);
+    const allButLast = order.slice(0, -1);
+    const allButFirst = reversed.slice(0, -1);
+    const candidates = [
+      () => sweep(order, parents),
+      () => sweep(reversed, children),
+      () => { sweep(reversed, children); sweep(allButLast, parents); },
+      () => { sweep(order, parents); sweep(allButFirst, children); },
+      () => { sweep(reversed, children); sweep(allButLast, parents); sweep(allButFirst, children); },
+    ];
+
+    const initial = snapshot();
+    let best = null;
+    for (const build of candidates) {
+      restore(initial);
+      build();
       const cost = travel();
-      if (cost < best.cost) best = { y: snapshot(), cost };
+      if (!best || cost < best.cost) best = { y: snapshot(), cost };
     }
     restore(best.y);
 
