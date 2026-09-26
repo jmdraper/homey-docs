@@ -1125,18 +1125,30 @@ class HomeyDocsCompanion extends Homey.App {
       let moved = 0;
 
       for (const column of order) {
-        // Follow the parents' order, so branches stay beside what feeds them
-        const members = columns[column].sort((a, b) => {
-          const above = id => (parents[id].length
-            ? Math.min.apply(null, parents[id].map(p => (placedY[p] === undefined ? 0 : placedY[p])))
-            : (cards[id].y || 0));
-          return above(a) - above(b) || (cards[a].y || 0) - (cards[b].y || 0);
-        });
+        // Prefer to sit level with the middle of whatever feeds the card. On
+        // this Homey a card with several parents sits at their midpoint
+        // (median offset 0), which keeps a gate between its inputs rather than
+        // level with the first of them.
+        const members = columns[column];
+        const desired = {};
+        for (const id of members) {
+          const feeding = parents[id]
+            .map(parent => placedY[parent])
+            .filter(value => value !== undefined);
+          desired[id] = feeding.length
+            ? (Math.min.apply(null, feeding) + Math.max.apply(null, feeding)) / 2
+            : originY;
+        }
+        members.sort((a, b) => desired[a] - desired[b] || (cards[a].y || 0) - (cards[b].y || 0));
 
         let y = originY;
         for (const id of members) {
           const card = cards[id];
           const x = columnX[column];
+          // Honour the preferred position where there is room, but never
+          // overlap the card already placed above it. Positions in this Homey
+          // sit on a 20px grid.
+          y = Math.max(y, Math.round(desired[id] / 20) * 20);
           if (card.x !== x || card.y !== y) moved += 1;
           card.x = x;
           card.y = y;
