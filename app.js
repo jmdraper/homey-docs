@@ -49,7 +49,7 @@ const CARD_GAP_Y_BY_TYPE = {
   trigger: 100,
   condition: 100,
 };
-const CARD_GAP_Y_ALL_BASE = 40;
+const CARD_GAP_Y_ALL_BASE = 24;   // fits the measured 120 at 2 inputs, 500 at 10
 const CARD_GAP_Y_ALL_PER_INPUT = 48;
 const CARD_GAP_Y = 100;
 const CARD_GAP_Y_MAX = 360;
@@ -1141,19 +1141,35 @@ class HomeyDocsCompanion extends Homey.App {
         }
         members.sort((a, b) => desired[a] - desired[b] || (cards[a].y || 0) - (cards[b].y || 0));
 
-        let y = originY;
+        // Cards wanting the same position form a cluster, and the cluster is
+        // centred on that position rather than starting at it. Two gates fed by
+        // the same pair of conditions both want the midpoint: centring the pair
+        // leaves one level with each condition, so two of the four connections
+        // run straight instead of all four bending downwards.
+        const clusters = [];
         for (const id of members) {
-          const card = cards[id];
-          const x = columnX[column];
-          // Honour the preferred position where there is room, but never
-          // overlap the card already placed above it. Positions in this Homey
-          // sit on a 20px grid.
-          y = Math.max(y, Math.round(desired[id] / 20) * 20);
-          if (card.x !== x || card.y !== y) moved += 1;
-          card.x = x;
-          card.y = y;
-          placedY[id] = y;
-          y += this._siblingGapBelow(card);
+          const last = clusters[clusters.length - 1];
+          if (last && Math.abs(desired[id] - last.desired) < 1) last.ids.push(id);
+          else clusters.push({ desired: desired[id], ids: [id] });
+        }
+
+        let cursor = originY;
+        for (const cluster of clusters) {
+          const gaps = cluster.ids.map(id => this._siblingGapBelow(cards[id]));
+          const extent = gaps.slice(0, -1).reduce((total, gap) => total + gap, 0);
+          let y = Math.round((cluster.desired - (extent / 2)) / 20) * 20;
+          if (y < cursor) y = cursor;
+
+          cluster.ids.forEach((id, index) => {
+            const card = cards[id];
+            const x = columnX[column];
+            if (card.x !== x || card.y !== y) moved += 1;
+            card.x = x;
+            card.y = y;
+            placedY[id] = y;
+            y += gaps[index];
+          });
+          cursor = y;
         }
       }
 
