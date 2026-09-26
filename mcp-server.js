@@ -216,7 +216,7 @@ const TOOLS = [
         flowId: { type: 'string' },
         card: {
           type: 'object',
-          description: 'The card: type (trigger/condition/action/all/any/delay/note), id (the full card id such as homey:device:<uuid>:on), ownerUri, and args.',
+          description: 'The card: type (trigger/condition/action/all/any/delay/note), id (the full card id such as homey:device:<uuid>:on), ownerUri, and args. For a note, pass type \'note\' with a value (the text) and optionally a color — yellow, blue, green or red; notes are never connected, and `after` places one above the card it labels.',
         },
         after: { type: 'string', description: 'Card id to place this one after and connect from' },
       },

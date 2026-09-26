@@ -41,19 +41,24 @@ const CARD_GAP_X = 440;
 // Heights vary by type too. start, delay and any render short and fixed; an
 // ALL card grows with the number of connections feeding it, measured here at
 // roughly 120px at two inputs rising to 500px at ten.
-const CARD_GAP_Y_BY_TYPE = {
-  start: 80,
-  delay: 80,
-  any: 80,
-  action: 100,
-  trigger: 100,
-  condition: 100,
-};
+// Compact card types render short whatever they contain
+const CARD_GAP_Y_COMPACT = { start: 80, delay: 80, any: 80 };
+// A full-size card with no arguments shows one line of text; with arguments it
+// shows two or more. The measured "action median 100, mode 80" is these two
+// populations, not one: device cards like Turn on carry no args and sit 80
+// apart, while log cards carrying text sit 100 apart.
+const CARD_GAP_Y_BARE = 80;
 const CARD_GAP_Y_ALL_BASE = 24;   // fits the measured 120 at 2 inputs, 500 at 10
 const CARD_GAP_Y_ALL_PER_INPUT = 48;
 const CARD_GAP_Y = 100;
 const CARD_GAP_Y_MAX = 360;
 const CARD_ROW_GAP_Y = 260;
+// Nothing is added between one behaviour and the next: a band's extent already
+// runs to below its lowest card, so that allowance is the separation. Adding
+// more on top pushes every behaviour progressively further down the canvas.
+const CARD_BAND_GAP_Y = 0;
+// How far above the card it labels a heading note sits
+const NOTE_HEADING_OFFSET_Y = 40;
 
 const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
 const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
@@ -1003,16 +1008,14 @@ class HomeyDocsCompanion extends Homey.App {
       const inputs = Array.isArray(card.input) ? card.input.length : 0;
       return CARD_GAP_Y_ALL_BASE + (inputs * CARD_GAP_Y_ALL_PER_INPUT);
     }
-
-    const base = CARD_GAP_Y_BY_TYPE[type] || CARD_GAP_Y;
-    // Only full-size cards grow with their text; the compact ones do not
-    if (base < CARD_GAP_Y) return base;
+    if (CARD_GAP_Y_COMPACT[type]) return CARD_GAP_Y_COMPACT[type];
 
     let text = '';
     try { text = JSON.stringify(card.args || {}); } catch (e) { text = ''; }
-    if (text.length <= 200) return base;
+    if (text.length <= 20) return CARD_GAP_Y_BARE;     // no arguments to show
+    if (text.length <= 200) return CARD_GAP_Y;
     const extra = Math.ceil((text.length - 200) / 100) * 60;
-    return Math.min(base + extra, CARD_GAP_Y_MAX);
+    return Math.min(CARD_GAP_Y + extra, CARD_GAP_Y_MAX);
   }
 
   async addCard(flowId, card, after) {
@@ -1034,6 +1037,16 @@ class HomeyDocsCompanion extends Homey.App {
       const cardId = crypto.randomUUID();
       const existing = Object.values(draft.cards);
 
+      // A note labels the section beside it. It is never connected, and Homey
+      // sizes it at render time, so width and height stay null.
+      const isNote = newCard.type === 'note';
+      if (isNote) {
+        if (!newCard.value) return { error: 'a note card needs a value (the text to show)' };
+        if (!newCard.color) newCard.color = 'yellow';
+        newCard.width = null;
+        newCard.height = null;
+      }
+
       let anchorId = null;
       if (after) {
         const anchor = this._resolveCardId(draft.cards, after);
@@ -1041,7 +1054,14 @@ class HomeyDocsCompanion extends Homey.App {
         anchorId = anchor.cardId;
       }
 
-      if (typeof newCard.x !== 'number' || typeof newCard.y !== 'number') {
+      if (isNote && typeof newCard.x !== 'number') {
+        // Sit above the card it heads, at the same left edge
+        const anchor = anchorId ? draft.cards[anchorId] : null;
+        newCard.x = anchor ? (anchor.x || 0) : 0;
+        newCard.y = anchor
+          ? (anchor.y || 0) - NOTE_HEADING_OFFSET_Y
+          : (existing.length ? Math.min.apply(null, existing.map(c => c.y || 0)) - NOTE_HEADING_OFFSET_Y : 0);
+      } else if (typeof newCard.x !== 'number' || typeof newCard.y !== 'number') {
         if (anchorId) {
           const source = draft.cards[anchorId];
           // Sit level with the anchor unless it already has children, in which
@@ -1080,7 +1100,7 @@ class HomeyDocsCompanion extends Homey.App {
       draft.cards[cardId] = newCard;
 
       let linked = null;
-      if (anchorId) {
+      if (anchorId && !isNote) {
         const source = draft.cards[anchorId];
         const output = source.type === 'condition' ? 'outputTrue' : 'outputSuccess';
         source[output] = (source[output] || []).concat([cardId]);
@@ -1090,113 +1110,184 @@ class HomeyDocsCompanion extends Homey.App {
     });
   }
 
-  // Reposition every card in a flow onto the measured grid. Columns come from
-  // the longest path to each card, so a card always sits to the right of
-  // everything that can reach it, and rows stack using the same height
-  // estimate used when adding cards.
+  // Independent behaviours get their own horizontal band. Laying every card
+  // out in shared columns interleaves unrelated logic — four triggers for three
+  // behaviours all land in column 0 — and drags long connections across the
+  // canvas. Flows written by hand keep each behaviour in its own band.
+  _connectedGroups(ids, parents, children) {
+    const owner = {};
+    const find = id => {
+      while (owner[id] !== id) { owner[id] = owner[owner[id]]; id = owner[id]; }
+      return id;
+    };
+    for (const id of ids) owner[id] = id;
+    for (const id of ids) {
+      for (const other of parents[id].concat(children[id])) {
+        const a = find(id);
+        const b = find(other);
+        if (a !== b) owner[a] = b;
+      }
+    }
+    const groups = new Map();
+    for (const id of ids) {
+      const root = find(id);
+      if (!groups.has(root)) groups.set(root, []);
+      groups.get(root).push(id);
+    }
+    return Array.from(groups.values());
+  }
+
+  // Notes label the section beside them, so they have to travel with it.
+  // Their width and height are null — Homey sizes them at render time — so
+  // position is all there is to work with.
+  _captureNoteAnchors(cards, ids) {
+    const anchors = {};
+    for (const [noteId, note] of Object.entries(cards)) {
+      if (!note || note.type !== 'note') continue;
+      let best = null;
+      let bestDistance = Infinity;
+      for (const id of ids) {
+        const dx = (cards[id].x || 0) - (note.x || 0);
+        const dy = (cards[id].y || 0) - (note.y || 0);
+        const distance = Math.sqrt((dx * dx) + (dy * dy));
+        if (distance < bestDistance) { bestDistance = distance; best = id; }
+      }
+      if (best) {
+        anchors[noteId] = {
+          anchor: best,
+          dx: (note.x || 0) - (cards[best].x || 0),
+          dy: (note.y || 0) - (cards[best].y || 0)
+        };
+      }
+    }
+    return anchors;
+  }
+
+  _layoutGroup(cards, group, parents, originX, bandTop) {
+    const inGroup = new Set(group);
+    const depth = {};
+    const visiting = new Set();
+    const depthOf = id => {
+      if (depth[id] !== undefined) return depth[id];
+      if (visiting.has(id)) return 0;
+      visiting.add(id);
+      const above = parents[id].filter(p => inGroup.has(p));
+      depth[id] = above.length ? Math.max.apply(null, above.map(depthOf)) + 1 : 0;
+      visiting.delete(id);
+      return depth[id];
+    };
+    group.forEach(depthOf);
+
+    const columns = {};
+    for (const id of group) (columns[depth[id]] = columns[depth[id]] || []).push(id);
+    const order = Object.keys(columns).map(Number).sort((a, b) => a - b);
+
+    const columnX = {};
+    let nextX = originX;
+    for (const column of order) {
+      columnX[column] = nextX;
+      nextX += Math.max.apply(null, columns[column].map(id => this._columnGapAfter(cards[id])));
+    }
+
+    const placedY = {};
+    let moved = 0;
+    let bottom = bandTop;
+
+    for (const column of order) {
+      const members = columns[column];
+      const desired = {};
+      for (const id of members) {
+        const feeding = parents[id]
+          .filter(p => inGroup.has(p))
+          .map(p => placedY[p])
+          .filter(value => value !== undefined);
+        desired[id] = feeding.length
+          ? (Math.min.apply(null, feeding) + Math.max.apply(null, feeding)) / 2
+          : bandTop;
+      }
+      members.sort((a, b) => desired[a] - desired[b] || (cards[a].y || 0) - (cards[b].y || 0));
+
+      const clusters = [];
+      for (const id of members) {
+        const last = clusters[clusters.length - 1];
+        if (last && Math.abs(desired[id] - last.desired) < 1) last.ids.push(id);
+        else clusters.push({ desired: desired[id], ids: [id] });
+      }
+
+      let cursor = bandTop;
+      for (const cluster of clusters) {
+        const gaps = cluster.ids.map(id => this._siblingGapBelow(cards[id]));
+        const extent = gaps.slice(0, -1).reduce((total, gap) => total + gap, 0);
+        let y = Math.round((cluster.desired - (extent / 2)) / 20) * 20;
+        if (y < cursor) y = cursor;
+
+        cluster.ids.forEach((id, index) => {
+          const card = cards[id];
+          const x = columnX[column];
+          if (card.x !== x || card.y !== y) moved += 1;
+          card.x = x;
+          card.y = y;
+          placedY[id] = y;
+          y += gaps[index];
+        });
+        cursor = y;
+      }
+      bottom = Math.max(bottom, cursor);
+    }
+    return { moved, columns: order.length, bottom };
+  }
+
   async relayoutFlow(flowId) {
     return this._mutateAdvancedFlow(flowId, 'repositioned the cards', draft => {
       const cards = draft.cards;
       const ids = Object.keys(cards).filter(id => cards[id] && cards[id].type !== 'note');
       if (!ids.length) return { error: 'this flow has no cards to lay out' };
-      const notes = Object.keys(cards).length - ids.length;
+
+      const noteAnchors = this._captureNoteAnchors(cards, ids);
 
       const parents = {};
-      for (const id of ids) parents[id] = [];
+      const children = {};
+      for (const id of ids) { parents[id] = []; children[id] = []; }
       for (const id of ids) {
         for (const output of CARD_OUTPUTS) {
           for (const child of (cards[id][output] || [])) {
-            if (parents[child]) parents[child].push(id);
+            if (parents[child]) { parents[child].push(id); children[id].push(child); }
           }
         }
       }
 
-      const depth = {};
-      const visiting = new Set();
-      const depthOf = id => {
-        if (depth[id] !== undefined) return depth[id];
-        if (visiting.has(id)) return 0;          // guard against a cycle
-        visiting.add(id);
-        const above = parents[id];
-        depth[id] = above.length ? Math.max.apply(null, above.map(depthOf)) + 1 : 0;
-        visiting.delete(id);
-        return depth[id];
-      };
-      ids.forEach(depthOf);
-
-      const columns = {};
-      for (const id of ids) (columns[depth[id]] = columns[depth[id]] || []).push(id);
+      const groups = this._connectedGroups(ids, parents, children);
+      // Keep the author's top-to-bottom ordering of behaviours
+      groups.sort((a, b) =>
+        Math.min.apply(null, a.map(id => cards[id].y || 0))
+        - Math.min.apply(null, b.map(id => cards[id].y || 0)));
 
       const originX = Math.min.apply(null, ids.map(id => cards[id].x || 0));
-      // Each column starts far enough right to clear the widest card in the
-      // one before it, rather than at a fixed multiple
-      const order = Object.keys(columns).map(Number).sort((a, b) => a - b);
-      const columnX = {};
-      let nextX = originX;
-      for (const column of order) {
-        columnX[column] = nextX;
-        nextX += Math.max.apply(null,
-          columns[column].map(id => this._columnGapAfter(cards[id])));
-      }
       const originY = Math.min.apply(null, ids.map(id => cards[id].y || 0));
-      const placedY = {};
+
       let moved = 0;
-
-      for (const column of order) {
-        // Prefer to sit level with the middle of whatever feeds the card. On
-        // this Homey a card with several parents sits at their midpoint
-        // (median offset 0), which keeps a gate between its inputs rather than
-        // level with the first of them.
-        const members = columns[column];
-        const desired = {};
-        for (const id of members) {
-          const feeding = parents[id]
-            .map(parent => placedY[parent])
-            .filter(value => value !== undefined);
-          desired[id] = feeding.length
-            ? (Math.min.apply(null, feeding) + Math.max.apply(null, feeding)) / 2
-            : originY;
-        }
-        members.sort((a, b) => desired[a] - desired[b] || (cards[a].y || 0) - (cards[b].y || 0));
-
-        // Cards wanting the same position form a cluster, and the cluster is
-        // centred on that position rather than starting at it. Two gates fed by
-        // the same pair of conditions both want the midpoint: centring the pair
-        // leaves one level with each condition, so two of the four connections
-        // run straight instead of all four bending downwards.
-        const clusters = [];
-        for (const id of members) {
-          const last = clusters[clusters.length - 1];
-          if (last && Math.abs(desired[id] - last.desired) < 1) last.ids.push(id);
-          else clusters.push({ desired: desired[id], ids: [id] });
-        }
-
-        let cursor = originY;
-        for (const cluster of clusters) {
-          const gaps = cluster.ids.map(id => this._siblingGapBelow(cards[id]));
-          const extent = gaps.slice(0, -1).reduce((total, gap) => total + gap, 0);
-          let y = Math.round((cluster.desired - (extent / 2)) / 20) * 20;
-          if (y < cursor) y = cursor;
-
-          cluster.ids.forEach((id, index) => {
-            const card = cards[id];
-            const x = columnX[column];
-            if (card.x !== x || card.y !== y) moved += 1;
-            card.x = x;
-            card.y = y;
-            placedY[id] = y;
-            y += gaps[index];
-          });
-          cursor = y;
-        }
+      let widest = 0;
+      let bandTop = originY;
+      for (const group of groups) {
+        const laid = this._layoutGroup(cards, group, parents, originX, bandTop);
+        moved += laid.moved;
+        widest = Math.max(widest, laid.columns);
+        bandTop = laid.bottom + CARD_BAND_GAP_Y;
       }
 
-      const result = { cardsRepositioned: moved, columns: Object.keys(columns).length };
-      if (notes) {
-        result.warning = notes + ' note card(s) were left where they were. Notes are '
-          + 'positioned next to what they describe, so they may no longer line up.';
+      for (const [noteId, anchor] of Object.entries(noteAnchors)) {
+        const target = cards[anchor.anchor];
+        if (!target) continue;
+        cards[noteId].x = (target.x || 0) + anchor.dx;
+        cards[noteId].y = (target.y || 0) + anchor.dy;
       }
-      return result;
+
+      return {
+        cardsRepositioned: moved,
+        independentBehaviours: groups.length,
+        widestBehaviour: widest,
+        notesMoved: Object.keys(noteAnchors).length
+      };
     });
   }
 
