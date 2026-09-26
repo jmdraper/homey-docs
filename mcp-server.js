@@ -255,6 +255,16 @@ const TOOLS = [
     annotations: { readOnlyHint: false },
   },
   {
+    name: 'relayout_flow',
+    description: 'Reposition every card in an advanced flow onto a tidy grid, following the spacing the rest of this Homey uses. Cards keep their connections and arguments; only coordinates change. Note cards are left where they are, since they are positioned beside what they describe.',
+    inputSchema: {
+      type: 'object',
+      properties: { flowId: { type: 'string' } },
+      required: ['flowId'],
+    },
+    annotations: { readOnlyHint: false, idempotentHint: true },
+  },
+  {
     name: 'create_advanced_flow',
     description: 'Create an empty advanced flow. It is created disabled; add cards with add_card, then enable it with set_flow_enabled.',
     inputSchema: {
@@ -671,6 +681,9 @@ class HomeyMcpServer {
 
         case 'connect_cards':
           return this._text(await app.connectCards(args.flowId, args.fromCardId, args.output, args.toCardId, args.connected));
+
+        case 'relayout_flow':
+          return this._text(await app.relayoutFlow(args.flowId));
 
         case 'create_advanced_flow':
           return this._text(await app.createAdvancedFlow(args.name, args.folder));

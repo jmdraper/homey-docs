@@ -984,6 +984,78 @@ class HomeyDocsCompanion extends Homey.App {
     });
   }
 
+  // Reposition every card in a flow onto the measured grid. Columns come from
+  // the longest path to each card, so a card always sits to the right of
+  // everything that can reach it, and rows stack using the same height
+  // estimate used when adding cards.
+  async relayoutFlow(flowId) {
+    return this._mutateAdvancedFlow(flowId, 'repositioned the cards', draft => {
+      const cards = draft.cards;
+      const ids = Object.keys(cards).filter(id => cards[id] && cards[id].type !== 'note');
+      if (!ids.length) return { error: 'this flow has no cards to lay out' };
+      const notes = Object.keys(cards).length - ids.length;
+
+      const parents = {};
+      for (const id of ids) parents[id] = [];
+      for (const id of ids) {
+        for (const output of CARD_OUTPUTS) {
+          for (const child of (cards[id][output] || [])) {
+            if (parents[child]) parents[child].push(id);
+          }
+        }
+      }
+
+      const depth = {};
+      const visiting = new Set();
+      const depthOf = id => {
+        if (depth[id] !== undefined) return depth[id];
+        if (visiting.has(id)) return 0;          // guard against a cycle
+        visiting.add(id);
+        const above = parents[id];
+        depth[id] = above.length ? Math.max.apply(null, above.map(depthOf)) + 1 : 0;
+        visiting.delete(id);
+        return depth[id];
+      };
+      ids.forEach(depthOf);
+
+      const columns = {};
+      for (const id of ids) (columns[depth[id]] = columns[depth[id]] || []).push(id);
+
+      const originX = Math.min.apply(null, ids.map(id => cards[id].x || 0));
+      const originY = Math.min.apply(null, ids.map(id => cards[id].y || 0));
+      const placedY = {};
+      let moved = 0;
+
+      for (const column of Object.keys(columns).map(Number).sort((a, b) => a - b)) {
+        // Follow the parents' order, so branches stay beside what feeds them
+        const members = columns[column].sort((a, b) => {
+          const above = id => (parents[id].length
+            ? Math.min.apply(null, parents[id].map(p => (placedY[p] === undefined ? 0 : placedY[p])))
+            : (cards[id].y || 0));
+          return above(a) - above(b) || (cards[a].y || 0) - (cards[b].y || 0);
+        });
+
+        let y = originY;
+        for (const id of members) {
+          const card = cards[id];
+          const x = originX + column * CARD_GAP_X;
+          if (card.x !== x || card.y !== y) moved += 1;
+          card.x = x;
+          card.y = y;
+          placedY[id] = y;
+          y += this._siblingGapBelow(card);
+        }
+      }
+
+      const result = { cardsRepositioned: moved, columns: Object.keys(columns).length };
+      if (notes) {
+        result.warning = notes + ' note card(s) were left where they were. Notes are '
+          + 'positioned next to what they describe, so they may no longer line up.';
+      }
+      return result;
+    });
+  }
+
   async createAdvancedFlow(name, folder) {
     if (!this._writesEnabled()) {
       return { error: 'Editing is turned off. Enable "Allow AI assistants to edit flows" in the app settings first.' };
