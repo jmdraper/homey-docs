@@ -141,6 +141,11 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
+    name: 'get_diagnostics',
+    description: 'Report the companion app’s own health: API reachability, snapshot counts, which Homey endpoints resolved, and how many flow card titles and folder names were looked up. Use when data looks wrong or incomplete — for example if card titles appear as raw ids.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'refresh_snapshot',
     description: 'Force the companion app to re-read Homey immediately, refreshing its cached flow/device/variable/zone data and rebuilding the cross-reference index, rather than waiting for the next 5-minute refresh. Call this if you suspect the cached data is stale.',
     inputSchema: { type: 'object', properties: {} },
@@ -505,6 +510,9 @@ class HomeyMcpServer {
 
         case 'get_app_actions':
           return this._text(await app.getAppActions());
+
+        case 'get_diagnostics':
+          return this._text(await app.getDiagnostics());
 
         case 'refresh_snapshot':
           return this._text(await app._refreshSnapshot());

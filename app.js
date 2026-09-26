@@ -8,6 +8,16 @@ const path = require('path');
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
+// Flow card registries — used to turn card ids into human titles
+const FLOW_CARD_PATHS = [
+  '/manager/flow/flowcardtrigger',
+  '/manager/flow/flowcardcondition',
+  '/manager/flow/flowcardaction',
+  '/manager/flow/flowcardtriggerdevice',
+  '/manager/flow/flowcardconditiondevice',
+  '/manager/flow/flowcardactiondevice',
+];
+
 // Candidate paths for advanced flows — tried in order, first success wins
 const ADVANCED_FLOW_PATHS = [
   '/manager/flow/advancedflow',
@@ -225,6 +235,7 @@ class HomeyDocsCompanion extends Homey.App {
       : (flow.trigger ? 1 : 0) + (flow.conditions || []).length + (flow.actions || []).length;
     return {
       name: flow.name,
+      folder: flow.folder || null,
       enabled: flow.enabled !== false,
       broken: flow.broken || false,
       cards: cardCount,
@@ -438,20 +449,50 @@ class HomeyDocsCompanion extends Homey.App {
   async _fetchFlowCardTitles() {
     if (this._cardTitles) return this._cardTitles;
     const titles = {};
-    for (const kind of ['flowcardtrigger', 'flowcardcondition', 'flowcardaction']) {
+    const probe = {};
+
+    const register = (key, text) => { if (key && text && !titles[key]) titles[key] = text; };
+    const titleOf = t => (typeof t === 'string' ? t : (t && (t.en || Object.values(t)[0])) || null);
+
+    for (const path of FLOW_CARD_PATHS) {
       try {
-        const data = await this._apiGet('/manager/flow/' + kind);
-        for (const [id, card] of Object.entries(data || {})) {
-          const t = card && card.title;
-          const text = typeof t === 'string' ? t : (t && (t.en || Object.values(t)[0]));
-          if (text) titles[id] = text;
+        const data = await this._apiGet(path);
+        const entries = Object.entries(data || {});
+        let added = 0;
+        for (const [key, card] of entries) {
+          const text = titleOf(card && card.title);
+          if (!text) continue;
+          // The registry may key by bare id, by full uri:id, or carry uri/id
+          // fields separately — register every shape so lookups hit whichever
+          // form the flow's card id uses.
+          register(key, text);
+          if (card.uri && card.id) register(card.uri + ':' + card.id, text);
+          if (card.id) register(card.id, text);
+          added++;
         }
+        probe[path] = { ok: true, entries: entries.length, titled: added };
       } catch (e) {
-        this.log('Could not fetch ' + kind + ':', e.message);
+        probe[path] = { ok: false, error: e.message };
       }
     }
+
+    // App card titles from the store manifests — a proven source that covers
+    // homey:app:* ids even if the on-device registry is unavailable.
+    try {
+      const apps = await this.getAppActions();
+      for (const app of Object.values(apps || {})) {
+        for (const group of ['triggers', 'conditions', 'actions']) {
+          for (const [cardId, text] of Object.entries(app[group] || {})) register(cardId, text);
+        }
+      }
+      probe.appManifests = { ok: true, apps: Object.keys(apps || {}).length };
+    } catch (e) {
+      probe.appManifests = { ok: false, error: e.message };
+    }
+
+    this._cardTitleProbe = probe;
     this._cardTitles = titles;
-    this.log('Flow card titles resolved:', Object.keys(titles).length);
+    this.log('Flow card titles resolved:', Object.keys(titles).length, JSON.stringify(probe));
     return titles;
   }
 
@@ -549,19 +590,40 @@ class HomeyDocsCompanion extends Homey.App {
       .filter(([id, c]) => c.type !== 'note' && !referenced.has(id))
       .sort((a, b) => (a[1].y || 0) - (b[1].y || 0) || (a[1].x || 0) - (b[1].x || 0));
 
+    // Cards reached from more than one place get a stable marker, so a
+    // cross-reference points at one specific card rather than at a label that
+    // may occur many times in the same flow.
+    const inDegree = {};
+    for (const card of Object.values(cards)) {
+      for (const [key] of OUTPUTS) {
+        for (const id of (card[key] || [])) inDegree[id] = (inDegree[id] || 0) + 1;
+      }
+    }
+
     const lines = [];
-    const rendered = new Set();
+    const rendered = new Map();
+    let marker = 0;
     const walk = (id, depth, branch) => {
       const card = cards[id];
       const pad = '  '.repeat(depth);
       if (!card) { lines.push(pad + (branch ? branch + ' ' : '') + '[missing card]'); return; }
       const head = pad + (branch ? branch + ' ' : '');
       if (rendered.has(id)) {
-        lines.push(head + '-> continues at "' + this._cardLabel(card, titles) + '" shown above');
+        const at = rendered.get(id);
+        lines.push(head + (at
+          ? '-> continues at [' + at + ']'
+          : '-> continues at "' + this._cardLabel(card, titles) + '" above'));
         return;
       }
-      rendered.add(id);
-      lines.push(head + this._cardLabel(card, titles));
+      let tag = '';
+      if ((inDegree[id] || 0) > 1) {
+        marker += 1;
+        rendered.set(id, marker);
+        tag = '[' + marker + '] ';
+      } else {
+        rendered.set(id, null);
+      }
+      lines.push(head + tag + this._cardLabel(card, titles));
       for (const [key, label] of OUTPUTS) {
         const children = card[key] || [];
         if (!children.length) continue;
@@ -1461,6 +1523,12 @@ function copyPrompt(){
       initialised_at: this.snapshot.initialised_at
     };
     result.advancedFlowPath = this._advancedFlowPath;
+    await this._fetchFlowCardTitles();
+    result.cardTitles = {
+      count: Object.keys(this._cardTitles || {}).length,
+      probe: this._cardTitleProbe || null
+    };
+    result.folderNames = Object.keys(await this._fetchFolderNames()).length;
     result.appDir = __dirname;
 
     try {
