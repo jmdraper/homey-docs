@@ -162,27 +162,26 @@ class HomeyDocsCompanion extends Homey.App {
     // Discover advanced flow path once and cache it
     this._advancedFlowPath = this.homey.settings.get('advancedFlowPath') || null;
 
+    // Servers first, so a restart does not take the viewer and MCP offline while
+    // Homey is re-read. Both serve from state persisted in settings — the stored
+    // page and the previous snapshot — so they answer correctly straight away,
+    // at worst with data one refresh interval old. Anything behind a reverse
+    // proxy sees a 502 for the whole of this window otherwise.
+    await this._startXrefServer();
+    await this._startMcpServer();
+
     // The snapshot is a cache, not a record — rebuild it on every start.
-    // Non-fatal: a bad refresh must not stop the servers from coming up, or a
-    // single malformed card would take the MCP server down with it. The
-    // interval below retries.
-    try {
-      await this._refreshSnapshot();
-    } catch (e) {
-      this.error('Initial snapshot refresh failed (continuing):', e.message);
-    }
+    // Not awaited: it is a background warm-up, and a slow or failing read must
+    // not hold up the rest of onInit. Failure is non-fatal for the same reason
+    // the servers come first; the interval below retries.
+    this._refreshSnapshot()
+      .catch(e => this.error('Initial snapshot refresh failed (continuing):', e.message));
 
     // Keep the cache warm
     this.homey.setInterval(
       () => this._refreshSnapshot().catch(e => this.error('Refresh error:', e.message)),
       REFRESH_INTERVAL_MS
     );
-
-    // Start the cross-reference HTTP server
-    await this._startXrefServer();
-
-    // Start the MCP server
-    await this._startMcpServer();
 
     // Register the flow action card
     this.homey.flow
@@ -192,7 +191,7 @@ class HomeyDocsCompanion extends Homey.App {
         return true;
       });
 
-    this.log(`Ready. Tracking ${Object.keys(this.snapshot.flows).length} flows, ${Object.keys(this.snapshot.devices).length} devices.`);
+    this.log(`Ready. Serving ${Object.keys(this.snapshot.flows).length} cached flows, ${Object.keys(this.snapshot.devices).length} devices; refreshing in background.`);
   }
 
   // ─── HTTP helper ────────────────────────────────────────────────────────────
