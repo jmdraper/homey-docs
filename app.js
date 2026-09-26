@@ -38,6 +38,19 @@ const CARD_GAP_X_BY_TYPE = {
   condition: 460,
 };
 const CARD_GAP_X = 440;
+// Heights vary by type too. start, delay and any render short and fixed; an
+// ALL card grows with the number of connections feeding it, measured here at
+// roughly 120px at two inputs rising to 500px at ten.
+const CARD_GAP_Y_BY_TYPE = {
+  start: 80,
+  delay: 80,
+  any: 80,
+  action: 100,
+  trigger: 100,
+  condition: 100,
+};
+const CARD_GAP_Y_ALL_BASE = 40;
+const CARD_GAP_Y_ALL_PER_INPUT = 48;
 const CARD_GAP_Y = 100;
 const CARD_GAP_Y_MAX = 360;
 const CARD_ROW_GAP_Y = 260;
@@ -617,11 +630,55 @@ class HomeyDocsCompanion extends Homey.App {
       }
     }
 
+    // An ALL card's input array must agree with the edges that actually reach it
+    for (const [cardId, card] of Object.entries(cards)) {
+      if (!card || card.type !== 'all') continue;
+      const reaching = [];
+      for (const [otherId, other] of Object.entries(cards)) {
+        if (!other || typeof other !== 'object') continue;
+        for (const output of CARD_OUTPUTS) {
+          if ((other[output] || []).includes(cardId)) reaching.push(otherId + '::' + output);
+        }
+      }
+      const declared = Array.isArray(card.input) ? card.input : [];
+      if (declared.length !== reaching.length
+          || reaching.some(entry => !declared.includes(entry))) {
+        problems.push(`ALL card ${cardId} lists ${declared.length} input(s) but `
+          + `${reaching.length} connection(s) reach it`);
+      }
+    }
+
     const runnable = Object.values(cards)
       .some(card => card && (card.type === 'trigger' || card.type === 'start'));
     if (!runnable) problems.push('flow has no trigger or start card, so it could never run');
 
     return problems;
+  }
+
+  // An ALL card carries an explicit `input` array of "<cardId>::<output>"
+  // entries, one per incoming connection — no other card type has one, and
+  // Homey sizes the card from it. Editing an output array without updating it
+  // leaves the gate rendering the wrong number of sockets and disagreeing with
+  // its own connections, so rebuild it from the edges after every change.
+  // Existing entries keep their order, so a write does not reshuffle sockets
+  // the author arranged.
+  _syncAllInputs(cards) {
+    const incoming = {};
+    for (const [cardId, card] of Object.entries(cards)) {
+      if (!card || typeof card !== 'object') continue;
+      for (const output of CARD_OUTPUTS) {
+        for (const target of (card[output] || [])) {
+          (incoming[target] = incoming[target] || []).push(cardId + '::' + output);
+        }
+      }
+    }
+    for (const [cardId, card] of Object.entries(cards)) {
+      if (!card || card.type !== 'all') continue;
+      const actual = incoming[cardId] || [];
+      const existing = Array.isArray(card.input) ? card.input : [];
+      const kept = existing.filter(entry => actual.includes(entry));
+      card.input = kept.concat(actual.filter(entry => !kept.includes(entry)));
+    }
   }
 
   // Accepts a full card id or any unambiguous prefix, so the short ids shown by
@@ -792,6 +849,7 @@ class HomeyDocsCompanion extends Homey.App {
     }
     if (outcome && outcome.error) return outcome;
 
+    this._syncAllInputs(draft.cards);
     const problems = this._validateCards(draft.cards);
     if (problems.length) {
       return { error: 'Refusing to write — the result would be a broken flow', problems };
@@ -920,11 +978,23 @@ class HomeyDocsCompanion extends Homey.App {
   // How far below a card the next sibling should sit, given how tall it will
   // render. Argument length is the only signal available before rendering.
   _siblingGapBelow(card) {
+    const type = card && card.type;
+
+    // An ALL card is sized by how many connections feed into it
+    if (type === 'all') {
+      const inputs = Array.isArray(card.input) ? card.input.length : 0;
+      return CARD_GAP_Y_ALL_BASE + (inputs * CARD_GAP_Y_ALL_PER_INPUT);
+    }
+
+    const base = CARD_GAP_Y_BY_TYPE[type] || CARD_GAP_Y;
+    // Only full-size cards grow with their text; the compact ones do not
+    if (base < CARD_GAP_Y) return base;
+
     let text = '';
     try { text = JSON.stringify(card.args || {}); } catch (e) { text = ''; }
-    if (text.length <= 200) return CARD_GAP_Y;
+    if (text.length <= 200) return base;
     const extra = Math.ceil((text.length - 200) / 100) * 60;
-    return Math.min(CARD_GAP_Y + extra, CARD_GAP_Y_MAX);
+    return Math.min(base + extra, CARD_GAP_Y_MAX);
   }
 
   async addCard(flowId, card, after) {
