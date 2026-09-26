@@ -62,6 +62,8 @@ const CARD_BAND_GAP_Y = 0;
 const NOTE_HEIGHT_BASE = 80;
 const NOTE_HEIGHT_PER_CHARS = 40;
 const NOTE_HEIGHT_MAX = 200;
+// Breathing room between a heading note and whatever sits above it
+const NOTE_GAP_ABOVE = 40;
 
 const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
 const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
@@ -1074,7 +1076,7 @@ class HomeyDocsCompanion extends Homey.App {
         // Sit above the card it heads, at the same left edge
         const anchor = anchorId ? draft.cards[anchorId] : null;
         newCard.x = anchor ? (anchor.x || 0) : 0;
-        const clearance = this._noteHeight(newCard);
+        const clearance = this._noteHeight(newCard) + NOTE_GAP_ABOVE;
         newCard.y = anchor
           ? (anchor.y || 0) - clearance
           : (existing.length ? Math.min.apply(null, existing.map(c => c.y || 0)) - clearance : 0);
@@ -1180,7 +1182,40 @@ class HomeyDocsCompanion extends Homey.App {
     return anchors;
   }
 
-  _layoutGroup(cards, group, parents, originX, bandTop) {
+  // Place one column's cards at their preferred positions, clustering those
+  // that want the same spot and centring each cluster on it.
+  _placeColumn(cards, members, desired, columnTop, placedY, columnX) {
+    members.sort((a, b) => desired[a] - desired[b] || (cards[a].y || 0) - (cards[b].y || 0));
+
+    const clusters = [];
+    for (const id of members) {
+      const last = clusters[clusters.length - 1];
+      if (last && Math.abs(desired[id] - last.desired) < 1) last.ids.push(id);
+      else clusters.push({ desired: desired[id], ids: [id] });
+    }
+
+    let moved = 0;
+    let cursor = columnTop;
+    for (const cluster of clusters) {
+      const gaps = cluster.ids.map(id => this._siblingGapBelow(cards[id]));
+      const extent = gaps.slice(0, -1).reduce((total, gap) => total + gap, 0);
+      let y = Math.round((cluster.desired - (extent / 2)) / 20) * 20;
+      if (y < cursor) y = cursor;
+
+      cluster.ids.forEach((id, index) => {
+        const card = cards[id];
+        if (card.x !== columnX || card.y !== y) moved += 1;
+        card.x = columnX;
+        card.y = y;
+        placedY[id] = y;
+        y += gaps[index];
+      });
+      cursor = y;
+    }
+    return { moved, bottom: cursor };
+  }
+
+  _layoutGroup(cards, group, parents, children, originX, bandTop) {
     const inGroup = new Set(group);
     const depth = {};
     const visiting = new Set();
@@ -1208,50 +1243,76 @@ class HomeyDocsCompanion extends Homey.App {
 
     const placedY = {};
     let moved = 0;
-    let bottom = bandTop;
 
-    for (const column of order) {
-      const members = columns[column];
-      const desired = {};
-      for (const id of members) {
-        const feeding = parents[id]
-          .filter(p => inGroup.has(p))
-          .map(p => placedY[p])
-          .filter(value => value !== undefined);
-        desired[id] = feeding.length
-          ? (Math.min.apply(null, feeding) + Math.max.apply(null, feeding)) / 2
-          : bandTop;
+    // A card sits level with the middle of whatever it connects to. Sweeping
+    // left to right settles it against its parents; sweeping back settles it
+    // against its children. Doing both matters for fan-outs: a gate placed only
+    // by its parents sits well above the cards it feeds, so every connection
+    // leaves it at a steep angle and the lines bunch together. Two passes is
+    // the usual compromise — more rarely changes anything a reader notices.
+    const midpointOf = (id, side) => {
+      const neighbours = side[id]
+        .filter(other => inGroup.has(other))
+        .map(other => placedY[other])
+        .filter(value => value !== undefined);
+      if (!neighbours.length) return null;
+      return (Math.min.apply(null, neighbours) + Math.max.apply(null, neighbours)) / 2;
+    };
+
+    const sweep = (sequence, side) => {
+      let bottom = bandTop;
+      for (const column of sequence) {
+        const desired = {};
+        for (const id of columns[column]) {
+          const target = midpointOf(id, side);
+          desired[id] = target === null ? bandTop : target;
+        }
+        const placed = this._placeColumn(cards, columns[column], desired, bandTop, placedY, columnX[column]);
+        moved += placed.moved;
+        bottom = Math.max(bottom, placed.bottom);
       }
-      members.sort((a, b) => desired[a] - desired[b] || (cards[a].y || 0) - (cards[b].y || 0));
+      return bottom;
+    };
 
-      const clusters = [];
-      for (const id of members) {
-        const last = clusters[clusters.length - 1];
-        if (last && Math.abs(desired[id] - last.desired) < 1) last.ids.push(id);
-        else clusters.push({ desired: desired[id], ids: [id] });
+    // How far the connectors in this behaviour have to travel vertically.
+    // Readability tracks this more closely than crossing count: on these flows
+    // the crossings are fixed by the topology, but a gate placed badly leaves
+    // every line steep. Lower is flatter is easier to follow.
+    const travel = () => {
+      let total = 0;
+      for (const id of group) {
+        for (const child of children[id]) {
+          if (!inGroup.has(child)) continue;
+          total += Math.abs((placedY[child] || 0) - (placedY[id] || 0));
+        }
       }
+      return total;
+    };
+    const snapshot = () => group.map(id => cards[id].y);
+    const restore = saved => group.forEach((id, index) => {
+      cards[id].y = saved[index];
+      placedY[id] = saved[index];
+    });
 
-      let cursor = bandTop;
-      for (const cluster of clusters) {
-        const gaps = cluster.ids.map(id => this._siblingGapBelow(cards[id]));
-        const extent = gaps.slice(0, -1).reduce((total, gap) => total + gap, 0);
-        let y = Math.round((cluster.desired - (extent / 2)) / 20) * 20;
-        if (y < cursor) y = cursor;
-
-        cluster.ids.forEach((id, index) => {
-          const card = cards[id];
-          const x = columnX[column];
-          if (card.x !== x || card.y !== y) moved += 1;
-          card.x = x;
-          card.y = y;
-          placedY[id] = y;
-          y += gaps[index];
-        });
-        cursor = y;
-      }
-      bottom = Math.max(bottom, cursor);
+    // Sweeping one way settles each card against its parents, the other way
+    // against its children; neither alone is right, and whichever the last
+    // sweep was would otherwise win by default. Keep the best.
+    const reversed = order.slice().reverse();
+    sweep(order, parents);
+    let best = { y: snapshot(), cost: travel() };
+    for (const [sequence, side] of [[reversed, children], [order, parents], [reversed, children]]) {
+      sweep(sequence, side);
+      const cost = travel();
+      if (cost < best.cost) best = { y: snapshot(), cost };
     }
-    return { moved, columns: order.length, bottom };
+    restore(best.y);
+
+    let bottom = bandTop;
+    for (const id of group) {
+      bottom = Math.max(bottom, (cards[id].y || 0) + this._siblingGapBelow(cards[id]));
+    }
+
+    return { moved, columns: order.length, bottom, lastColumnX: columnX[order[order.length - 1]] };
   }
 
   async relayoutFlow(flowId) {
@@ -1290,7 +1351,7 @@ class HomeyDocsCompanion extends Homey.App {
         let clearance = 0;
         for (const [noteId, anchor] of Object.entries(noteAnchors)) {
           if (!members.has(anchor.anchor) || anchor.dy >= 0) continue;
-          clearance = Math.max(clearance, this._noteHeight(cards[noteId]));
+          clearance = Math.max(clearance, this._noteHeight(cards[noteId]) + NOTE_GAP_ABOVE);
         }
         return clearance;
       };
@@ -1298,12 +1359,25 @@ class HomeyDocsCompanion extends Homey.App {
       let moved = 0;
       let widest = 0;
       let bandTop = originY;
+      const laidOut = [];
       for (const group of groups) {
         bandTop += headroomFor(group);
-        const laid = this._layoutGroup(cards, group, parents, originX, bandTop);
+        const laid = this._layoutGroup(cards, group, parents, children, originX, bandTop);
+        laidOut.push({ group, laid });
         moved += laid.moved;
         widest = Math.max(widest, laid.columns);
         bandTop = laid.bottom + CARD_BAND_GAP_Y;
+      }
+
+      // Right-align the last column of every behaviour. Bands end at different
+      // depths, so their final cards otherwise land a little apart — close
+      // enough to read as a mistake rather than a choice.
+      const finalX = Math.max.apply(null, laidOut.map(entry => entry.laid.lastColumnX));
+      for (const entry of laidOut) {
+        if (entry.laid.lastColumnX === finalX) continue;
+        for (const id of entry.group) {
+          if (cards[id].x === entry.laid.lastColumnX) cards[id].x = finalX;
+        }
       }
 
       for (const [noteId, anchor] of Object.entries(noteAnchors)) {
@@ -1313,7 +1387,7 @@ class HomeyDocsCompanion extends Homey.App {
         let dy = anchor.dy;
         // A note above its card must clear the card's own height, whatever
         // offset it was stored with
-        const clearance = this._noteHeight(note);
+        const clearance = this._noteHeight(note) + NOTE_GAP_ABOVE;
         if (dy < 0 && dy > -clearance) dy = -clearance;
         note.x = (target.x || 0) + anchor.dx;
         note.y = (target.y || 0) + dy;
