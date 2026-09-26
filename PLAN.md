@@ -1,6 +1,6 @@
 # Homey Docs Companion — Development Plan
 
-Status: step 1 complete. Built one step at a time, in order.
+Status: steps 1–3 complete. Built one step at a time, in order.
 
 ## Context
 
@@ -97,7 +97,7 @@ refresh):
   `null` to distinguish a failed read from an empty Homey, and the assignment is
   guarded like the device/variable/zone ones already were.
 
-## Step 2 — Rewrite the FlowBits extractor
+## Step 2 — Rewrite the FlowBits extractor ✅ done
 
 `_extractFlowBitsRef` identifies entities by *which arg is present*. That cannot be
 extended to the new types, because mode cards and cycle cards share an arg key:
@@ -169,9 +169,18 @@ Chronograph timers remain in the existing `timers` bucket, keyed by `args.namedd
   the distinction from `event_triggered`.
 
 **Done when:** `get_cross_references` returns populated buckets for every new type
-against real flow data.
+against real flow data. ✅ Verified against live Homey — 31 distinct FlowBits cards in
+use across 359 instances, none unrouted. All 141 cards from FlowBits' own app.json
+were driven through the extractor: 115 placed, 26 skipped, all 26 genuinely
+entity-less.
 
-## Step 3 — Devices as a cross-reference type, and viewer updates
+**Corrected during implementation:** `mode_toggle` and `mode_group_toggle` were
+landing as `activates`. The plan's role table gave modes only activates/deactivates,
+but FlowBits has toggle cards for modes exactly as for sets and flags, and a toggle
+can deactivate. Both now use `toggles`. Also declared `trigger_tokens` in the result
+skeleton and added it to the enum — it was populated but not filterable.
+
+## Step 3 — Devices as a cross-reference type, and viewer updates ✅ done
 
 The index covers variables, events, labels, timers and flow triggers — but **not
 devices**. "Which flows control the kitchen lights?" is likely the most common
@@ -194,6 +203,26 @@ grouped rendering.
 **`mcp-server.js`** — extend the `get_cross_references` type enum.
 
 **Done when:** every collected bucket is reachable in the viewer and counted in "All".
+✅ 13 tabs render against live data, 394 entries in "All".
+
+**Device extraction covers three patterns**, confirmed by scanning 5021 real cards:
+`ownerUri: homey:device:<uuid>` on capability cards (1394 cards — the dominant form,
+with the capability in the card id), `args.device` on app cards, and
+`homey:device:<uuid>|<capability>` capability tokens read into other cards' arguments.
+Result: 210 of 244 devices cross-referenced, with zone and capability lists resolved.
+
+**Delivered beyond the written plan:**
+- **Empty tabs are hidden.** With 16 possible sections, a Homey that uses none of
+  sets/modes/cycles/sliders would show four permanent zero tabs. Only populated
+  sections get a tab now.
+- **The legend is derived from the data** rather than a hardcoded role list, so it
+  cannot drift as roles are added.
+- **Missing devices are flagged.** Devices referenced by a flow but absent from Homey
+  get `missing: true` and a "not in Homey" badge — a deleted device whose cards were
+  left behind. Live data turned up two, referenced by three flows.
+- **Per-flow member chips** show which capabilities / states / modes each flow
+  actually touches, not just that it touches the entity.
+- Deleted `SECTION_LABELS`, which was defined but never referenced.
 
 ## Step 4 — Navigation tools
 
@@ -332,6 +361,15 @@ Spotted while working; none blocking, all deferred deliberately.
   `[BLL] /ALL returned no usable data: []`. Handled gracefully, but if BLL *is*
   installed with variables defined, the empty result is worth investigating — the
   `bll_variables` bucket would be silently empty.
+
+### Deferred from step 3
+
+- **`trigger_tokens` has no viewer tab, deliberately.** It holds 93 entries, but its
+  keys are opaque `<cardUuid>::<tokenName>` pairs — a tab would show 93 UUIDs. Making
+  it useful needs card-title resolution, which is exactly what `get_flow_summary`
+  builds in step 4. Revisit then; it is the one bucket not reachable from the viewer.
+- **Watch the size of `xref_html`.** The rendered page is now ~192KB held in app
+  settings; devices roughly doubled it. Fine today, but it grows with the estate.
 
 ## Development workflow
 

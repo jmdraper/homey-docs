@@ -801,6 +801,7 @@ function copyPrompt(){
 
   async getCrossReferences() {
     const result = {
+      devices: {},
       variables: {},
       bll_variables: {},
       timers: {},          // Chronograph; FlowBits timers live in flowbits_timers
@@ -862,10 +863,63 @@ function copyPrompt(){
     } else if (owner === 'homey:manager:flow') {
       this._extractFlowTriggerRef(result, flowId, flowName, card);
     }
+    // Device references are owner-based, arg-based or token-based rather than
+    // namespaced like the above, so this runs for every card
+    this._extractDeviceRef(result, flowId, flowName, card);
     // Generic token scan — catches [[...]] patterns in any card, any namespace
     this._extractTokenRefs(result, flowId, flowName, card);
     // BLL variable detection — always run; coding expression scan is skipped internally if bllVarNames is empty
     this._extractBllRefs(result, flowId, flowName, card, bllVarNames);
+  }
+
+  // Devices appear three ways: as the card's owner (capability cards, where the
+  // card id carries the capability), as a `device` argument on an app card, and
+  // as a capability token read into another card's arguments.
+  _extractDeviceRef(result, flowId, flowName, card) {
+    const args = card.args || {};
+    let deviceId = null;
+    let capability = null;
+
+    const ownerMatch = String(card.ownerUri || '').match(/^homey:device:([a-f0-9-]{36})$/);
+    if (ownerMatch) {
+      deviceId = ownerMatch[1];
+      const idMatch = String(card.id || '').match(/^homey:device:[a-f0-9-]{36}:(.+)$/);
+      if (idMatch) capability = idMatch[1];
+    } else if (args.device && args.device.id) {
+      deviceId = args.device.id;
+    }
+    if (!deviceId) return;
+
+    const role = card.type === 'action' ? 'controls'
+      : card.type === 'condition' ? 'checks'
+      : card.type === 'trigger' ? 'triggers_on'
+      : null;
+    if (!role) return;
+
+    this._addDeviceRef(result, deviceId, capability, flowId, flowName, role);
+  }
+
+  _addDeviceRef(result, deviceId, capability, flowId, flowName, role) {
+    if (!result.devices[deviceId]) {
+      const meta = (this.snapshot.devices || {})[deviceId];
+      const zone = meta && (this.snapshot.zones || {})[meta.zone];
+      result.devices[deviceId] = {
+        name: meta ? meta.name : deviceId,
+        zone: zone ? zone.name : null,
+        // Referenced by a flow but absent from Homey — a deleted device whose
+        // cards were left behind. Worth surfacing rather than hiding.
+        missing: !meta,
+        capabilities: [],
+        flows: {}
+      };
+    }
+    const entry = result.devices[deviceId];
+    if (capability && !entry.capabilities.includes(capability)) entry.capabilities.push(capability);
+
+    if (!entry.flows[flowId]) entry.flows[flowId] = { flowName, roles: [], capabilities: [] };
+    const flow = entry.flows[flowId];
+    if (!flow.roles.includes(role)) flow.roles.push(role);
+    if (capability && !flow.capabilities.includes(capability)) flow.capabilities.push(capability);
   }
 
   _addFlowRole(entry, flowId, flowName, role) {
@@ -907,6 +961,12 @@ function copyPrompt(){
       this._addVariableRef(result, logicMatch[1], flowId, flowName, role);
       return;
     }
+    // Device capability token, e.g. homey:device:<uuid>|measure_luminance
+    const deviceMatch = droptoken.match(/^homey:device:([a-f0-9-]{36})\|(.+)$/);
+    if (deviceMatch) {
+      this._addDeviceRef(result, deviceMatch[1], deviceMatch[2], flowId, flowName, role);
+      return;
+    }
     // Pattern 2: trigger::CARD_UUID::TOKEN_NAME
     const triggerMatch = droptoken.match(/^trigger::([a-f0-9-]{36})::(\w+)$/);
     if (triggerMatch) {
@@ -923,6 +983,9 @@ function copyPrompt(){
     if (typeof obj === 'string') {
       for (const match of obj.matchAll(/\[\[homey:manager:logic\|([a-f0-9-]{36})\]\]/g)) {
         this._addVariableRef(result, match[1], flowId, flowName, 'reads');
+      }
+      for (const match of obj.matchAll(/\[\[homey:device:([a-f0-9-]{36})\|([^\]]+)\]\]/g)) {
+        this._addDeviceRef(result, match[1], match[2], flowId, flowName, 'reads');
       }
       for (const match of obj.matchAll(/\[\[trigger::([a-f0-9-]{36})::(\w+)\]\]/g)) {
         this._processDroptoken(result, flowId, flowName, `trigger::${match[1]}::${match[2]}`, 'reads');

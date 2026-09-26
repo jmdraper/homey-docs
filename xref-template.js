@@ -118,6 +118,7 @@ module.exports = `<!DOCTYPE html>
   .type-string  { background: var(--blue-bg);  color: var(--blue-text); }
   .type-number  { background: var(--amber-bg); color: var(--amber-text); }
   .type-trigger { background: var(--gray-bg);  color: var(--gray-text); }
+  .type-missing { background: var(--coral-bg); color: var(--coral-text); }
 
   .source-badge { font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
   .source-bll   { background: var(--coral-bg); color: var(--coral-text); }
@@ -171,6 +172,23 @@ module.exports = `<!DOCTYPE html>
   .role-started_by  { background: var(--purple-bg); color: var(--purple-text); }
   .role-bll_direct  { background: var(--amber-bg); color: var(--amber-text); }
   .role-bll_coding  { background: var(--teal-bg);  color: var(--teal-text); }
+  .role-controls    { background: var(--coral-bg); color: var(--coral-text); }
+  .role-sends       { background: var(--coral-bg); color: var(--coral-text); }
+  .role-received_by { background: var(--purple-bg); color: var(--purple-text); }
+  .role-cleared_by  { background: var(--purple-bg); color: var(--purple-text); }
+  .role-toggles     { background: var(--amber-bg); color: var(--amber-text); }
+  .role-advances    { background: var(--teal-bg);  color: var(--teal-text); }
+
+  .zone-badge {
+    font-size: 11px; font-weight: 500; padding: 2px 8px;
+    border-radius: 999px; white-space: nowrap;
+    background: var(--blue-bg); color: var(--blue-text);
+  }
+  .members { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+  .member {
+    font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+    background: var(--gray-bg); color: var(--gray-text);
+  }
 
   .group-header {
     font-size: 12px; font-weight: 500; letter-spacing: 0.04em;
@@ -360,13 +378,23 @@ const META = %%META%%;
 const DATA = %%DATA%%;
 
 const SECTIONS = [
-  { key: 'all',             label: 'All',             icon: '\\uD83D\\uDD0D' },
-  { key: 'variables',       label: 'Variables',       icon: '\\uD83D\\uDCCA' },
-  { key: 'bll_variables',   label: 'BLL variables',   icon: '\\uD83D\\uDCDA' },
-  { key: 'flowbits_events', label: 'FlowBits events', icon: '\\u26A1' },
-  { key: 'flowbits_labels', label: 'FlowBits labels', icon: '\\uD83D\\uDCE2' },
-  { key: 'timers',          label: 'Timers',          icon: '\\u23F1' },
-  { key: 'flow_triggers',   label: 'Flow triggers',   icon: '\\u25B6' },
+  { key: 'all',                  label: 'All',            icon: '\\uD83D\\uDD0D' },
+  { key: 'devices',              label: 'Devices',        icon: '\\uD83D\\uDCA1' },
+  { key: 'variables',            label: 'Variables',      icon: '\\uD83D\\uDCCA' },
+  { key: 'bll_variables',        label: 'BLL variables',  icon: '\\uD83D\\uDCDA' },
+  { key: 'flowbits_events',      label: 'FB events',      icon: '\\u26A1' },
+  { key: 'flowbits_labels',      label: 'FB labels',      icon: '\\uD83D\\uDCE2' },
+  { key: 'flowbits_sets',        label: 'FB sets',        icon: '\\uD83C\\uDF9B' },
+  { key: 'flowbits_signals',     label: 'FB signals',     icon: '\\uD83D\\uDCE1' },
+  { key: 'flowbits_modes',       label: 'FB modes',       icon: '\\uD83C\\uDF9A' },
+  { key: 'flowbits_mode_groups', label: 'FB mode groups', icon: '\\uD83D\\uDDC2' },
+  { key: 'flowbits_timers',      label: 'FB timers',      icon: '\\u23F2' },
+  { key: 'flowbits_flags',       label: 'FB flags',       icon: '\\uD83D\\uDEA9' },
+  { key: 'flowbits_cycles',      label: 'FB cycles',      icon: '\\uD83D\\uDD01' },
+  { key: 'flowbits_sliders',     label: 'FB sliders',     icon: '\\uD83C\\uDF9A' },
+  { key: 'flowbits_windows',     label: 'No-repeat',      icon: '\\uD83D\\uDEA7' },
+  { key: 'timers',               label: 'Chronograph',    icon: '\\u23F1' },
+  { key: 'flow_triggers',        label: 'Flow triggers',  icon: '\\u25B6' },
 ];
 
 const ROLE_LABELS = {
@@ -374,7 +402,9 @@ const ROLE_LABELS = {
   fires: 'fires', triggered_by: 'triggered by', checks: 'checks', clears: 'clears',
   starts: 'starts', stops: 'stops', activates: 'activates', deactivates: 'deactivates', calls: 'calls',
   started_by: 'started by',
-  bll_coding: 'BLL coding'
+  bll_coding: 'BLL coding',
+  controls: 'controls', sends: 'sends', received_by: 'received by',
+  cleared_by: 'cleared by', toggles: 'toggles', advances: 'advances'
 };
 
 const ROLE_TOOLTIPS = {
@@ -392,16 +422,18 @@ const ROLE_TOOLTIPS = {
   calls:        'Programmatically triggers another flow',
   starts:       'Starts a timer or programmatically triggers another flow',
   started_by:   'This flow is programmatically triggered by another flow',
+  controls:     'Sets a capability on this device',
+  sends:        'Sends this signal',
+  received_by:  'Flow runs when this signal is received',
+  cleared_by:   'Flow runs when this event is cleared',
+  toggles:      'Flips this between active and inactive',
+  advances:     'Steps this cycle counter to its next value',
 };
 
 document.getElementById('updated-label').textContent = 'Generated ' + GENERATED;
 
 let activeTab = 'all';
 
-const SECTION_LABELS = {
-  variables: 'variable', bll_variables: 'BLL variable', flowbits_events: 'event',
-  flowbits_labels: 'label', timers: 'timer', flow_triggers: 'trigger'
-};
 
 function countEntries(key) {
   if (key === 'all') return SECTIONS.filter(s => s.key !== 'all').reduce((n, s) => n + Object.keys(DATA[s.key] || {}).length, 0);
@@ -411,10 +443,13 @@ function countEntries(key) {
 function buildTabs() {
   const el = document.getElementById('tabs');
   SECTIONS.forEach(s => {
+    const n = countEntries(s.key);
+    // An empty bucket means this Homey does not use that entity type at all —
+    // showing a zero tab for each would crowd out the ones that matter
+    if (n === 0 && s.key !== 'all') return;
     const btn = document.createElement('button');
     btn.className = 'tab' + (s.key === activeTab ? ' active' : '');
     btn.dataset.key = s.key;
-    const n = countEntries(s.key);
     btn.innerHTML = s.icon + ' ' + s.label + ' <span class="count">' + n + '</span>';
     btn.addEventListener('click', () => { activeTab = s.key; rebuildUI(); });
     el.appendChild(btn);
@@ -423,17 +458,21 @@ function buildTabs() {
 
 function buildLegend() {
   const el = document.getElementById('legend');
-  const roles = [
-    {r:'writes',label:'writes'}, {r:'reads',label:'reads'}, {r:'triggers_on',label:'triggers on'},
-    {r:'fires',label:'fires'}, {r:'triggered_by',label:'triggered by'},
-    {r:'checks',label:'checks'}, {r:'clears',label:'clears'},
-    {r:'starts',label:'starts'}, {r:'stops',label:'stops'}, {r:'started_by',label:'started by'}
-  ];
-  roles.forEach(({r, label}) => {
+  el.innerHTML = '';
+  const present = new Set();
+  Object.entries(DATA).forEach(([key, entries]) => {
+    Object.values(entries || {}).forEach(e => {
+      Object.values(e.flows || {}).forEach(f => (f.roles || []).forEach(r => present.add(r)));
+      // flow_triggers keeps its roles under calledBy/starts instead of flows
+      Object.values(e.calledBy || {}).forEach(f => (f.roles || []).forEach(r => present.add(r)));
+      Object.values(e.starts || {}).forEach(f => (f.roles || []).forEach(r => present.add(r)));
+    });
+  });
+  Array.from(present).sort().forEach(r => {
     const item = document.createElement('span');
     item.className = 'legend-item';
     const tip = ROLE_TOOLTIPS[r] ? ' data-tooltip="' + ROLE_TOOLTIPS[r] + '"' : '';
-    item.innerHTML = '<span class="role role-' + r + '"' + tip + '>' + label + '</span>';
+    item.innerHTML = '<span class="role role-' + r + '"' + tip + '>' + (ROLE_LABELS[r] || r) + '</span>';
     el.appendChild(item);
   });
 }
@@ -462,7 +501,12 @@ function makeEntry(name, flows, extraBadge) {
     const rolesHtml = (f.roles || []).map(r =>
       '<span class="role role-' + r + '">' + (ROLE_LABELS[r] || r) + '</span>'
     ).join('');
-    row.innerHTML = '<span class="flow-name">' + esc(f.flowName) + '</span><span class="roles">' + rolesHtml + '</span>';
+    const members = f.capabilities || f.states || f.modes || [];
+    const membersHtml = members.length
+      ? '<span class="members">' + members.map(m => '<span class="member">' + esc(m) + '</span>').join('') + '</span>'
+      : '';
+    row.innerHTML = '<span class="flow-name">' + esc(f.flowName) + '</span>' + membersHtml +
+      '<span class="roles">' + rolesHtml + '</span>';
     body.appendChild(row);
   });
 
@@ -539,9 +583,19 @@ function buildSectionItems(key) {
         else combined[fid] = { ...f, roles: f.roles || [] };
       });
       flows = Object.keys(combined).length > 0 ? combined : { _self: { flowName: '(triggerable, no callers detected)', roles: [] } };
+    } else if (key === 'devices') {
+      name = item.name;
+      flows = item.flows;
+      badge = (item.missing ? '<span class="type-badge type-missing">not in Homey</span>' : '') +
+        (item.zone ? '<span class="zone-badge">' + esc(item.zone) + '</span>' : '');
     } else {
       name = id;
       flows = item.flows;
+      const members = item.states || item.modes;
+      if (members && members.length) {
+        badge = '<span class="type-badge type-trigger">' + members.length +
+          (item.states ? ' states' : ' modes') + '</span>';
+      }
     }
     const entry = makeEntry(name, flows, badge);
     entry.dataset.name = name.toLowerCase();
