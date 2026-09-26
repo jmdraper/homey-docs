@@ -1282,10 +1282,24 @@ class HomeyDocsCompanion extends Homey.App {
       const originX = Math.min.apply(null, ids.map(id => cards[id].x || 0));
       const originY = Math.min.apply(null, ids.map(id => cards[id].y || 0));
 
+      // A note heading a band sits above that band's first card, so the band
+      // has to start low enough to leave room for it — otherwise the note
+      // lands on the band above.
+      const headroomFor = group => {
+        const members = new Set(group);
+        let clearance = 0;
+        for (const [noteId, anchor] of Object.entries(noteAnchors)) {
+          if (!members.has(anchor.anchor) || anchor.dy >= 0) continue;
+          clearance = Math.max(clearance, this._noteHeight(cards[noteId]));
+        }
+        return clearance;
+      };
+
       let moved = 0;
       let widest = 0;
       let bandTop = originY;
       for (const group of groups) {
+        bandTop += headroomFor(group);
         const laid = this._layoutGroup(cards, group, parents, originX, bandTop);
         moved += laid.moved;
         widest = Math.max(widest, laid.columns);
