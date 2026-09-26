@@ -620,17 +620,28 @@ class HomeyDocsCompanion extends Homey.App {
       .filter(([id, c]) => c.type !== 'note' && !referenced.has(id))
       .sort((a, b) => (a[1].y || 0) - (b[1].y || 0) || (a[1].x || 0) - (b[1].x || 0));
 
-    // Notes sit above the section they describe, with sections stacked down the
-    // canvas, so attach each note to the first tree at or below it. This keeps
-    // the author's narrative order instead of dumping every note at the top.
-    const notesByRoot = new Map();
-    const trailing = [];
+    // Anchor each note to the nearest card on the canvas. Section headers sit
+    // just above their section's first card and inline annotations sit beside
+    // the card they describe, so proximity handles both — whereas attaching to
+    // the next tree below made inline notes bleed into the following section.
+    // Cards above a note are penalised, since notes label what follows them.
+    const positioned = Object.entries(cards).filter(([, c]) => c.type !== 'note');
+    const notesByCard = new Map();
+    const orphanNotes = [];
     for (const note of (notes || [])) {
-      const target = roots.find(([, c]) => (c.y || 0) >= (note.y || 0) - 1);
       const text = String(note.value).replace(/\s+/g, ' ').trim();
-      if (!target) { trailing.push(text); continue; }
-      if (!notesByRoot.has(target[0])) notesByRoot.set(target[0], []);
-      notesByRoot.get(target[0]).push(text);
+      let best = null;
+      let bestDistance = Infinity;
+      for (const [cardId, card] of positioned) {
+        const dx = (card.x || 0) - (note.x || 0);
+        const dy = (card.y || 0) - (note.y || 0);
+        let distance = Math.sqrt(dx * dx + dy * dy);
+        if ((card.y || 0) < (note.y || 0)) distance *= 2;
+        if (distance < bestDistance) { bestDistance = distance; best = cardId; }
+      }
+      if (!best) { orphanNotes.push(text); continue; }
+      if (!notesByCard.has(best)) notesByCard.set(best, []);
+      notesByCard.get(best).push(text);
     }
 
     // Cards reached from more than one place get a stable marker, so a
@@ -666,6 +677,7 @@ class HomeyDocsCompanion extends Homey.App {
       } else {
         rendered.set(id, null);
       }
+      for (const note of (notesByCard.get(id) || [])) lines.push(pad + '# ' + note);
       lines.push(head + tag + this._cardLabel(card, titles));
       for (const [key, label] of OUTPUTS) {
         const children = card[key] || [];
@@ -679,12 +691,14 @@ class HomeyDocsCompanion extends Homey.App {
         }
       }
     };
-    for (const [id] of roots) {
-      for (const note of (notesByRoot.get(id) || [])) lines.push('# ' + note);
-      walk(id, 0, '');
-      lines.push('');
+    for (const [id] of roots) { walk(id, 0, ''); lines.push(''); }
+
+    // Notes anchored to cards no tree reaches would otherwise vanish
+    const stranded = [];
+    for (const [cardId, texts] of notesByCard) {
+      if (!rendered.has(cardId)) stranded.push(...texts);
     }
-    for (const note of trailing) lines.push('# ' + note);
+    for (const note of stranded.concat(orphanNotes)) lines.push('# ' + note);
     return lines;
   }
 
