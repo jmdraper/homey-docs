@@ -51,14 +51,17 @@ const CARD_GAP_Y_BARE = 80;
 const CARD_GAP_Y_ALL_BASE = 24;   // fits the measured 120 at 2 inputs, 500 at 10
 const CARD_GAP_Y_ALL_PER_INPUT = 48;
 const CARD_GAP_Y = 100;
-const CARD_GAP_Y_MAX = 360;
+const CARD_GAP_Y_MAX = 220;
 const CARD_ROW_GAP_Y = 260;
 // Nothing is added between one behaviour and the next: a band's extent already
 // runs to below its lowest card, so that allowance is the separation. Adding
 // more on top pushes every behaviour progressively further down the canvas.
 const CARD_BAND_GAP_Y = 0;
-// How far above the card it labels a heading note sits
-const NOTE_HEADING_OFFSET_Y = 40;
+// Note height also grows with its text: measured 80 for a short note, rising
+// 20 per 40 characters. A note sits its own height above the card it heads.
+const NOTE_HEIGHT_BASE = 80;
+const NOTE_HEIGHT_PER_CHARS = 40;
+const NOTE_HEIGHT_MAX = 200;
 
 const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
 const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
@@ -1000,6 +1003,17 @@ class HomeyDocsCompanion extends Homey.App {
 
   // How far below a card the next sibling should sit, given how tall it will
   // render. Argument length is the only signal available before rendering.
+  _noteHeight(note) {
+    const length = String((note && note.value) || '').length;
+    const height = NOTE_HEIGHT_BASE
+      + (Math.floor(length / NOTE_HEIGHT_PER_CHARS) * 20);
+    return Math.min(height, NOTE_HEIGHT_MAX);
+  }
+
+  // Calibrated against the smallest gaps that appear between cards sharing a
+  // column in hand-drawn flows. Those are a lower bound on how tall a card
+  // renders, because nobody overlaps them deliberately — unlike the median,
+  // which reflects taste rather than the constraint.
   _siblingGapBelow(card) {
     const type = card && card.type;
 
@@ -1009,12 +1023,14 @@ class HomeyDocsCompanion extends Homey.App {
       return CARD_GAP_Y_ALL_BASE + (inputs * CARD_GAP_Y_ALL_PER_INPUT);
     }
     if (CARD_GAP_Y_COMPACT[type]) return CARD_GAP_Y_COMPACT[type];
+    if (type === 'note') return this._noteHeight(card);
 
     let text = '';
     try { text = JSON.stringify(card.args || {}); } catch (e) { text = ''; }
     if (text.length <= 20) return CARD_GAP_Y_BARE;     // no arguments to show
-    if (text.length <= 200) return CARD_GAP_Y;
-    const extra = Math.ceil((text.length - 200) / 100) * 60;
+    // Grows in 20px steps rather than staying flat to 200 characters, which
+    // left log cards carrying a sentence overlapping the card below them
+    const extra = Math.ceil((text.length - 20) / 80) * 20;
     return Math.min(CARD_GAP_Y + extra, CARD_GAP_Y_MAX);
   }
 
@@ -1058,9 +1074,10 @@ class HomeyDocsCompanion extends Homey.App {
         // Sit above the card it heads, at the same left edge
         const anchor = anchorId ? draft.cards[anchorId] : null;
         newCard.x = anchor ? (anchor.x || 0) : 0;
+        const clearance = this._noteHeight(newCard);
         newCard.y = anchor
-          ? (anchor.y || 0) - NOTE_HEADING_OFFSET_Y
-          : (existing.length ? Math.min.apply(null, existing.map(c => c.y || 0)) - NOTE_HEADING_OFFSET_Y : 0);
+          ? (anchor.y || 0) - clearance
+          : (existing.length ? Math.min.apply(null, existing.map(c => c.y || 0)) - clearance : 0);
       } else if (typeof newCard.x !== 'number' || typeof newCard.y !== 'number') {
         if (anchorId) {
           const source = draft.cards[anchorId];
@@ -1278,8 +1295,14 @@ class HomeyDocsCompanion extends Homey.App {
       for (const [noteId, anchor] of Object.entries(noteAnchors)) {
         const target = cards[anchor.anchor];
         if (!target) continue;
-        cards[noteId].x = (target.x || 0) + anchor.dx;
-        cards[noteId].y = (target.y || 0) + anchor.dy;
+        const note = cards[noteId];
+        let dy = anchor.dy;
+        // A note above its card must clear the card's own height, whatever
+        // offset it was stored with
+        const clearance = this._noteHeight(note);
+        if (dy < 0 && dy > -clearance) dy = -clearance;
+        note.x = (target.x || 0) + anchor.dx;
+        note.y = (target.y || 0) + dy;
       }
 
       return {
