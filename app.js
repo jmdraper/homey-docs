@@ -604,9 +604,16 @@ class HomeyDocsCompanion extends Homey.App {
       : card.type === 'condition' ? (card.inverted ? 'IF NOT' : 'IF')
       : 'THEN';
     const args = this._argSummary(card.args || {});
-    const token = card.droptoken ? 'on ' + this._resolveTokens('[[' + card.droptoken + ']]') : null;
-    return [kind, subject ? subject + ' -' : null, name, token, args ? '(' + args + ')' : null]
-      .filter(Boolean).join(' ');
+    const token = card.droptoken ? this._resolveTokens('[[' + card.droptoken + ']]') : null;
+    // Where the card names no subject the droptoken is its left operand, so it
+    // belongs in front of the verb: "IF {Shortfall} is greater than" rather than
+    // "IF is greater than on {Shortfall}". Device and zone cards already lead
+    // with their subject, so there the token follows the title.
+    const parts = subject
+      ? [kind, subject + ' -', name, token ? 'on ' + token : null]
+      : [kind, token, name];
+    parts.push(args ? '(' + args + ')' : null);
+    return parts.filter(Boolean).join(' ');
   }
 
   _renderCardGraph(cards, titles, notes) {
