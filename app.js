@@ -615,6 +615,23 @@ class HomeyDocsCompanion extends Homey.App {
       .trim().replace(/\/$/, '');
   }
 
+  // The scopes of the owner API token, read from the JWT payload. Writes to
+  // flows need homey.flow, while reads only need homey.flow.readonly, and a
+  // token short of the former fails with a bare "Missing Scopes". The token
+  // itself is never returned — only which scopes it carries.
+  _tokenScopes() {
+    try {
+      const segments = String(this._token || '').split('.');
+      if (segments.length < 2) return 'token is not a JWT';
+      const payload = JSON.parse(Buffer.from(segments[1], 'base64', 'utf8').toString('utf8'));
+      const scope = payload.scope || payload.scopes;
+      if (!scope) return { noScopeClaim: Object.keys(payload) };
+      return Array.isArray(scope) ? scope : String(scope).split(/[\s,]+/);
+    } catch (e) {
+      return 'could not decode: ' + e.message;
+    }
+  }
+
   _allowedHosts() {
     return String(this.homey.settings.get('allowed_hosts') || '')
       .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
@@ -2097,6 +2114,7 @@ function copyPrompt(){
     };
     result.advancedFlowPath = this._advancedFlowPath;
     result.allowedHosts = this._allowedHosts();
+    result.tokenScopes = this._tokenScopes();
     result.recentlyRejected = this._rejections || [];
     await this._fetchFlowCardTitles();
     result.cardTitles = {
