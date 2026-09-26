@@ -314,6 +314,21 @@ Flow Version History import restores folder placement or enabled state. An agent
 needs it — `set_flow_enabled(false)` plus a rename is the reversible equivalent.
 Deleting stays a human action in the Homey UI.
 
+**Addressing a card to edit it.** `get_flow_summary` is deliberately lossy — no card
+ids, no coordinates, arguments truncated — because it exists to be read cheaply. But
+every write tool takes a card id, and a summary gives Claude no way to name the card
+it just read about: there is nothing in `THEN Sewing room Shelf lights - Turn off` that
+identifies which card that is. Without a fix, the flow becomes read summary, re-fetch
+the raw flow, re-identify the card by matching on its contents — which reintroduces
+exactly the error-prone matching step the summary was built to remove, and on a flow
+with eight identical `Turn off` cards it is ambiguous.
+
+Likely answer: an opt-in `withCardIds` argument on `get_flow_summary` that prefixes
+each line with the card's short id, so reading-for-understanding stays cheap and
+reading-to-edit is addressable. Decide when building the write tools, since the exact
+shape depends on what they take. The convergence markers (`[1]`, `[2]`) already in the
+output are sequential render positions, not card ids, and are not a substitute.
+
 **Card graph integrity.** Cards embed `x`/`y` coordinates and output connections
 (`outputTrue` / `outputFalse` / `outputSuccess` / `outputError`, arrays of card UUIDs).
 Before any write, validate: no unknown card UUID references, no dangling connections,
