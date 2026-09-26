@@ -620,23 +620,30 @@ class HomeyDocsCompanion extends Homey.App {
       .filter(([id, c]) => c.type !== 'note' && !referenced.has(id))
       .sort((a, b) => (a[1].y || 0) - (b[1].y || 0) || (a[1].x || 0) - (b[1].x || 0));
 
-    // Anchor each note to the nearest card on the canvas. Section headers sit
-    // just above their section's first card and inline annotations sit beside
-    // the card they describe, so proximity handles both — whereas attaching to
-    // the next tree below made inline notes bleed into the following section.
-    // Cards above a note are penalised, since notes label what follows them.
+    // Anchor each note to the nearest card on the canvas. Notes are placed three
+    // ways: as a section header at the left margin above its section, as a label
+    // directly above a card, and as a label directly below one — on branching
+    // layouts the note for the upper branch sits under it. Measuring from the
+    // note's rectangle rather than its corner treats all three the same, so no
+    // directional assumption is needed.
     const positioned = Object.entries(cards).filter(([, c]) => c.type !== 'note');
     const notesByCard = new Map();
     const orphanNotes = [];
     for (const note of (notes || [])) {
       const text = String(note.value).replace(/\s+/g, ' ').trim();
+      const left = note.x || 0;
+      const top = note.y || 0;
+      const right = left + (note.width || 0);
+      const bottom = top + (note.height || 0);
       let best = null;
       let bestDistance = Infinity;
       for (const [cardId, card] of positioned) {
-        const dx = (card.x || 0) - (note.x || 0);
-        const dy = (card.y || 0) - (note.y || 0);
-        let distance = Math.sqrt(dx * dx + dy * dy);
-        if ((card.y || 0) < (note.y || 0)) distance *= 2;
+        const cx = card.x || 0;
+        const cy = card.y || 0;
+        // Gap between the card's anchor and the note's rectangle, zero on overlap
+        const dx = cx < left ? left - cx : cx > right ? cx - right : 0;
+        const dy = cy < top ? top - cy : cy > bottom ? cy - bottom : 0;
+        const distance = Math.sqrt(dx * dx + dy * dy);
         if (distance < bestDistance) { bestDistance = distance; best = cardId; }
       }
       if (!best) { orphanNotes.push(text); continue; }

@@ -46,14 +46,16 @@ function _httpGet(app, path) {
   });
 }
 
+// null means "could not read BLL"; an empty array means "BLL has no variables".
+// Conflating the two made the cache below un-clearable: a deleted variable was
+// reported forever, because an empty response looked like a failed read and the
+// previous contents were served instead.
 function _toArray(data) {
-  if (!data) return null;
-  if (Array.isArray(data) && data.length > 0) return data;
-  if (typeof data === 'object' && !Array.isArray(data)) {
-    const entries = Object.entries(data);
-    if (entries.length === 0) return null;
+  if (data === null || data === undefined) return null;
+  if (Array.isArray(data)) return data;
+  if (typeof data === 'object') {
     // If values are objects without a name field, inject the key as name
-    return entries.map(([key, val]) =>
+    return Object.entries(data).map(([key, val]) =>
       (val && typeof val === 'object' && !val.name) ? { ...val, name: key } : val
     );
   }

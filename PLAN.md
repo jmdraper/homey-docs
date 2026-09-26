@@ -392,10 +392,12 @@ Spotted while working; none blocking, all deferred deliberately.
   live querying, but its prompt can only teach Claude about tools that exist today —
   `get_flow_summary`, `search_flows`, and the write tools will each change the advice
   it gives.
-- **Confirm whether Better Logic Library is actually installed.** During testing
-  `[BLL] /ALL returned no usable data: []`. Handled gracefully, but if BLL *is*
-  installed with variables defined, the empty result is worth investigating — the
-  `bll_variables` bucket would be silently empty.
+- ~~Confirm whether Better Logic Library is actually installed.~~ **Resolved.** BLL is
+  installed and responding; it returned `[]` because it genuinely had no variables.
+  The `no usable data` log was a bug: `_toArray` treated an empty collection as a
+  failed read, so the 60-second cache could never be cleared and a deleted variable
+  was reported indefinitely. Fixed — null now means "could not read", `[]` means
+  "no variables".
 
 ### Deferred from step 3
 
