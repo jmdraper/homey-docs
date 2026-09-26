@@ -13,6 +13,13 @@ const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 // and broken is derived by Homey, so sending them back invites a rejection.
 const ADVANCED_FLOW_WRITABLE = ['name', 'enabled', 'folder', 'cards'];
 
+// Spacing measured from the flows already on this Homey: a child sits ~440px
+// right of its parent at the same height, and siblings stack ~80px apart.
+// Matching the house style means generated cards do not look foreign.
+const CARD_GAP_X = 440;
+const CARD_GAP_Y = 80;
+const CARD_ROW_GAP_Y = 240;
+
 const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
 const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
 
@@ -901,33 +908,49 @@ class HomeyDocsCompanion extends Homey.App {
     return this._mutateAdvancedFlow(flowId, 'added a ' + card.type + ' card', draft => {
       const newCard = Object.assign({}, card);
       const cardId = crypto.randomUUID();
+      const existing = Object.values(draft.cards);
 
-      // Place it rather than let it land on top of an existing card
+      let anchorId = null;
+      if (after) {
+        const anchor = this._resolveCardId(draft.cards, after);
+        if (anchor.error) return anchor;
+        anchorId = anchor.cardId;
+      }
+
       if (typeof newCard.x !== 'number' || typeof newCard.y !== 'number') {
-        const existing = Object.values(draft.cards);
-        if (after) {
-          const anchor = this._resolveCardId(draft.cards, after);
-          if (anchor.error) return anchor;
-          const source = draft.cards[anchor.cardId];
-          newCard.x = (source.x || 0) + 320;
-          newCard.y = source.y || 0;
-          while (existing.some(c => c.x === newCard.x && c.y === newCard.y)) newCard.y += 160;
+        if (anchorId) {
+          const source = draft.cards[anchorId];
+          // Sit level with the anchor unless it already has children, in which
+          // case stack below the lowest of them
+          const siblings = CARD_OUTPUTS
+            .reduce((all, output) => all.concat(source[output] || []), [])
+            .map(id => draft.cards[id])
+            .filter(Boolean);
+          newCard.x = (source.x || 0) + CARD_GAP_X;
+          newCard.y = siblings.length
+            ? Math.max.apply(null, siblings.map(c => c.y || 0)) + CARD_GAP_Y
+            : (source.y || 0);
         } else {
+          // Unattached: start a new row below everything already placed
           newCard.x = existing.length ? Math.min.apply(null, existing.map(c => c.x || 0)) : 0;
-          newCard.y = existing.length ? Math.max.apply(null, existing.map(c => c.y || 0)) + 200 : 0;
+          newCard.y = existing.length
+            ? Math.max.apply(null, existing.map(c => c.y || 0)) + CARD_ROW_GAP_Y
+            : 0;
+        }
+        // Never land on top of something already there
+        while (existing.some(c => c.x === newCard.x && c.y === newCard.y)) {
+          newCard.y += CARD_GAP_Y;
         }
       }
 
       draft.cards[cardId] = newCard;
 
       let linked = null;
-      if (after) {
-        const anchor = this._resolveCardId(draft.cards, after);
-        if (anchor.error) return anchor;
-        const source = draft.cards[anchor.cardId];
+      if (anchorId) {
+        const source = draft.cards[anchorId];
         const output = source.type === 'condition' ? 'outputTrue' : 'outputSuccess';
         source[output] = (source[output] || []).concat([cardId]);
-        linked = { from: anchor.cardId, output };
+        linked = { from: anchorId, output };
       }
       return { addedCardId: cardId, position: { x: newCard.x, y: newCard.y }, linkedFrom: linked };
     });
