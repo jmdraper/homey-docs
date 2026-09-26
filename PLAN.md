@@ -337,6 +337,17 @@ without addressing it.
 
 ## Step 6 — Write support for advanced flows
 
+**Editing requires a Personal Access Token — a platform constraint, not a choice.**
+The app's own token (`getOwnerApiToken`) carries `homey.flow.readonly` but not
+`homey.flow`, so every write returns HTTP 403 "Missing Scopes". Verified against
+`GET /manager/sessions/session/me`, which needs no scopes and reports the session's
+scopes: broad on reads, plus `homey.device.control`, but no write scope for flows,
+logic or zones. Apps may control devices; they may not rewrite automations.
+`HomeyAPI.createAppAPI()` is not an alternative — its source calls
+`getOwnerApiToken()` itself. So the user must create a token in the Homey web app and
+paste it into the app settings; writes use it, reads keep using the app's own token.
+Two deliberate opt-ins rather than one, which suits the feature.
+
 **Infrastructure**
 - Generalise `_apiGet` into `_apiRequest(method, path, body)` — JSON body, 200/201/204
   handling. `_apiGet` becomes a one-line wrapper.
