@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script type="text/javascript" src="/homey.js" data-origin="settings"></script>
+    <style>
+      .hint { font-size: 12px; opacity: 0.65; margin: 4px 0 0; line-height: 1.4; }
+      .rejected { margin-top: 10px; }
+      .rejected-row {
+        display: flex; align-items: center; gap: 10px;
+        padding: 7px 0; border-bottom: 0.5px solid rgba(128,128,128,0.25);
+      }
+      .rejected-row:last-child { border-bottom: none; }
+      .rejected-host { flex: 1; font-size: 13px; word-break: break-all; }
+      .rejected-meta { font-size: 11px; opacity: 0.6; }
+      .mini {
+        font-size: 12px; padding: 4px 10px; border-radius: 999px;
+        border: 0.5px solid rgba(128,128,128,0.4); background: transparent;
+        cursor: pointer; white-space: nowrap;
+      }
+      .none { font-size: 13px; opacity: 0.6; }
+    </style>
+  </head>
+  <body>
+    <header class="homey-header">
+      <h1 class="homey-title">Homey Docs Companion</h1>
+      <p class="homey-subtitle">Cross-reference viewer and AI assistant access</p>
+    </header>
+
+    <fieldset class="homey-form-fieldset">
+      <legend class="homey-form-legend">Network access</legend>
+
+      <div class="homey-form-group">
+        <label class="homey-form-label" for="allowed_hosts">Additional allowed hosts</label>
+        <input class="homey-form-input" id="allowed_hosts" type="text" placeholder="homey.example.com, homey.tailnet-name.ts.net" />
+        <p class="hint">
+          Comma-separated. IP addresses, <code>localhost</code> and <code>.local</code>
+          names are always allowed — this is only needed when you reach Homey by a
+          domain name, such as through a reverse proxy or Tailscale MagicDNS. Requests
+          from other hostnames are refused, which is what stops a website you visit
+          from reaching Homey through your browser.
+        </p>
+      </div>
+
+      <div class="rejected" id="rejected-block">
+        <label class="homey-form-label">Recently refused</label>
+        <div id="rejected-list"><p class="none">Nothing has been refused.</p></div>
+      </div>
+    </fieldset>
+
+    <fieldset class="homey-form-fieldset">
+      <legend class="homey-form-legend">Links and ports</legend>
+
+      <div class="homey-form-group">
+        <label class="homey-form-label" for="xref_base_url">Homey web app URL</label>
+        <input class="homey-form-input" id="xref_base_url" type="text" placeholder="https://my.homey.app" />
+        <p class="hint">Used to build links to the flow editor. Leave as the default unless you reach Homey on a custom domain. Do not include <code>/web</code>.</p>
+      </div>
+
+      <div class="homey-form-group">
+        <label class="homey-form-label" for="xref_port">Cross-reference viewer port</label>
+        <input class="homey-form-input" id="xref_port" type="number" placeholder="8734" />
+      </div>
+
+      <div class="homey-form-group">
+        <label class="homey-form-label" for="mcp_port">AI assistant (MCP) port</label>
+        <input class="homey-form-input" id="mcp_port" type="number" placeholder="8735" />
+        <p class="hint">Changing either port takes effect after restarting the app.</p>
+      </div>
+    </fieldset>
+
+    <button id="save" class="homey-button-primary-full">Save changes</button>
+
+    <script type="text/javascript">
+      function onHomeyReady(Homey) {
+        Homey.ready();
+
+        var FIELDS = ['allowed_hosts', 'xref_base_url', 'xref_port', 'mcp_port'];
+        var el = {};
+        FIELDS.forEach(function (name) {
+          el[name] = document.getElementById(name);
+          Homey.get(name, function (err, value) {
+            if (err) return;
+            if (value !== null && value !== undefined) el[name].value = value;
+          });
+        });
+
+        function addHost(host) {
+          var current = el.allowed_hosts.value.split(',')
+            .map(function (h) { return h.trim(); })
+            .filter(Boolean);
+          if (current.indexOf(host) === -1) current.push(host);
+          el.allowed_hosts.value = current.join(', ');
+        }
+
+        // Anything the guard turned away, so the host to allow can be read off
+        // rather than guessed — a proxy may report the refusal as a 502, which
+        // hides the reason entirely.
+        Homey.api('GET', '/rejections', null, function (err, result) {
+          var list = document.getElementById('rejected-list');
+          if (err || !result || !result.recentlyRejected || !result.recentlyRejected.length) return;
+          list.innerHTML = '';
+          result.recentlyRejected.forEach(function (entry) {
+            if (!entry.host || entry.host === '(none)') return;
+            var host = entry.host.replace(/:\d+$/, '');
+            var row = document.createElement('div');
+            row.className = 'rejected-row';
+
+            var label = document.createElement('div');
+            label.className = 'rejected-host';
+            label.innerHTML = '<strong>' + host + '</strong><div class="rejected-meta">' +
+              entry.count + (entry.count === 1 ? ' request' : ' requests') + '</div>';
+
+            var button = document.createElement('button');
+            button.className = 'mini';
+            button.textContent = 'Allow';
+            button.addEventListener('click', function () {
+              addHost(host);
+              button.textContent = 'Added';
+              button.disabled = true;
+            });
+
+            row.appendChild(label);
+            row.appendChild(button);
+            list.appendChild(row);
+          });
+        });
+
+        document.getElementById('save').addEventListener('click', function () {
+          var button = this;
+          button.disabled = true;
+          var remaining = FIELDS.length;
+          var failed = null;
+          FIELDS.forEach(function (name) {
+            Homey.set(name, el[name].value.trim(), function (err) {
+              if (err) failed = err;
+              if (--remaining === 0) {
+                button.disabled = false;
+                if (failed) return Homey.alert(failed);
+                Homey.alert('Saved.');
+              }
+            });
+          });
+        });
+      }
+    </script>
+  </body>
+</html>

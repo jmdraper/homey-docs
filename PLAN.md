@@ -307,6 +307,15 @@ else is refused unless listed in a new **Additional allowed hosts** setting — 
 what a Tailscale MagicDNS name needs, since `homey.tailnet-name.ts.net` is a real DNS
 name and therefore reboundable. Access by plain Tailscale IP needs no configuration.
 
+**The app had no settings UI at all.** `app.json` carried a `settings` array, which
+validates but renders nothing — Homey app settings come from a custom
+`/settings/index.html`, which this app never had. So `xref_port`, `mcp_port` and
+`xref_base_url` had been unconfigurable since the app was written, which is why the
+viewer grew its own Setup panel with a base-URL field. Adding a setting for allowed
+hosts surfaced this, because a setting nobody can reach is not a setting. A real
+settings page now exists, listing refused hosts with an Allow button beside each, and
+the inert array is gone.
+
 **Reverse proxies need configuring.** A proxy forwards its own hostname, so the guard
 refuses it and the viewer stops working — and a proxy may report that upstream 403 as
 a 502, hiding the reason. The hostname must be added to **Additional allowed hosts**.

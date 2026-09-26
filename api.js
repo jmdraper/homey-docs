@@ -34,6 +34,13 @@ module.exports = {
     return homey.app.resetSnapshot();
   },
 
+  async rejections({ homey }) {
+    return {
+      allowedHosts: homey.app._allowedHosts(),
+      recentlyRejected: homey.app._rejections || []
+    };
+  },
+
   async diagnostics({ homey }) {
     return homey.app.getDiagnostics();
   },
