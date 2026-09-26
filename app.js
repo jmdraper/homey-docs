@@ -57,6 +57,8 @@ const CARD_ROW_GAP_Y = 260;
 // runs to below its lowest card, so that allowance is the separation. Adding
 // more on top pushes every behaviour progressively further down the canvas.
 const CARD_BAND_GAP_Y = 0;
+// Rounds of candidate layouts to try before settling; convergence is quick
+const LAYOUT_ROUNDS = 6;
 // Note height also grows with its text: measured 80 for a short note, rising
 // 20 per 40 characters. A note sits its own height above the card it heads.
 const NOTE_HEIGHT_BASE = 80;
@@ -1342,13 +1344,31 @@ class HomeyDocsCompanion extends Homey.App {
       () => { sweep(reversed, children); sweep(allButLast, parents); sweep(allButFirst, children); },
     ];
 
+    // Each candidate is evaluated from the best layout found so far, not from
+    // the positions the flow arrived with, and the round repeats while anything
+    // improves. Evaluating once from the starting positions makes the result
+    // depend on them: a flow built card by card lands somewhere arbitrary, and
+    // a single round from there settles into a worse arrangement than the same
+    // flow already tidied — which showed up as a second relayout improving on
+    // the first.
     const initial = snapshot();
-    let best = null;
-    for (const build of candidates) {
-      restore(initial);
-      build();
-      const cost = travel();
-      if (!best || cost < best.cost) best = { y: snapshot(), cost };
+    restore(initial);
+    candidates[0]();
+    let best = { y: snapshot(), cost: travel() };
+
+    for (let round = 0; round < LAYOUT_ROUNDS; round++) {
+      const start = best.y;
+      let improved = false;
+      for (const build of candidates) {
+        restore(start);
+        build();
+        const cost = travel();
+        if (cost < best.cost) {
+          best = { y: snapshot(), cost };
+          improved = true;
+        }
+      }
+      if (!improved) break;
     }
     restore(best.y);
 
