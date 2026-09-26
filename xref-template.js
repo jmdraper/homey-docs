@@ -347,22 +347,6 @@ module.exports = `<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="accordion-item">
-    <div class="accordion-header" id="acc3-header">
-      <span class="accordion-num">3</span>
-      <span class="accordion-title">Custom Homey URL &ensp;<span style="font-size:11px;font-weight:400;color:var(--text3)">(optional)</span></span>
-      <span class="accordion-chevron">&#x25B6;</span>
-    </div>
-    <div class="accordion-body" id="acc3-body">
-      <div class="acc-step">
-        By default, flow links open in <b>my.homey.app</b>. This step is only needed if you access Homey via a custom domain or the <a href="https://homey.app/en-us/news/introducing-local-users-for-homey-pro/" target="_blank" style="color:var(--blue-text);text-decoration:none">local web interface</a>. Enter your root URL below (without <code>/web</code>) and click Save &amp; Refresh.
-      </div>
-      <div class="url-row">
-        <input type="text" id="base-url-input" placeholder="https://my.homey.app">
-        <button id="save-settings-btn">Save &amp; Refresh</button>
-      </div>
-    </div>
-  </div>
 
 </div>
 
@@ -693,7 +677,7 @@ setupBtn.addEventListener('click', () => {
   setupBtn.classList.toggle('active', open);
 });
 
-['acc1', 'acc2', 'acc3'].forEach(id => {
+['acc1', 'acc2'].forEach(id => {
   const header = document.getElementById(id + '-header');
   const body   = document.getElementById(id + '-body');
   header.addEventListener('click', () => {
@@ -752,36 +736,6 @@ document.getElementById('copy-prompt-btn').addEventListener('click', async funct
     setTimeout(() => { this.textContent = 'Copy AI prompt'; this.disabled = false; }, 2000);
   } catch (e) {
     this.textContent = 'Failed';
-    this.disabled = false;
-  }
-});
-
-// Step 3: Custom Homey URL
-const baseUrlInput = document.getElementById('base-url-input');
-
-document.getElementById('acc3-header').addEventListener('click', async () => {
-  // Refresh stored value each time step 3 is toggled
-  try {
-    const r = await fetch('/settings');
-    if (r.ok) { const d = await r.json(); baseUrlInput.value = d.baseUrl || ''; }
-  } catch (e) {}
-});
-
-document.getElementById('save-settings-btn').addEventListener('click', async function() {
-  const newUrl = baseUrlInput.value.trim() || 'https://my.homey.app';
-  this.disabled = true;
-  this.textContent = 'Saving…';
-  try {
-    const r1 = await fetch('/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ baseUrl: newUrl })
-    });
-    if (!r1.ok) throw new Error();
-    const r2 = await fetch('/refresh', { method: 'POST' });
-    if (r2.ok) { location.reload(); } else { throw new Error(); }
-  } catch (e) {
-    this.textContent = 'Error';
     this.disabled = false;
   }
 });

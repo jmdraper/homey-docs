@@ -146,8 +146,14 @@ class HomeyDocsCompanion extends Homey.App {
       this.log('Could not get Homey cloud ID:', e.message);
     }
 
-    // Cache base URL so it's always current without a settings round-trip
-    this._xrefBaseUrl = (this.homey.settings.get('xref_base_url') || 'https://my.homey.app').replace(/\/$/, '');
+    // The web app URL is baked into the generated page, so rebuild it whenever
+    // the setting changes rather than waiting for the next restart
+    this.homey.settings.on('set', key => {
+      if (key !== 'xref_base_url') return;
+      this.log('Web app URL changed, regenerating cross-reference page');
+      this.regenerateXrefPage()
+        .catch(e => this.error('Regenerate after settings change failed:', e.message));
+    });
 
     // Resolved before the snapshot refresh, which regenerates the xref page and
     // needs the port to render the MCP setup instructions
@@ -451,6 +457,14 @@ class HomeyDocsCompanion extends Homey.App {
   }
 
   // ─── Request guards ──────────────────────────────────────────────────────────
+
+  // Read through rather than cached. This was previously read once at startup,
+  // so editing it in the app's settings left flow links pointing at the old URL
+  // until the app restarted — with no sign that anything had been missed.
+  _getXrefBaseUrl() {
+    return String(this.homey.settings.get('xref_base_url') || 'https://my.homey.app')
+      .trim().replace(/\/$/, '');
+  }
 
   _allowedHosts() {
     return String(this.homey.settings.get('allowed_hosts') || '')
@@ -1119,32 +1133,6 @@ function copyPrompt(){
         return;
       }
 
-      if (req.method === 'GET' && req.url === '/settings') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ baseUrl: this._xrefBaseUrl }));
-        return;
-      }
-
-      if (req.method === 'POST' && req.url === '/settings') {
-        let body = '';
-        req.on('data', chunk => { body += chunk; });
-        req.on('end', () => {
-          try {
-            const { baseUrl } = JSON.parse(body);
-            if (baseUrl && typeof baseUrl === 'string') {
-              this._xrefBaseUrl = baseUrl.trim().replace(/\/$/, '');
-              this.homey.settings.set('xref_base_url', this._xrefBaseUrl);
-            }
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, baseUrl: this._xrefBaseUrl }));
-          } catch (e) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
-          }
-        });
-        return;
-      }
-
       if (req.method === 'POST' && req.url === '/refresh') {
         // Re-read Homey as well as redrawing — otherwise the button rebuilds the
         // page from cached data and appears to do nothing after a flow changes
@@ -1196,7 +1184,7 @@ function copyPrompt(){
       }
       const pageMeta = {
         homeyId: this._homeyId || null,
-        baseUrl: this._xrefBaseUrl || 'https://my.homey.app',
+        baseUrl: this._getXrefBaseUrl(),
         flowTypes,
         mcpPort: this._mcpPort || 8735
       };

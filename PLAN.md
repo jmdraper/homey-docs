@@ -316,6 +316,14 @@ hosts surfaced this, because a setting nobody can reach is not a setting. A real
 settings page now exists, listing refused hosts with an Allow button beside each, and
 the inert array is gone.
 
+With the setting reachable in the proper place, the viewer's Setup step 3 and the
+`GET`/`POST /settings` routes behind it were removed. That deletes the unauthenticated
+write endpoint outright rather than merely guarding it, which is the better outcome.
+The base URL is also no longer cached at startup: it was read once in `onInit`, so
+editing it left flow links pointing at the old URL until the app restarted. It is now
+read through, and a `settings.on('set')` listener rebuilds the page — which bakes the
+URL in at generation time — as soon as it changes.
+
 **Reverse proxies need configuring.** A proxy forwards its own hostname, so the guard
 refuses it and the viewer stops working — and a proxy may report that upstream 403 as
 a 502, hiding the reason. The hostname must be added to **Additional allowed hosts**.
