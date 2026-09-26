@@ -219,7 +219,19 @@ Result: 210 of 244 devices cross-referenced, with zone and capability lists reso
   cannot drift as roles are added.
 - **Missing devices are flagged.** Devices referenced by a flow but absent from Homey
   get `missing: true` and a "not in Homey" badge — a deleted device whose cards were
-  left behind. Live data turned up two, referenced by three flows.
+  left behind. On the reference Homey nothing is currently flagged.
+
+**Correction made after review.** The first implementation took the device id from
+`card.ownerUri` and only the capability from `card.id`. That is wrong: on capability
+cards the **card id is authoritative** (`homey:device:<id>:<capability>`), while
+ownerUri carries a device uuid that usually agrees but can be stale. On the reference
+Homey the two disagreed on 21 cards and ownerUri named two devices that no longer
+exist, producing false "missing" reports for devices that were plainly present in the
+flow editor. A further 15 cards carried a device card id with no device ownerUri and
+were being skipped entirely. Separately, the `args.device` fallback admitted
+app-internal identifiers — Pushover's is a notification target literally named
+"iPhone" — so it now requires an id that resolves to a real device. Card ids resolved
+100% against Homey's device list; ownerUri is no longer consulted.
 - **Per-flow member chips** show which capabilities / states / modes each flow
   actually touches, not just that it touches the entity.
 - Deleted `SECTION_LABELS`, which was defined but never referenced.

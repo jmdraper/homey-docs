@@ -872,20 +872,27 @@ function copyPrompt(){
     this._extractBllRefs(result, flowId, flowName, card, bllVarNames);
   }
 
-  // Devices appear three ways: as the card's owner (capability cards, where the
-  // card id carries the capability), as a `device` argument on an app card, and
-  // as a capability token read into another card's arguments.
+  // Devices appear three ways: as a capability card, as a `device` argument on
+  // an app card, and as a capability token read into another card's arguments.
+  //
+  // For capability cards the card id is authoritative — homey:device:<id>:<cap>.
+  // ownerUri carries a device uuid too and usually agrees, but it can be stale:
+  // on this codebase's reference Homey it disagreed on 21 cards and pointed at
+  // two devices that no longer exist, while every card id resolved. A further
+  // 15 cards carry a device card id with no device ownerUri at all.
   _extractDeviceRef(result, flowId, flowName, card) {
     const args = card.args || {};
     let deviceId = null;
     let capability = null;
 
-    const ownerMatch = String(card.ownerUri || '').match(/^homey:device:([a-f0-9-]{36})$/);
-    if (ownerMatch) {
-      deviceId = ownerMatch[1];
-      const idMatch = String(card.id || '').match(/^homey:device:[a-f0-9-]{36}:(.+)$/);
-      if (idMatch) capability = idMatch[1];
-    } else if (args.device && args.device.id) {
+    const idMatch = String(card.id || '').match(/^homey:device:([a-f0-9-]{36}):(.+)$/);
+    if (idMatch) {
+      deviceId = idMatch[1];
+      capability = idMatch[2];
+    } else if (args.device && args.device.id && (this.snapshot.devices || {})[args.device.id]) {
+      // Some apps use this argument for their own targets rather than Homey
+      // devices — Pushover's is a notification destination literally named
+      // "iPhone" — so only accept ids that resolve to a real device
       deviceId = args.device.id;
     }
     if (!deviceId) return;
