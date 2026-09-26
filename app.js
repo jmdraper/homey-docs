@@ -231,7 +231,8 @@ class HomeyDocsCompanion extends Homey.App {
     // running — picking the wrong client throws "Protocol not supported"
     const client = url.startsWith('https:') ? https : http;
     const payload = body === undefined ? null : JSON.stringify(body);
-    const headers = { Authorization: `Bearer ${this._token}` };
+    const writeToken = method === 'GET' ? null : this._writeToken();
+    const headers = { Authorization: `Bearer ${writeToken || this._token}` };
     if (payload !== null) {
       headers['Content-Type'] = 'application/json';
       headers['Content-Length'] = Buffer.byteLength(payload);
@@ -632,6 +633,16 @@ class HomeyDocsCompanion extends Homey.App {
     }
   }
 
+  // Writes need the homey.flow scope; the owner API token only carries
+  // homey.flow.readonly, so Homey answers a write with "Missing Scopes". A
+  // Personal Access Token created by the user can carry the write scope, and
+  // requiring them to provision one deliberately suits a feature that edits
+  // their automations.
+  _writeToken() {
+    const token = String(this.homey.settings.get('write_token') || '').trim();
+    return token || null;
+  }
+
   _allowedHosts() {
     return String(this.homey.settings.get('allowed_hosts') || '')
       .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
@@ -698,6 +709,16 @@ class HomeyDocsCompanion extends Homey.App {
     return value === true || value === 'true';
   }
 
+  _explainWriteFailure(error) {
+    const message = String(error && error.message || error);
+    if (!/missing scopes/i.test(message)) return 'Homey rejected the write: ' + message;
+    return 'Homey rejected the write for lack of permission. Editing flows needs the '
+      + '"homey.flow" scope, which the app\'s own token does not carry — it can only '
+      + 'read flows. Create a Personal Access Token with flow write access in the Homey '
+      + 'web app and paste it into "Personal Access Token" in this app\'s settings. '
+      + '(' + message + ')';
+  }
+
   async _installedAppIds() {
     if (this._appIds && (Date.now() - this._appIdsAt) < 60000) return this._appIds;
     try {
@@ -755,7 +776,7 @@ class HomeyDocsCompanion extends Homey.App {
     try {
       await this._apiRequest('PUT', '/manager/flow/advancedflow/' + flowId, body);
     } catch (e) {
-      return { error: 'Homey rejected the write: ' + e.message };
+      return { error: this._explainWriteFailure(e) };
     }
 
     await this._resyncFlow(flowId);
@@ -927,7 +948,7 @@ class HomeyDocsCompanion extends Homey.App {
     try {
       created = await this._apiRequest('POST', '/manager/flow/advancedflow', body);
     } catch (e) {
-      return { error: 'Homey rejected the create: ' + e.message };
+      return { error: this._explainWriteFailure(e) };
     }
     const flowId = created && created.id;
     if (flowId) await this._resyncFlow(flowId);
@@ -2115,6 +2136,17 @@ function copyPrompt(){
     result.advancedFlowPath = this._advancedFlowPath;
     result.allowedHosts = this._allowedHosts();
     result.tokenScopes = this._tokenScopes();
+    result.writeTokenConfigured = !!this._writeToken();
+    for (const [label, path] of [['session', '/manager/sessions/session/me']]) {
+      try {
+        const data = await this._apiGet(path);
+        // Never echo anything token-shaped back out
+        result[label] = JSON.parse(JSON.stringify(data, (key, value) =>
+          /token|secret|password|key/i.test(key) ? '[redacted]' : value));
+      } catch (e) {
+        result[label + 'Error'] = e.message;
+      }
+    }
     result.recentlyRejected = this._rejections || [];
     await this._fetchFlowCardTitles();
     result.cardTitles = {

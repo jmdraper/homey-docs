@@ -68,6 +68,17 @@
       </div>
 
       <div class="homey-form-group">
+        <label class="homey-form-label" for="write_token">Personal Access Token</label>
+        <input class="homey-form-input" id="write_token" type="password" placeholder="Required for editing" />
+        <p class="hint">
+          The app's own token can read flows but not change them, so editing needs a
+          token you create yourself. In the Homey web app go to Settings &rarr; API Keys,
+          create a key with flow write access, and paste it here. Leaving this empty
+          keeps everything read-only no matter what the switch above says.
+        </p>
+      </div>
+
+      <div class="homey-form-group">
         <label class="homey-form-label" for="revision_depth">Revisions kept per flow</label>
         <input class="homey-form-input" id="revision_depth" type="number" min="1" max="50" placeholder="10" />
         <p class="hint">
@@ -107,7 +118,7 @@
       function onHomeyReady(Homey) {
         Homey.ready();
 
-        var FIELDS = ['allowed_hosts', 'xref_base_url', 'xref_port', 'mcp_port', 'revision_depth'];
+        var FIELDS = ['allowed_hosts', 'xref_base_url', 'xref_port', 'mcp_port', 'revision_depth', 'write_token'];
         var TOGGLES = ['writes_enabled'];
         var el = {};
         FIELDS.concat(TOGGLES).forEach(function (name) {
