@@ -63,6 +63,13 @@ const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError
 const REVISION_DIR = '/userdata/revisions';
 const DEFAULT_REVISION_DEPTH = 10;
 
+// Rebuilding the cross-reference page walks every card in every flow and
+// writes a page of a couple of hundred kilobytes into settings. That is fine
+// once, but a burst of writes — building a flow card by card makes dozens —
+// repeats it for each one. Coalesce them into a single rebuild once the writes
+// stop.
+const XREF_REBUILD_DEBOUNCE_MS = 4000;
+
 // Addresses that cannot be pointed at this Homey by an attacker's DNS: IPv4 and
 // IPv6 literals, localhost, and mDNS .local names (resolved by mDNS, not DNS).
 const UNREBINDABLE_HOST_RE = /^(?:\[[0-9a-f:]+\]|\d{1,3}(?:\.\d{1,3}){3}|localhost|[a-z0-9-]+\.local)$/i;
@@ -885,11 +892,22 @@ class HomeyDocsCompanion extends Homey.App {
       const fresh = await this._apiGet('/manager/flow/advancedflow/' + flowId);
       if (fresh) this.snapshot.flows[flowId] = this._flowMeta(fresh, true);
       await this._saveState();
+      // The cache is dropped at once, so the next reader recomputes; only the
+      // expensive page rebuild is deferred
       this._xrefCache = null;
-      await this.regenerateXrefPage();
+      this._scheduleXrefRebuild();
     } catch (e) {
       this.error('Post-write resync failed (the write succeeded):', e.message);
     }
+  }
+
+  _scheduleXrefRebuild() {
+    if (this._xrefRebuildTimer) this.homey.clearTimeout(this._xrefRebuildTimer);
+    this._xrefRebuildTimer = this.homey.setTimeout(() => {
+      this._xrefRebuildTimer = null;
+      this.regenerateXrefPage()
+        .catch(e => this.error('Deferred cross-reference rebuild failed:', e.message));
+    }, XREF_REBUILD_DEBOUNCE_MS);
   }
 
   async setFlowEnabled(flowId, enabled) {
