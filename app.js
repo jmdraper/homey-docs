@@ -23,6 +23,20 @@ const ADVANCED_FLOW_WRITABLE = ['name', 'enabled', 'folder', 'cards'];
 // arguments, 120 around 250 characters, 240 around 350. The estimate below is
 // deliberately generous, because too much space is cosmetic while an overlap
 // is not.
+// Width varies by card type, not by content. Trigger, condition and action
+// cards render as full-width boxes; start, delay, all and any render as
+// compact pills. Spacing left edge to left edge by one constant therefore
+// leaves a wide card almost touching its child while a pill sits marooned.
+// These are the gaps measured per parent type on this Homey.
+const CARD_GAP_X_BY_TYPE = {
+  start: 160,
+  all: 180,
+  any: 200,
+  delay: 200,
+  trigger: 440,
+  action: 440,
+  condition: 460,
+};
 const CARD_GAP_X = 440;
 const CARD_GAP_Y = 100;
 const CARD_GAP_Y_MAX = 360;
@@ -899,6 +913,10 @@ class HomeyDocsCompanion extends Homey.App {
     });
   }
 
+  _columnGapAfter(card) {
+    return CARD_GAP_X_BY_TYPE[card && card.type] || CARD_GAP_X;
+  }
+
   // How far below a card the next sibling should sit, given how tall it will
   // render. Argument length is the only signal available before rendering.
   _siblingGapBelow(card) {
@@ -944,7 +962,7 @@ class HomeyDocsCompanion extends Homey.App {
             .reduce((all, output) => all.concat(source[output] || []), [])
             .map(id => draft.cards[id])
             .filter(Boolean);
-          newCard.x = (source.x || 0) + CARD_GAP_X;
+          newCard.x = (source.x || 0) + this._columnGapAfter(source);
           if (siblings.length) {
             // Stack below the lowest existing child, clearing however tall it is
             const lowest = siblings.reduce((a, b) => ((a.y || 0) > (b.y || 0) ? a : b));
@@ -1022,11 +1040,21 @@ class HomeyDocsCompanion extends Homey.App {
       for (const id of ids) (columns[depth[id]] = columns[depth[id]] || []).push(id);
 
       const originX = Math.min.apply(null, ids.map(id => cards[id].x || 0));
+      // Each column starts far enough right to clear the widest card in the
+      // one before it, rather than at a fixed multiple
+      const order = Object.keys(columns).map(Number).sort((a, b) => a - b);
+      const columnX = {};
+      let nextX = originX;
+      for (const column of order) {
+        columnX[column] = nextX;
+        nextX += Math.max.apply(null,
+          columns[column].map(id => this._columnGapAfter(cards[id])));
+      }
       const originY = Math.min.apply(null, ids.map(id => cards[id].y || 0));
       const placedY = {};
       let moved = 0;
 
-      for (const column of Object.keys(columns).map(Number).sort((a, b) => a - b)) {
+      for (const column of order) {
         // Follow the parents' order, so branches stay beside what feeds them
         const members = columns[column].sort((a, b) => {
           const above = id => (parents[id].length
@@ -1038,7 +1066,7 @@ class HomeyDocsCompanion extends Homey.App {
         let y = originY;
         for (const id of members) {
           const card = cards[id];
-          const x = originX + column * CARD_GAP_X;
+          const x = columnX[column];
           if (card.x !== x || card.y !== y) moved += 1;
           card.x = x;
           card.y = y;
