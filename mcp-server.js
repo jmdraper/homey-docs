@@ -209,12 +209,21 @@ class HomeyMcpServer {
   }
 
   async _handleHttp(req, res) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Mcp-Session-Id');
+    // No CORS headers: this server has no browser client. mcp-remote is a local
+    // Node process, which neither sends an Origin nor needs one honoured.
+    // Serving Access-Control-Allow-Origin: * here previously let any website the
+    // user visited read their entire flow and device inventory.
+    const rejection = this._app._checkRequest(req);
+    if (rejection) {
+      this._app.log('MCP request rejected:', rejection);
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden: ' + rejection);
+      return;
+    }
 
     if (req.method === 'OPTIONS') {
-      res.writeHead(204);
+      // A preflight can only come from a browser, which is not a client here
+      res.writeHead(405, { Allow: 'POST, DELETE' });
       res.end();
       return;
     }

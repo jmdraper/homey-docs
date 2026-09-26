@@ -62,6 +62,17 @@
       }
     },
     {
+      "id": "allowed_hosts",
+      "type": "text",
+      "title": {
+        "en": "Additional allowed hosts"
+      },
+      "value": "",
+      "hint": {
+        "en": "Comma-separated hostnames permitted to reach the viewer and MCP server, in addition to IP addresses, localhost and .local names, which are always allowed. Only needed if you reach Homey by a domain name — for example a Tailscale MagicDNS name such as homey.tailnet-name.ts.net. Leave empty otherwise."
+      }
+    },
+    {
       "id": "xref_base_url",
       "type": "text",
       "title": {

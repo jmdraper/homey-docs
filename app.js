@@ -8,6 +8,10 @@ const path = require('path');
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
+// Addresses that cannot be pointed at this Homey by an attacker's DNS: IPv4 and
+// IPv6 literals, localhost, and mDNS .local names (resolved by mDNS, not DNS).
+const UNREBINDABLE_HOST_RE = /^(?:\[[0-9a-f:]+\]|\d{1,3}(?:\.\d{1,3}){3}|localhost|[a-z0-9-]+\.local)$/i;
+
 // Flow card registries — used to turn card ids into human titles
 const FLOW_CARD_PATHS = {
   trigger: '/manager/flow/flowcardtrigger',
@@ -446,6 +450,47 @@ class HomeyDocsCompanion extends Homey.App {
     return result;
   }
 
+  // ─── Request guards ──────────────────────────────────────────────────────────
+
+  _allowedHosts() {
+    return String(this.homey.settings.get('allowed_hosts') || '')
+      .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
+  }
+
+  // Returns null when a request is acceptable, or a reason to reject it.
+  //
+  // The attack these guard against is not a peer on the LAN — it is the user's
+  // own browser. A page they visit can resolve an attacker-controlled name to
+  // this Homey and then talk to these servers, which no amount of network trust
+  // prevents. Requiring the Host header to name an address that cannot be
+  // rebound closes that; anything else can be allowlisted in settings, which is
+  // what a Tailscale MagicDNS name needs.
+  //
+  // allowSameOrigin is for the cross-reference viewer, whose own page must be
+  // able to POST back to it. The MCP server has no browser client at all —
+  // mcp-remote is a local Node process and sends no Origin — so any Origin
+  // there is a browser that has no business talking to it.
+  _checkRequest(req, options) {
+    const allowSameOrigin = !!(options && options.allowSameOrigin);
+    const hostHeader = String(req.headers.host || '').toLowerCase();
+    const hostname = hostHeader.replace(/:\d+$/, '');
+
+    if (!hostname) return 'missing Host header';
+    if (!UNREBINDABLE_HOST_RE.test(hostname) && !this._allowedHosts().includes(hostname)) {
+      return 'Host "' + hostname + '" is not a local address — add it to the '
+        + '"Additional allowed hosts" app setting if this is expected';
+    }
+
+    const origin = req.headers.origin;
+    if (!origin) return null;
+    if (!allowSameOrigin) return 'requests carrying an Origin header are not accepted';
+    let originHost;
+    try { originHost = new URL(origin).host.toLowerCase(); }
+    catch (e) { return 'malformed Origin header'; }
+    if (originHost !== hostHeader) return 'cross-origin request from ' + origin + ' rejected';
+    return null;
+  }
+
   // ─── Flow summaries and search ───────────────────────────────────────────────
 
   // Homey registers every flow card with a human title. Resolving card ids this
@@ -861,6 +906,16 @@ class HomeyDocsCompanion extends Homey.App {
     const port = parseInt(this.homey.settings.get('xref_port'), 10) || 8734;
 
     this._xrefServer = http.createServer((req, res) => {
+      // The viewer's own page POSTs back to /settings and /refresh, so a
+      // same-origin Origin is expected here; anything else is not.
+      const rejection = this._checkRequest(req, { allowSameOrigin: true });
+      if (rejection) {
+        this.log('Viewer request rejected:', rejection);
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden: ' + rejection);
+        return;
+      }
+
       if (req.method === 'GET' && req.url === '/onboarding') {
         const mdPath = path.join(__dirname, 'assets', 'homey-docs-companion-onboarding.md');
         let onboardingHtml = '<p>Could not load instructions.</p>';
@@ -1599,6 +1654,7 @@ function copyPrompt(){
       initialised_at: this.snapshot.initialised_at
     };
     result.advancedFlowPath = this._advancedFlowPath;
+    result.allowedHosts = this._allowedHosts();
     await this._fetchFlowCardTitles();
     result.cardTitles = {
       count: Object.keys((this._cardTitles || {}).any || {}).length,

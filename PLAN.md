@@ -1,6 +1,6 @@
 # Homey Docs Companion — Development Plan
 
-Status: steps 1–4 complete. Built one step at a time, in order.
+Status: steps 1–5 complete. Built one step at a time, in order.
 
 ## Context
 
@@ -276,7 +276,7 @@ for card titles and `/manager/flow/folder` for folder names. Both are wrapped in
 try/catch and degrade to the raw card-id suffix and the folder uuid respectively, so
 a missing endpoint costs readability rather than correctness.
 
-## Step 5 — MCP network hardening
+## Step 5 — MCP network hardening ✅ done
 
 Prerequisite for step 6. `mcp-server.js` sets `Access-Control-Allow-Origin: *` with
 no authentication. Read-only, that leaks the full flow and device inventory to any
@@ -291,7 +291,25 @@ control of the automations. Tailscale does not help — the browser is the couri
   rebinding once CORS is gone.
 
 **Done when:** `mcp-remote` still connects, and a cross-origin `fetch` from a browser
-page is refused.
+page is refused. ✅ 16 guard cases and 5 end-to-end HTTP cases pass.
+
+**Both servers are covered**, with different rules, because their clients differ:
+- **MCP (8735)** has no browser client at all — `mcp-remote` is a local Node process
+  that sends no Origin — so *any* Origin header is rejected outright. A CORS preflight
+  is therefore refused at the guard, which also fails the real request behind it.
+- **Viewer (8734)** is itself a browser page that POSTs back to `/settings` and
+  `/refresh`, so an Origin is expected there but must match the Host. That closes the
+  unauthenticated `POST /settings` noted in the step 3 follow-ups.
+
+**Host validation** accepts addresses that cannot be pointed at this Homey by an
+attacker's DNS: IPv4 and IPv6 literals, `localhost`, and mDNS `.local` names. Anything
+else is refused unless listed in a new **Additional allowed hosts** setting — which is
+what a Tailscale MagicDNS name needs, since `homey.tailnet-name.ts.net` is a real DNS
+name and therefore reboundable. Access by plain Tailscale IP needs no configuration.
+
+**No token, deliberately** — see the decisions table. The guards address the attack
+that network trust does not cover; a shared secret would add client configuration
+without addressing it.
 
 ## Step 6 — Write support for advanced flows
 
@@ -399,10 +417,9 @@ Spotted while working; none blocking, all deferred deliberately.
   the `/apps` endpoint have always returned `{}` — neither the old `_buildSnapshot`
   nor `_poll` ever populated it. Either wire it up or delete all three. Pre-dates this
   work.
-- **Step 5 must also cover the xref server on port 8734**, not just MCP on 8735. It
-  exposes an unauthenticated `POST /settings` that persists `xref_base_url` into app
-  settings, and a `POST /refresh` that now triggers a full Homey re-read. Same class
-  of problem, same fix.
+- ~~Step 5 must also cover the xref server on port 8734.~~ **Done** — both servers are
+  guarded, with same-origin POSTs permitted on the viewer and no Origin accepted at
+  all on MCP.
 - **The onboarding doc needs another pass after steps 4 and 6.** It was rewritten for
   live querying, but its prompt can only teach Claude about tools that exist today —
   `get_flow_summary`, `search_flows`, and the write tools will each change the advice
