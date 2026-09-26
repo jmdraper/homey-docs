@@ -148,7 +148,7 @@ const TOOLS = [
   },
   {
     name: 'list_flow_revisions',
-    description: 'List the saved pre-edit copies of a flow, newest first. Every edit saves one automatically. Use the revision number with revert_flow.',
+    description: 'List the saved pre-edit copies of a flow, newest first. Every edit saves one automatically. Use the revision number with revert_flow — but call this again first if anything has been written since, because revision 1 is always the most recent save and the numbers shift down as new ones are added.',
     inputSchema: {
       type: 'object',
       properties: { flowId: { type: 'string', description: 'The advanced flow ID' } },
@@ -158,7 +158,7 @@ const TOOLS = [
   },
   {
     name: 'revert_flow',
-    description: 'Restore a flow to a previously saved revision. The current state is saved first, so a revert can itself be reverted.',
+    description: 'Restore a flow to a previously saved revision, numbered as list_flow_revisions reports them at the time of the call. The current state is saved first, so a revert can itself be reverted — which also means every revert shifts the existing numbers down by one, so list the revisions again rather than reusing numbers from before a write.',
     inputSchema: {
       type: 'object',
       properties: {
