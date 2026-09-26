@@ -1115,11 +1115,24 @@ class HomeyDocsCompanion extends Homey.App {
     return parts.join(', ');
   }
 
+  // Delay args are { number, multiplier }, where the multiplier converts to
+  // seconds. Rendering the raw object says nothing a reader can use.
+  _delaySummary(args) {
+    const delay = args && args.delay;
+    if (!delay || delay.number === undefined) return this._argSummary(args || {});
+    const seconds = Number(delay.number) * Number(delay.multiplier || 1);
+    if (!Number.isFinite(seconds)) return this._argSummary(args);
+    const unit = (value, name) => value + ' ' + name + (value === 1 ? '' : 's');
+    if (seconds >= 3600 && seconds % 3600 === 0) return unit(seconds / 3600, 'hour');
+    if (seconds >= 60 && seconds % 60 === 0) return unit(seconds / 60, 'minute');
+    return unit(seconds, 'second');
+  }
+
   _cardLabel(card, titles) {
     if (card.type === 'all')   return 'ALL of:';
     if (card.type === 'any')   return 'ANY of:';
     if (card.type === 'start') return 'WHEN started by another flow';
-    if (card.type === 'delay') return 'DELAY ' + this._argSummary(card.args || {});
+    if (card.type === 'delay') return 'DELAY ' + this._delaySummary(card.args);
 
     const id = String(card.id || '');
     const title = this._lookupCardTitle(card, titles);
