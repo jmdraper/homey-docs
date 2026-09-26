@@ -939,9 +939,15 @@ class HomeyDocsCompanion extends Homey.App {
     }
     if (!name || typeof name !== 'string' || !name.trim()) return { error: 'name is required' };
 
-    // Created disabled: a new flow has no cards, and an empty enabled flow in
-    // the user's list is noise at best
-    const body = { name: name.trim(), enabled: false, cards: {} };
+    // Homey rejects a flow with no cards ("Advanced Flow is empty, add at least
+    // one Flow card"), so seed a start card: the minimal valid flow, and one
+    // that cannot fire on its own. Created disabled as well.
+    const startCardId = crypto.randomUUID();
+    const body = {
+      name: name.trim(),
+      enabled: false,
+      cards: { [startCardId]: { type: 'start', x: 0, y: 0, outputSuccess: [] } }
+    };
     if (folder) body.folder = folder;
 
     let created;
@@ -952,7 +958,11 @@ class HomeyDocsCompanion extends Homey.App {
     }
     const flowId = created && created.id;
     if (flowId) await this._resyncFlow(flowId);
-    return { ok: true, flowId, flow: body.name, enabled: false, note: 'Created disabled and empty — add cards, then enable it.' };
+    return {
+      ok: true, flowId, flow: body.name, enabled: false, startCardId,
+      note: 'Created disabled, containing only a start card. Add cards with add_card '
+        + '(pass after: startCardId to chain from it), then enable it.'
+    };
   }
 
   async revertFlow(flowId, revision) {
