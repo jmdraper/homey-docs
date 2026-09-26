@@ -16,6 +16,84 @@ const ADVANCED_FLOW_PATHS = [
   '/manager/flow2/flow',
 ];
 
+// ─── FlowBits card families ──────────────────────────────────────────────────
+// FlowBits identifies entities by card-ID prefix, not by argument shape: mode
+// cards and cycle cards both carry the entity name in `args.name`, so dispatching
+// on which argument is present cannot tell them apart.
+//
+// Order matters. `mode_group_` must be tested before `mode_`, and the base cycle
+// action is the bare id `cycle` with no trailing underscore.
+//
+// Autocomplete arguments always serialise as { name: string }. Cards with no
+// entity argument at all (mode_active, flag_active, event_clear_all,
+// mode_reactivate_current) reference nothing specific and fall out naturally.
+//
+// `trigger` / `condition` / `action` map a card type to a role, either directly
+// or via a function of the card id. Families with a `memberField` are two-level
+// (a set and its states, a group and its modes).
+const FLOWBITS_FAMILIES = [
+  {
+    prefix: 'mode_group_', bucket: 'flowbits_mode_groups',
+    keyArg: 'group', memberArg: 'name', memberField: 'modes',
+    trigger: 'triggers_on', condition: 'checks',
+    action: id => (id === 'mode_group_toggle' ? 'toggles'
+                 : id.startsWith('mode_group_deactivate') ? 'deactivates' : 'activates'),
+  },
+  {
+    prefix: 'mode_', bucket: 'flowbits_modes', keyArg: 'name',
+    trigger: 'triggers_on', condition: 'checks',
+    action: id => (id === 'mode_toggle' ? 'toggles'
+                 : id.startsWith('mode_deactivate') ? 'deactivates' : 'activates'),
+  },
+  {
+    prefix: 'event_', bucket: 'flowbits_events', keyArg: 'event',
+    trigger: id => (id === 'event_cleared' ? 'cleared_by' : 'triggered_by'),
+    condition: 'checks',
+    action: id => (id.startsWith('event_clear') ? 'clears' : 'fires'),
+  },
+  {
+    prefix: 'label_', bucket: 'flowbits_labels', keyArg: 'label',
+    trigger: 'triggers_on', condition: 'checks',
+    action: id => (id === 'label_clear' ? 'clears' : 'writes'),
+  },
+  {
+    prefix: 'set_', bucket: 'flowbits_sets',
+    keyArg: 'set', memberArg: 'state', memberField: 'states',
+    trigger: 'triggers_on', condition: 'checks',
+    action: id => (id.startsWith('set_deactivate') ? 'deactivates'
+                 : id.startsWith('set_toggle') ? 'toggles' : 'activates'),
+  },
+  {
+    prefix: 'signal_', bucket: 'flowbits_signals', keyArg: 'signal',
+    trigger: 'received_by', condition: null, action: 'sends',
+  },
+  {
+    prefix: 'timer_', bucket: 'flowbits_timers', keyArg: 'timer',
+    trigger: 'triggers_on', condition: 'checks',
+    action: id => (id === 'timer_info' ? 'reads'
+                 : (id === 'timer_pause' || id === 'timer_stop') ? 'stops' : 'starts'),
+  },
+  {
+    prefix: 'flag_', bucket: 'flowbits_flags', keyArg: 'flag',
+    trigger: 'triggers_on', condition: 'checks',
+    action: id => (id === 'flag_deactivate' ? 'deactivates'
+                 : id === 'flag_toggle' ? 'toggles' : 'activates'),
+  },
+  {
+    prefix: 'cycle', bucket: 'flowbits_cycles', keyArg: 'name',
+    trigger: 'triggers_on', condition: 'checks',
+    action: id => (id === 'cycle_to' ? 'writes' : 'advances'),
+  },
+  {
+    prefix: 'slider_', bucket: 'flowbits_sliders', keyArg: 'slider',
+    trigger: 'triggers_on', condition: null, action: 'writes',
+  },
+  {
+    prefix: 'no_repeat_', bucket: 'flowbits_windows', keyArg: 'window',
+    trigger: null, condition: 'checks', action: 'clears',
+  },
+];
+
 class HomeyDocsCompanion extends Homey.App {
 
   async onInit() {
@@ -725,12 +803,13 @@ function copyPrompt(){
     const result = {
       variables: {},
       bll_variables: {},
-      flowbits_events: {},
-      flowbits_labels: {},
-      flowbits_sets: {},
-      timers: {},
-      flow_triggers: {}
+      timers: {},          // Chronograph; FlowBits timers live in flowbits_timers
+      flow_triggers: {},
+      trigger_tokens: {}   // otherwise created lazily by _processDroptoken
     };
+    // One bucket per FlowBits family, built from the same table the extractor
+    // dispatches on, so the two cannot drift apart
+    for (const family of FLOWBITS_FAMILIES) result[family.bucket] = {};
 
     const { getBllVariables } = require('./bll-client.js');
     const bllVariables = await getBllVariables(this);
@@ -895,64 +974,44 @@ function copyPrompt(){
   }
 
   _extractFlowBitsRef(result, flowId, flowName, card) {
-    const cardId = card.id || '';
+    const suffix = (card.id || '').split(':').pop();
+    const family = FLOWBITS_FAMILIES.find(f => suffix.startsWith(f.prefix));
+    if (!family) return;
+
     const args = card.args || {};
-    const cardType = card.type;
-    const suffix = cardId.split(':').pop();
+    const keyArg = args[family.keyArg];
+    const keyName = keyArg && keyArg.name;
+    if (!keyName) return;   // card references no specific entity
 
-    // Events
-    if (args.event && args.event.name) {
-      const key = args.event.name;
-      if (!result.flowbits_events[key]) result.flowbits_events[key] = { flows: {} };
-      let role;
-      if (suffix === 'event_trigger') role = 'fires';
-      else if (suffix === 'event_triggered') role = 'triggered_by';
-      else if (suffix === 'event_happened_within') role = 'checks';
-      else if (suffix === 'event_clear') role = 'clears';
-      else if (cardType === 'action') role = 'fires';
-      else if (cardType === 'trigger') role = 'triggered_by';
-      else if (cardType === 'condition') role = 'checks';
-      if (role) this._addFlowRole(result.flowbits_events[key], flowId, flowName, role);
+    const spec = family[card.type];
+    const role = typeof spec === 'function' ? spec(suffix) : spec;
+    if (!role) return;
+
+    if (family.memberField) {
+      const memberArg = args[family.memberArg];
+      this._addGroupedRef(
+        result[family.bucket], keyName, memberArg && memberArg.name,
+        family.memberField, flowId, flowName, role
+      );
       return;
     }
 
-    // Labels
-    if (args.label && args.label.name) {
-      const key = args.label.name;
-      if (!result.flowbits_labels[key]) result.flowbits_labels[key] = { flows: {} };
-      let role;
-      if (suffix === 'label_set') role = 'writes';
-      else if (suffix === 'label_is') role = 'reads';
-      else if (cardType === 'action') role = 'writes';
-      else role = 'reads';
-      this._addFlowRole(result.flowbits_labels[key], flowId, flowName, role);
-      return;
-    }
+    if (!result[family.bucket][keyName]) result[family.bucket][keyName] = { flows: {} };
+    this._addFlowRole(result[family.bucket][keyName], flowId, flowName, role);
+  }
 
-    // Sets
-    if (args.set && args.set.name) {
-      const key = args.set.name;
-      if (!result.flowbits_sets[key]) result.flowbits_sets[key] = { states: [], flows: {} };
-      const stateName = args.state && args.state.name ? args.state.name : null;
-      if (stateName && !result.flowbits_sets[key].states.includes(stateName)) {
-        result.flowbits_sets[key].states.push(stateName);
-      }
-      let role;
-      if (suffix === 'set_activate_state') role = 'activates';
-      else if (suffix === 'set_deactivate_state') role = 'deactivates';
-      else if (suffix === 'set_state_is') role = 'checks';
-      else if (cardType === 'action') role = suffix.includes('deactivate') ? 'deactivates' : 'activates';
-      else role = 'checks';
-      if (!result.flowbits_sets[key].flows[flowId]) {
-        result.flowbits_sets[key].flows[flowId] = { flowName, roles: [], states: [] };
-      }
-      if (role && !result.flowbits_sets[key].flows[flowId].roles.includes(role)) {
-        result.flowbits_sets[key].flows[flowId].roles.push(role);
-      }
-      if (stateName && !result.flowbits_sets[key].flows[flowId].states.includes(stateName)) {
-        result.flowbits_sets[key].flows[flowId].states.push(stateName);
-      }
-    }
+  // Two-level entities: a set and its states, a mode group and its modes. The
+  // member is recorded both on the entry and per-flow, so the viewer can show
+  // which states a given flow actually touches.
+  _addGroupedRef(bucket, keyName, member, memberField, flowId, flowName, role) {
+    if (!bucket[keyName]) bucket[keyName] = { [memberField]: [], flows: {} };
+    const entry = bucket[keyName];
+    if (member && !entry[memberField].includes(member)) entry[memberField].push(member);
+
+    if (!entry.flows[flowId]) entry.flows[flowId] = { flowName, roles: [], [memberField]: [] };
+    const flow = entry.flows[flowId];
+    if (!flow.roles.includes(role)) flow.roles.push(role);
+    if (member && !flow[memberField].includes(member)) flow[memberField].push(member);
   }
 
   _extractTimerRef(result, flowId, flowName, card) {

@@ -126,13 +126,18 @@ const TOOLS = [
   },
   {
     name: 'get_cross_references',
-    description: "Get a cross-reference index showing which flows use each variable, FlowBits event, label, set, timer, and programmatic flow trigger. Use to answer 'which flows use variable X?' or 'what fires FlowBits event Y?'.",
+    description: "Get a cross-reference index showing which flows use each Homey variable, Better Logic Library variable, Chronograph timer, programmatic flow trigger, and FlowBits entity (events, labels, sets, signals, modes, mode groups, timers, flags, cycles, sliders and no-repeat windows). Use to answer 'which flows use variable X?', 'what fires FlowBits event Y?' or 'what activates mode Z?'.",
     inputSchema: {
       type: 'object',
       properties: {
         type: {
           type: 'string',
-          enum: ['variables', 'bll_variables', 'flowbits_events', 'flowbits_labels', 'flowbits_sets', 'timers', 'flow_triggers'],
+          enum: [
+            'variables', 'bll_variables', 'timers', 'flow_triggers', 'trigger_tokens',
+            'flowbits_events', 'flowbits_labels', 'flowbits_sets', 'flowbits_signals',
+            'flowbits_modes', 'flowbits_mode_groups', 'flowbits_timers',
+            'flowbits_flags', 'flowbits_cycles', 'flowbits_sliders', 'flowbits_windows',
+          ],
           description: 'Filter to a single reference type. Omit to return all types.',
         },
       },
