@@ -1159,23 +1159,49 @@ class HomeyDocsCompanion extends Homey.App {
   // Notes label the section beside them, so they have to travel with it.
   // Their width and height are null — Homey sizes them at render time — so
   // position is all there is to work with.
-  _captureNoteAnchors(cards, ids) {
+  _captureNoteAnchors(cards, ids, groups) {
     const anchors = {};
+    const leftEdge = Math.min.apply(null, ids.map(id => cards[id].x || 0));
+
+    // The first card of each behaviour, in canvas order
+    const heads = (groups || []).map(group => {
+      const atEdge = group.filter(id => (cards[id].x || 0) === leftEdge);
+      const candidates = atEdge.length ? atEdge : group;
+      return candidates.reduce((top, id) =>
+        ((cards[id].y || 0) < (cards[top].y || 0) ? id : top));
+    });
+
     for (const [noteId, note] of Object.entries(cards)) {
       if (!note || note.type !== 'note') continue;
+
+      // A note at the left edge heads a behaviour. Anchoring it to whatever is
+      // nearest is self-reinforcing: once it drifts beside the wrong band it
+      // stays there, because the next pass measures from where it already is.
       let best = null;
-      let bestDistance = Infinity;
-      for (const id of ids) {
-        const dx = (cards[id].x || 0) - (note.x || 0);
-        const dy = (cards[id].y || 0) - (note.y || 0);
-        const distance = Math.sqrt((dx * dx) + (dy * dy));
-        if (distance < bestDistance) { bestDistance = distance; best = id; }
+      if ((note.x || 0) <= leftEdge && heads.length) {
+        const below = heads.filter(id => (cards[id].y || 0) >= (note.y || 0));
+        const pool = below.length ? below : heads;
+        best = pool.reduce((closest, id) =>
+          (Math.abs((cards[id].y || 0) - (note.y || 0))
+            < Math.abs((cards[closest].y || 0) - (note.y || 0)) ? id : closest));
+      } else {
+        let bestDistance = Infinity;
+        for (const id of ids) {
+          const dx = (cards[id].x || 0) - (note.x || 0);
+          const dy = (cards[id].y || 0) - (note.y || 0);
+          const distance = Math.sqrt((dx * dx) + (dy * dy));
+          if (distance < bestDistance) { bestDistance = distance; best = id; }
+        }
       }
+
       if (best) {
+        const heading = (note.x || 0) <= leftEdge;
         anchors[noteId] = {
           anchor: best,
-          dx: (note.x || 0) - (cards[best].x || 0),
-          dy: (note.y || 0) - (cards[best].y || 0)
+          dx: heading ? 0 : (note.x || 0) - (cards[best].x || 0),
+          dy: heading
+            ? -(this._noteHeight(note) + NOTE_GAP_ABOVE)
+            : (note.y || 0) - (cards[best].y || 0)
         };
       }
     }
@@ -1184,7 +1210,7 @@ class HomeyDocsCompanion extends Homey.App {
 
   // Place one column's cards at their preferred positions, clustering those
   // that want the same spot and centring each cluster on it.
-  _placeColumn(cards, members, desired, columnTop, placedY, columnX) {
+  _placeColumn(cards, members, desired, placedY, columnX) {
     members.sort((a, b) => desired[a] - desired[b] || (cards[a].y || 0) - (cards[b].y || 0));
 
     const clusters = [];
@@ -1195,7 +1221,10 @@ class HomeyDocsCompanion extends Homey.App {
     }
 
     let moved = 0;
-    let cursor = columnTop;
+    // No floor: a cluster must be free to sit above where the column started,
+    // or a parent ends up level with its first child rather than centred on
+    // them. The band is shifted into place once it is complete.
+    let cursor = -Infinity;
     for (const cluster of clusters) {
       const gaps = cluster.ids.map(id => this._siblingGapBelow(cards[id]));
       const extent = gaps.slice(0, -1).reduce((total, gap) => total + gap, 0);
@@ -1265,9 +1294,9 @@ class HomeyDocsCompanion extends Homey.App {
         const desired = {};
         for (const id of columns[column]) {
           const target = midpointOf(id, side);
-          desired[id] = target === null ? bandTop : target;
+          desired[id] = target === null ? (placedY[id] === undefined ? 0 : placedY[id]) : target;
         }
-        const placed = this._placeColumn(cards, columns[column], desired, bandTop, placedY, columnX[column]);
+        const placed = this._placeColumn(cards, columns[column], desired, placedY, columnX[column]);
         moved += placed.moved;
         bottom = Math.max(bottom, placed.bottom);
       }
@@ -1307,6 +1336,14 @@ class HomeyDocsCompanion extends Homey.App {
     }
     restore(best.y);
 
+    // Slide the finished band into position
+    const top = Math.min.apply(null, group.map(id => cards[id].y || 0));
+    const shift = bandTop - top;
+    for (const id of group) {
+      cards[id].y = (cards[id].y || 0) + shift;
+      placedY[id] = cards[id].y;
+    }
+
     let bottom = bandTop;
     for (const id of group) {
       bottom = Math.max(bottom, (cards[id].y || 0) + this._siblingGapBelow(cards[id]));
@@ -1320,8 +1357,6 @@ class HomeyDocsCompanion extends Homey.App {
       const cards = draft.cards;
       const ids = Object.keys(cards).filter(id => cards[id] && cards[id].type !== 'note');
       if (!ids.length) return { error: 'this flow has no cards to lay out' };
-
-      const noteAnchors = this._captureNoteAnchors(cards, ids);
 
       const parents = {};
       const children = {};
@@ -1340,8 +1375,14 @@ class HomeyDocsCompanion extends Homey.App {
         Math.min.apply(null, a.map(id => cards[id].y || 0))
         - Math.min.apply(null, b.map(id => cards[id].y || 0)));
 
+      const noteAnchors = this._captureNoteAnchors(cards, ids, groups);
+
       const originX = Math.min.apply(null, ids.map(id => cards[id].x || 0));
       const originY = Math.min.apply(null, ids.map(id => cards[id].y || 0));
+      // Finish with the flow's topmost element at the origin. Preserving
+      // wherever it currently starts would keep any drift it has already
+      // accumulated, and the canvas origin carries no meaning of its own.
+      const topBefore = 0;
 
       // A note heading a band sits above that band's first card, so the band
       // has to start low enough to leave room for it — otherwise the note
@@ -1391,6 +1432,12 @@ class HomeyDocsCompanion extends Homey.App {
         if (dy < 0 && dy > -clearance) dy = -clearance;
         note.x = (target.x || 0) + anchor.dx;
         note.y = (target.y || 0) + dy;
+      }
+
+      const topAfter = Math.min.apply(null, Object.values(cards).map(card => card.y || 0));
+      const correction = topBefore - topAfter;
+      if (correction !== 0) {
+        for (const card of Object.values(cards)) card.y = (card.y || 0) + correction;
       }
 
       return {
