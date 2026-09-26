@@ -457,6 +457,26 @@ class HomeyDocsCompanion extends Homey.App {
       .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
   }
 
+  // Rejections are kept so the cause is visible in diagnostics. A reverse proxy
+  // forwards its own hostname, and an upstream 403 can surface as a 502 at the
+  // proxy, which hides the reason entirely — this is how you find out which
+  // host to allow.
+  _recordRejection(req, reason) {
+    if (!this._rejections) this._rejections = [];
+    const host = String(req.headers.host || '(none)');
+    const existing = this._rejections.find(e => e.host === host && e.reason === reason);
+    if (existing) {
+      existing.count += 1;
+      existing.lastSeen = new Date().toISOString();
+      return;
+    }
+    this._rejections.unshift({
+      host, origin: req.headers.origin || null, reason,
+      count: 1, lastSeen: new Date().toISOString()
+    });
+    if (this._rejections.length > 10) this._rejections.pop();
+  }
+
   // Returns null when a request is acceptable, or a reason to reject it.
   //
   // The attack these guard against is not a peer on the LAN — it is the user's
@@ -910,6 +930,7 @@ class HomeyDocsCompanion extends Homey.App {
       // same-origin Origin is expected here; anything else is not.
       const rejection = this._checkRequest(req, { allowSameOrigin: true });
       if (rejection) {
+        this._recordRejection(req, rejection);
         this.log('Viewer request rejected:', rejection);
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end('Forbidden: ' + rejection);
@@ -1655,6 +1676,7 @@ function copyPrompt(){
     };
     result.advancedFlowPath = this._advancedFlowPath;
     result.allowedHosts = this._allowedHosts();
+    result.recentlyRejected = this._rejections || [];
     await this._fetchFlowCardTitles();
     result.cardTitles = {
       count: Object.keys((this._cardTitles || {}).any || {}).length,

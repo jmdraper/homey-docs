@@ -27,6 +27,13 @@ Option B — Local network (advanced users)
   Safari requires either a reverse proxy providing HTTPS, or a one-time insecure
   content exception in Safari Settings → Websites.
 
+  If you reach the viewer through a reverse proxy or any other domain name, add
+  that hostname to the "Additional allowed hosts" app setting. Requests are only
+  accepted for IP addresses, localhost and .local names by default, which is what
+  prevents a website you visit from reaching Homey through your browser. A proxy
+  forwards its own hostname, so without this the viewer returns 403 — which some
+  proxies report as a 502.
+
 
 AI ASSISTANT INTEGRATION (MCP)
 

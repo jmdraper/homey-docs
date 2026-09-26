@@ -307,6 +307,13 @@ else is refused unless listed in a new **Additional allowed hosts** setting — 
 what a Tailscale MagicDNS name needs, since `homey.tailnet-name.ts.net` is a real DNS
 name and therefore reboundable. Access by plain Tailscale IP needs no configuration.
 
+**Reverse proxies need configuring.** A proxy forwards its own hostname, so the guard
+refuses it and the viewer stops working — and a proxy may report that upstream 403 as
+a 502, hiding the reason. The hostname must be added to **Additional allowed hosts**.
+This is a real access pattern the README documents, so it is called out there too, and
+rejected requests are now recorded in `getDiagnostics` (`recentlyRejected`) so the
+host to allow is discoverable rather than guessed at.
+
 **No token, deliberately** — see the decisions table. The guards address the attack
 that network trust does not cover; a shared secret would add client configuration
 without addressing it.

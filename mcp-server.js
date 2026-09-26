@@ -215,6 +215,7 @@ class HomeyMcpServer {
     // user visited read their entire flow and device inventory.
     const rejection = this._app._checkRequest(req);
     if (rejection) {
+      this._app._recordRejection(req, rejection);
       this._app.log('MCP request rejected:', rejection);
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end('Forbidden: ' + rejection);
