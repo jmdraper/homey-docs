@@ -78,6 +78,27 @@ const TOOLS = [
     },
   },
   {
+    name: 'get_flow_summary',
+    description: 'Get a readable summary of one flow: card ids resolved to their human titles, device/variable/zone ids resolved to names, tokens rendered inline, any notes the author wrote on the canvas, and the card graph as an indented tree showing execution order. Far cheaper to read than get_advanced_flow and much less error-prone — prefer it whenever you want to understand what a flow does, and fall back to get_advanced_flow only when you need raw ids or card coordinates.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'The flow ID (basic or advanced)' } },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'search_flows',
+    description: 'Search every flow for a phrase, matching against flow names, canvas notes, resolved card titles, device and variable names, and card arguments. Returns matching flows with the specific lines that matched. Use this to locate flows by what they do rather than guessing ids, before pulling detail with get_flow_summary.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Text to search for, case-insensitive substring match.' },
+        limit: { type: 'integer', description: 'Maximum flows to return. Default 20, max 100.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'list_devices',
     description: 'List all devices connected to Homey, with their names, zone (zoneId + resolved zoneName), capabilities, network address (when locally known), and owning app ID',
     inputSchema: { type: 'object', properties: {} },
@@ -369,6 +390,11 @@ class HomeyMcpServer {
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   }
 
+  // Pre-formatted text — JSON-encoding it would bury the layout in \n escapes
+  _raw(text) {
+    return { content: [{ type: 'text', text: String(text) }] };
+  }
+
   async _callTool(name, args) {
     const app = this._app;
 
@@ -410,6 +436,17 @@ class HomeyMcpServer {
           if (!Array.isArray(args.ids) || args.ids.length === 0) throw new Error('ids must be a non-empty array');
           const data = await app._apiGet('/manager/flow/flow');
           return this._text(args.ids.map(id => (data || {})[id] || { id, error: 'Flow not found' }));
+        }
+
+        case 'get_flow_summary': {
+          if (!args.id) throw new Error('id is required');
+          const summary = await app.getFlowSummary(args.id);
+          return typeof summary === 'string' ? this._raw(summary) : this._text(summary);
+        }
+
+        case 'search_flows': {
+          if (!args.query) throw new Error('query is required');
+          return this._text(await app.searchFlows(args.query, args.limit));
         }
 
         case 'list_devices': {

@@ -1,6 +1,6 @@
 # Homey Docs Companion — Development Plan
 
-Status: steps 1–3 complete. Built one step at a time, in order.
+Status: steps 1–4 complete. Built one step at a time, in order.
 
 ## Context
 
@@ -236,7 +236,7 @@ app-internal identifiers — Pushover's is a notification target literally named
   actually touches, not just that it touches the entity.
 - Deleted `SECTION_LABELS`, which was defined but never referenced.
 
-## Step 4 — Navigation tools
+## Step 4 — Navigation tools ✅ done
 
 Both reduce the context Claude burns resolving identifiers before it can reason.
 
@@ -251,7 +251,30 @@ device/variable names, returning flow IDs with matching card context. Currently
 Claude's only options are to guess an ID or pull `get_all_advanced_flows` wholesale.
 
 **Done when:** a named behaviour can be located and understood without fetching all
-flows.
+flows. ✅ `get_flow_summary` renders 73% smaller than `get_advanced_flow` on a
+representative flow and matches the flow editor's structure exactly.
+
+**What the summary resolves:** device/zone/variable ids to names (with zone in
+brackets), `[[...]]` tokens to readable placeholders like `{trigger.value}` and
+`{Outside temp}`, card ids to their registered titles, and flow folder ids to folder
+names. The card graph renders as an indented tree following outputTrue / outputFalse /
+outputSuccess / outputError, with each branch named once and its children nested
+beneath. Cards reachable by more than one path are rendered once and then referenced,
+which bounds the output on diamond-shaped graphs.
+
+**Canvas notes are included.** Advanced flows carry `note` cards — the author's own
+annotations, 517 of them across the reference Homey. They are the single best
+statement of intent available and are listed above the tree.
+
+**Card-type coverage:** the graph handles `trigger`, `condition` (including
+`inverted`, rendered as IF NOT), `action`, `all`, `any`, `delay`, `start` and `note`.
+Basic flows render as a flat WHEN / IF / THEN list.
+
+**Depends on two Homey endpoints that can only be verified on-device**, since a
+development run has no Homey API: `/manager/flow/flowcard{trigger,condition,action}`
+for card titles and `/manager/flow/folder` for folder names. Both are wrapped in
+try/catch and degrade to the raw card-id suffix and the folder uuid respectively, so
+a missing endpoint costs readability rather than correctness.
 
 ## Step 5 — MCP network hardening
 

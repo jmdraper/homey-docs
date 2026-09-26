@@ -42,6 +42,14 @@ module.exports = {
     return homey.app._refreshSnapshot();
   },
 
+  async flow_summary({ homey, query }) {
+    return homey.app.getFlowSummary(query.id);
+  },
+
+  async search_flows({ homey, query }) {
+    return homey.app.searchFlows(query.q || query.query, parseInt(query.limit, 10) || undefined);
+  },
+
   async app_actions({ homey }) {
     return homey.app.getAppActions();
   },

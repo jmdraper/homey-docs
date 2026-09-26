@@ -430,6 +430,228 @@ class HomeyDocsCompanion extends Homey.App {
     return result;
   }
 
+  // ─── Flow summaries and search ───────────────────────────────────────────────
+
+  // Homey registers every flow card with a human title. Resolving card ids this
+  // way turns "homey:manager:presence:user_athome" into "Someone is at home",
+  // which is the difference between a readable summary and UUID soup.
+  async _fetchFlowCardTitles() {
+    if (this._cardTitles) return this._cardTitles;
+    const titles = {};
+    for (const kind of ['flowcardtrigger', 'flowcardcondition', 'flowcardaction']) {
+      try {
+        const data = await this._apiGet('/manager/flow/' + kind);
+        for (const [id, card] of Object.entries(data || {})) {
+          const t = card && card.title;
+          const text = typeof t === 'string' ? t : (t && (t.en || Object.values(t)[0]));
+          if (text) titles[id] = text;
+        }
+      } catch (e) {
+        this.log('Could not fetch ' + kind + ':', e.message);
+      }
+    }
+    this._cardTitles = titles;
+    this.log('Flow card titles resolved:', Object.keys(titles).length);
+    return titles;
+  }
+
+  async _fetchFolderNames() {
+    if (this._folderNames) return this._folderNames;
+    const names = {};
+    try {
+      const data = await this._apiGet('/manager/flow/folder');
+      for (const [id, folder] of Object.entries(data || {})) {
+        if (folder && folder.name) names[id] = folder.name;
+      }
+    } catch (e) {
+      this.log('Could not fetch flow folders:', e.message);
+    }
+    this._folderNames = names;
+    return names;
+  }
+
+  // Replace token references with readable placeholders, e.g. {Outside temp}
+  _resolveTokens(text) {
+    return String(text)
+      .replace(/\[\[homey:manager:logic\|([a-f0-9-]{36})\]\]/g, (m, id) => {
+        const v = (this.snapshot.variables || {})[id];
+        return '{' + (v ? v.name : 'unknown variable') + '}';
+      })
+      .replace(/\[\[homey:device:([a-f0-9-]{36})\|([^\]]+)\]\]/g, (m, id, cap) => {
+        const d = (this.snapshot.devices || {})[id];
+        return '{' + (d ? d.name : 'unknown device') + '.' + cap + '}';
+      })
+      .replace(/\[\[trigger::[a-f0-9-]{36}::([\w-]+)\]\]/g, '{trigger.$1}')
+      .replace(/\[\[action::[a-f0-9-]{36}::([\w-]+)\]\]/g, '{action.$1}');
+  }
+
+  _argSummary(args) {
+    const parts = [];
+    for (const [key, value] of Object.entries(args || {})) {
+      let out;
+      if (value && typeof value === 'object') {
+        const dev = value.id && (this.snapshot.devices || {})[value.id];
+        const variable = value.id && (this.snapshot.variables || {})[value.id];
+        out = dev ? dev.name : variable ? variable.name : (value.name || value.id || JSON.stringify(value));
+      } else {
+        out = String(value);
+      }
+      out = this._resolveTokens(out).replace(/\s+/g, ' ').trim();
+      if (out.length > 70) out = out.slice(0, 67) + '...';
+      if (out) parts.push(key + '=' + out);
+    }
+    return parts.join(', ');
+  }
+
+  _cardLabel(card, titles) {
+    if (card.type === 'all')   return 'ALL of:';
+    if (card.type === 'any')   return 'ANY of:';
+    if (card.type === 'start') return 'WHEN started by another flow';
+    if (card.type === 'delay') return 'DELAY ' + this._argSummary(card.args || {});
+
+    const id = String(card.id || '');
+    const title = titles[id];
+    let subject = null;
+    let name = title;
+
+    const dev = id.match(/^homey:device:([a-f0-9-]{36}):(.+)$/);
+    const zoneCard = id.match(/^homey:zone:([a-f0-9-]{36}):(.+)$/);
+    if (dev) {
+      const meta = (this.snapshot.devices || {})[dev[1]];
+      const zone = meta && (this.snapshot.zones || {})[meta.zone];
+      subject = (meta ? meta.name : 'unknown device') + (zone ? ' [' + zone.name + ']' : '');
+      name = title || dev[2];
+    } else if (zoneCard) {
+      const zone = (this.snapshot.zones || {})[zoneCard[1]];
+      subject = zone ? zone.name : 'unknown zone';
+      name = title || zoneCard[2];
+    } else if (!title) {
+      name = id.split(':').pop() || id;
+    }
+
+    const kind = card.type === 'trigger' ? 'WHEN'
+      : card.type === 'condition' ? (card.inverted ? 'IF NOT' : 'IF')
+      : 'THEN';
+    const args = this._argSummary(card.args || {});
+    const token = card.droptoken ? 'on ' + this._resolveTokens('[[' + card.droptoken + ']]') : null;
+    return [kind, subject ? subject + ' -' : null, name, token, args ? '(' + args + ')' : null]
+      .filter(Boolean).join(' ');
+  }
+
+  _renderCardGraph(cards, titles) {
+    const referenced = new Set();
+    const OUTPUTS = [['outputTrue', 'TRUE:'], ['outputFalse', 'FALSE:'],
+                     ['outputSuccess', ''], ['outputError', 'ERROR:']];
+    for (const card of Object.values(cards)) {
+      for (const [key] of OUTPUTS) for (const id of (card[key] || [])) referenced.add(id);
+    }
+    const roots = Object.entries(cards)
+      .filter(([id, c]) => c.type !== 'note' && !referenced.has(id))
+      .sort((a, b) => (a[1].y || 0) - (b[1].y || 0) || (a[1].x || 0) - (b[1].x || 0));
+
+    const lines = [];
+    const rendered = new Set();
+    const walk = (id, depth, branch) => {
+      const card = cards[id];
+      const pad = '  '.repeat(depth);
+      if (!card) { lines.push(pad + (branch ? branch + ' ' : '') + '[missing card]'); return; }
+      const head = pad + (branch ? branch + ' ' : '');
+      if (rendered.has(id)) {
+        lines.push(head + '-> continues at "' + this._cardLabel(card, titles) + '" shown above');
+        return;
+      }
+      rendered.add(id);
+      lines.push(head + this._cardLabel(card, titles));
+      for (const [key, label] of OUTPUTS) {
+        const children = card[key] || [];
+        if (!children.length) continue;
+        if (label) {
+          // Name the branch once rather than repeating it on every child
+          lines.push('  '.repeat(depth + 1) + label);
+          for (const child of children) walk(child, depth + 2, '');
+        } else {
+          for (const child of children) walk(child, depth + 1, '');
+        }
+      }
+    };
+    for (const [id] of roots) { walk(id, 0, ''); lines.push(''); }
+    return lines;
+  }
+
+  async getFlowSummary(id) {
+    const meta = (this.snapshot.flows || {})[id];
+    if (!meta) return { error: 'Flow ' + id + ' not in snapshot' };
+    const titles = await this._fetchFlowCardTitles();
+    const folders = await this._fetchFolderNames();
+    const cards = meta.cards_snapshot || {};
+
+    const out = [];
+    out.push('Flow: ' + meta.name);
+    const facts = [meta.isAdvanced ? 'advanced' : 'basic'];
+    if (!meta.enabled) facts.push('DISABLED');
+    if (meta.broken) facts.push('BROKEN');
+    if (meta.folder) facts.push('folder: ' + (folders[meta.folder] || meta.folder));
+    out.push('(' + facts.join(', ') + ')');
+
+    if (meta.isAdvanced) {
+      const notes = Object.values(cards)
+        .filter(c => c && c.type === 'note' && c.value)
+        .sort((a, b) => (a.y || 0) - (b.y || 0));
+      if (notes.length) {
+        out.push('', "Notes written on the flow:");
+        for (const n of notes) out.push('  - ' + String(n.value).replace(/\s+/g, ' ').trim());
+      }
+      out.push('');
+      out.push(...this._renderCardGraph(cards, titles));
+    } else {
+      out.push('');
+      if (cards.trigger) out.push(this._cardLabel(cards.trigger, titles));
+      for (const c of (cards.conditions || [])) out.push('  ' + this._cardLabel(c, titles));
+      for (const c of (cards.actions || [])) out.push('  ' + this._cardLabel(c, titles));
+    }
+    return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  async searchFlows(query, limit) {
+    const q = String(query || '').trim().toLowerCase();
+    if (!q) return { error: 'query is required' };
+    const titles = await this._fetchFlowCardTitles();
+    const max = Math.min(limit || 20, 100);
+    const results = [];
+
+    for (const [flowId, meta] of Object.entries(this.snapshot.flows || {})) {
+      const matches = [];
+      if (String(meta.name || '').toLowerCase().includes(q)) matches.push('name: ' + meta.name);
+
+      const snap = meta.cards_snapshot || {};
+      const cards = [];
+      for (const value of Object.values(snap)) {
+        if (Array.isArray(value)) cards.push(...value);
+        else if (value && typeof value === 'object') cards.push(value);
+      }
+      for (const card of cards) {
+        if (!card || typeof card !== 'object') continue;
+        if (card.type === 'note') {
+          const text = String(card.value || '').replace(/\s+/g, ' ').trim();
+          if (text.toLowerCase().includes(q)) matches.push('note: ' + text.slice(0, 90));
+          continue;
+        }
+        const label = this._cardLabel(card, titles);
+        if (label.toLowerCase().includes(q)) matches.push(label.slice(0, 110));
+      }
+      if (matches.length) {
+        results.push({
+          id: flowId, name: meta.name,
+          type: meta.isAdvanced ? 'advanced' : 'basic',
+          enabled: meta.enabled, broken: meta.broken,
+          matches: Array.from(new Set(matches)).slice(0, 5)
+        });
+      }
+    }
+    results.sort((a, b) => b.matches.length - a.matches.length || a.name.localeCompare(b.name));
+    return { query, matched: results.length, returned: Math.min(results.length, max), results: results.slice(0, max) };
+  }
+
   async getAppActions() {
     const result = {};
 

@@ -110,6 +110,14 @@
       "method": "POST",
       "path": "/refresh"
     },
+    "flow_summary": {
+      "method": "GET",
+      "path": "/flow_summary"
+    },
+    "search_flows": {
+      "method": "GET",
+      "path": "/search_flows"
+    },
     "app_actions": {
       "method": "GET",
       "path": "/app_actions"
