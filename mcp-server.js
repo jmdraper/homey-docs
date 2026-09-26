@@ -82,7 +82,13 @@ const TOOLS = [
     description: 'Get a readable summary of one flow: card ids resolved to their human titles, device/variable/zone ids resolved to names, tokens rendered inline, any notes the author wrote on the canvas, and the card graph as an indented tree showing execution order. Far cheaper to read than get_advanced_flow and much less error-prone — prefer it whenever you want to understand what a flow does, and fall back to get_advanced_flow only when you need raw ids or card coordinates.',
     inputSchema: {
       type: 'object',
-      properties: { id: { type: 'string', description: 'The flow ID (basic or advanced)' } },
+      properties: {
+        id: { type: 'string', description: 'The flow ID (basic or advanced)' },
+        withCardIds: {
+          type: 'boolean',
+          description: 'Prefix each line with that card\'s id. Needed before editing, since the editing tools address cards by id; leave it off when only reading.',
+        },
+      },
       required: ['id'],
     },
   },
@@ -139,6 +145,127 @@ const TOOLS = [
     name: 'get_app_actions',
     description: 'Returns human-readable titles for all triggers, conditions, and actions exposed by each installed Homey app, keyed by their full card ID strings. Use this to translate opaque app card IDs into readable labels.',
     inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'list_flow_revisions',
+    description: 'List the saved pre-edit copies of a flow, newest first. Every edit saves one automatically. Use the revision number with revert_flow.',
+    inputSchema: {
+      type: 'object',
+      properties: { flowId: { type: 'string', description: 'The advanced flow ID' } },
+      required: ['flowId'],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'revert_flow',
+    description: 'Restore a flow to a previously saved revision. The current state is saved first, so a revert can itself be reverted.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'The advanced flow ID' },
+        revision: { type: 'integer', description: 'Revision number from list_flow_revisions. Defaults to 1, the most recent.' },
+      },
+      required: ['flowId'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  },
+  {
+    name: 'set_flow_enabled',
+    description: 'Enable or disable an advanced flow. This is the reversible way to stop a flow running — prefer it to deleting, which this server cannot do.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string' },
+        enabled: { type: 'boolean' },
+      },
+      required: ['flowId', 'enabled'],
+    },
+    annotations: { readOnlyHint: false, idempotentHint: true },
+  },
+  {
+    name: 'rename_flow',
+    description: 'Rename an advanced flow.',
+    inputSchema: {
+      type: 'object',
+      properties: { flowId: { type: 'string' }, name: { type: 'string' } },
+      required: ['flowId', 'name'],
+    },
+    annotations: { readOnlyHint: false, idempotentHint: true },
+  },
+  {
+    name: 'update_card_args',
+    description: 'Change the arguments of one card. Arguments are merged into the existing ones unless replace is true. Get card ids from get_flow_summary with withCardIds: true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string' },
+        cardId: { type: 'string', description: 'Card id, or any unambiguous prefix of one' },
+        args: { type: 'object', description: 'Argument names and values to set' },
+        replace: { type: 'boolean', description: 'Replace all arguments instead of merging. Default false.' },
+      },
+      required: ['flowId', 'cardId', 'args'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  },
+  {
+    name: 'add_card',
+    description: 'Add a card to an advanced flow. Pass `after` to place and connect it downstream of an existing card; otherwise it is placed below the flow, unconnected. Coordinates are chosen automatically so cards do not overlap.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string' },
+        card: {
+          type: 'object',
+          description: 'The card: type (trigger/condition/action/all/any/delay/note), id (the full card id such as homey:device:<uuid>:on), ownerUri, and args.',
+        },
+        after: { type: 'string', description: 'Card id to place this one after and connect from' },
+      },
+      required: ['flowId', 'card'],
+    },
+    annotations: { readOnlyHint: false },
+  },
+  {
+    name: 'remove_card',
+    description: 'Remove a card and every connection pointing at it. Requires confirm: true — ask the user before calling.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string' },
+        cardId: { type: 'string' },
+        confirm: { type: 'boolean', description: 'Must be true. Set it only after the user has agreed to the removal.' },
+      },
+      required: ['flowId', 'cardId', 'confirm'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  },
+  {
+    name: 'connect_cards',
+    description: 'Connect or disconnect two cards. The output is outputTrue/outputFalse for conditions, or outputSuccess/outputError for actions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string' },
+        fromCardId: { type: 'string' },
+        output: { type: 'string', enum: ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'] },
+        toCardId: { type: 'string' },
+        connected: { type: 'boolean', description: 'false to disconnect. Default true.' },
+      },
+      required: ['flowId', 'fromCardId', 'output', 'toCardId'],
+    },
+    annotations: { readOnlyHint: false },
+  },
+  {
+    name: 'create_advanced_flow',
+    description: 'Create an empty advanced flow. It is created disabled; add cards with add_card, then enable it with set_flow_enabled.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        folder: { type: 'string', description: 'Folder id from list_folders' },
+      },
+      required: ['name'],
+    },
+    annotations: { readOnlyHint: false },
   },
   {
     name: 'get_diagnostics',
@@ -455,7 +582,7 @@ class HomeyMcpServer {
 
         case 'get_flow_summary': {
           if (!args.id) throw new Error('id is required');
-          const summary = await app.getFlowSummary(args.id);
+          const summary = await app.getFlowSummary(args.id, { withCardIds: args.withCardIds });
           return typeof summary === 'string' ? this._raw(summary) : this._text(summary);
         }
 
@@ -520,6 +647,33 @@ class HomeyMcpServer {
 
         case 'get_app_actions':
           return this._text(await app.getAppActions());
+
+        case 'list_flow_revisions':
+          return this._text(await app.listFlowRevisions(args.flowId));
+
+        case 'revert_flow':
+          return this._text(await app.revertFlow(args.flowId, args.revision));
+
+        case 'set_flow_enabled':
+          return this._text(await app.setFlowEnabled(args.flowId, args.enabled));
+
+        case 'rename_flow':
+          return this._text(await app.renameFlow(args.flowId, args.name));
+
+        case 'update_card_args':
+          return this._text(await app.updateCardArgs(args.flowId, args.cardId, args.args, args.replace));
+
+        case 'add_card':
+          return this._text(await app.addCard(args.flowId, args.card, args.after));
+
+        case 'remove_card':
+          return this._text(await app.removeCard(args.flowId, args.cardId, args.confirm));
+
+        case 'connect_cards':
+          return this._text(await app.connectCards(args.flowId, args.fromCardId, args.output, args.toCardId, args.connected));
+
+        case 'create_advanced_flow':
+          return this._text(await app.createAdvancedFlow(args.name, args.folder));
 
         case 'get_diagnostics':
           return this._text(await app.getDiagnostics());

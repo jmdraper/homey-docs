@@ -1,12 +1,25 @@
 'use strict';
 
 const Homey = require('homey');
+const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Writable fields on an advanced flow. id, uri and triggerable are read-only,
+// and broken is derived by Homey, so sending them back invites a rejection.
+const ADVANCED_FLOW_WRITABLE = ['name', 'enabled', 'folder', 'cards'];
+
+const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
+const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
+
+// Pre-edit copies live on disk; app settings hold only the index. Ten revisions
+// of a 213-card flow is far too much to keep in settings alongside the snapshot.
+const REVISION_DIR = '/userdata/revisions';
+const DEFAULT_REVISION_DEPTH = 10;
 
 // Addresses that cannot be pointed at this Homey by an attacker's DNS: IPv4 and
 // IPv6 literals, localhost, and mDNS .local names (resolved by mDNS, not DNS).
@@ -212,27 +225,49 @@ class HomeyDocsCompanion extends Homey.App {
     });
   }
 
-  _apiGet(path) {
+  _apiRequest(method, path, body) {
     const url = `${this._baseUrl}/api${path}`;
     // getLocalUrl() returns http:// or https:// depending on how the app is
     // running — picking the wrong client throws "Protocol not supported"
     const client = url.startsWith('https:') ? https : http;
+    const payload = body === undefined ? null : JSON.stringify(body);
+    const headers = { Authorization: `Bearer ${this._token}` };
+    if (payload !== null) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = Buffer.byteLength(payload);
+    }
+
     return new Promise((resolve, reject) => {
-      const req = client.get(url, { headers: { Authorization: `Bearer ${this._token}` } }, (res) => {
-        let body = '';
-        res.on('data', chunk => { body += chunk; });
+      const req = client.request(url, { method, headers }, res => {
+        let text = '';
+        res.on('data', chunk => { text += chunk; });
         res.on('end', () => {
-          if (res.statusCode !== 200) {
-            reject(new Error(`HTTP ${res.statusCode} for ${path}`));
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            // Homey explains rejected writes in the body; a bare status code
+            // leaves no way to tell a bad card from a missing permission
+            let detail = text.slice(0, 400);
+            try {
+              const parsed = JSON.parse(text);
+              detail = parsed.error || parsed.message || detail;
+            } catch (e) { /* keep the raw text */ }
+            reject(new Error(`HTTP ${res.statusCode} for ${method} ${path}`
+              + (detail ? ` — ${detail}` : '')));
             return;
           }
-          try { resolve(JSON.parse(body)); }
+          if (!text) { resolve(null); return; }
+          try { resolve(JSON.parse(text)); }
           catch (e) { reject(new Error(`JSON parse failed for ${path}`)); }
         });
       });
       req.on('error', reject);
-      req.setTimeout(15000, () => { req.destroy(); reject(new Error(`Timeout: ${path}`)); });
+      req.setTimeout(20000, () => { req.destroy(); reject(new Error(`Timeout: ${method} ${path}`)); });
+      if (payload !== null) req.write(payload);
+      req.end();
     });
+  }
+
+  _apiGet(path) {
+    return this._apiRequest('GET', path);
   }
 
   // ─── Snapshot helpers ───────────────────────────────────────────────────────
@@ -455,6 +490,121 @@ class HomeyDocsCompanion extends Homey.App {
     return result;
   }
 
+  // ─── Flow revisions ──────────────────────────────────────────────────────────
+
+  _revisionDepth() {
+    const configured = parseInt(this.homey.settings.get('revision_depth'), 10);
+    if (!Number.isFinite(configured) || configured < 1) return DEFAULT_REVISION_DEPTH;
+    return Math.min(configured, 50);
+  }
+
+  _revisionKey(flowId) {
+    return 'revisions_' + flowId;
+  }
+
+  // Called before every write. A single pre-edit slot would be overwritten by
+  // the next edit in the same session, which is exactly when a revert is wanted.
+  async _saveRevision(flowId, flow) {
+    const dir = path.join(REVISION_DIR, flowId);
+    await fs.promises.mkdir(dir, { recursive: true });
+
+    const now = new Date().toISOString();
+    const file = now.replace(/[:.]/g, '-') + '.json';
+    await fs.promises.writeFile(path.join(dir, file), JSON.stringify(flow), 'utf8');
+
+    const key = this._revisionKey(flowId);
+    const index = this.homey.settings.get(key) || [];
+    index.unshift({ file, ts: now, name: flow.name, cards: Object.keys(flow.cards || {}).length });
+
+    for (const dropped of index.splice(this._revisionDepth())) {
+      await fs.promises.unlink(path.join(dir, dropped.file)).catch(() => {});
+    }
+    this.homey.settings.set(key, index);
+    return index[0];
+  }
+
+  async listFlowRevisions(flowId) {
+    if (!flowId) return { error: 'flowId is required' };
+    const index = this.homey.settings.get(this._revisionKey(flowId)) || [];
+    const current = (this.snapshot.flows || {})[flowId];
+    return {
+      flowId,
+      name: current ? current.name : null,
+      depth: this._revisionDepth(),
+      revisions: index.map((entry, position) => ({
+        revision: position + 1,
+        savedAt: entry.ts,
+        nameAtSave: entry.name,
+        cards: entry.cards
+      }))
+    };
+  }
+
+  async _readRevision(flowId, position) {
+    const index = this.homey.settings.get(this._revisionKey(flowId)) || [];
+    const entry = index[(position || 1) - 1];
+    if (!entry) return null;
+    const raw = await fs.promises.readFile(path.join(REVISION_DIR, flowId, entry.file), 'utf8');
+    return { entry, flow: JSON.parse(raw) };
+  }
+
+  // ─── Card graph validation ───────────────────────────────────────────────────
+
+  // Homey will accept a graph with dangling references and leave the flow
+  // subtly broken, so check before writing rather than after.
+  _validateCards(cards) {
+    if (!cards || typeof cards !== 'object' || Array.isArray(cards)) {
+      return ['cards must be an object keyed by card id'];
+    }
+    const problems = [];
+    const known = new Set(Object.keys(cards));
+
+    for (const [cardId, card] of Object.entries(cards)) {
+      if (!card || typeof card !== 'object') {
+        problems.push(`card ${cardId} is not an object`);
+        continue;
+      }
+      if (!CARD_TYPES.has(card.type)) {
+        problems.push(`card ${cardId} has unknown type "${card.type}"`);
+      }
+      if (typeof card.x !== 'number' || typeof card.y !== 'number') {
+        problems.push(`card ${cardId} is missing numeric x/y coordinates`);
+      }
+      for (const output of CARD_OUTPUTS) {
+        if (card[output] === undefined) continue;
+        if (!Array.isArray(card[output])) {
+          problems.push(`card ${cardId}.${output} must be an array of card ids`);
+          continue;
+        }
+        for (const target of card[output]) {
+          if (!known.has(target)) {
+            problems.push(`card ${cardId}.${output} points at ${target}, which is not in this flow`);
+          }
+          if (target === cardId) {
+            problems.push(`card ${cardId}.${output} points at itself`);
+          }
+        }
+      }
+    }
+
+    const runnable = Object.values(cards)
+      .some(card => card && (card.type === 'trigger' || card.type === 'start'));
+    if (!runnable) problems.push('flow has no trigger or start card, so it could never run');
+
+    return problems;
+  }
+
+  // Accepts a full card id or any unambiguous prefix, so the short ids shown by
+  // get_flow_summary can be used directly.
+  _resolveCardId(cards, given) {
+    if (!given) return { error: 'cardId is required' };
+    if (cards[given]) return { cardId: given };
+    const matches = Object.keys(cards).filter(id => id.startsWith(given));
+    if (matches.length === 1) return { cardId: matches[0] };
+    if (matches.length === 0) return { error: `no card in this flow starts with "${given}"` };
+    return { error: `"${given}" matches ${matches.length} cards; use more characters` };
+  }
+
   // ─── Request guards ──────────────────────────────────────────────────────────
 
   // Read through rather than cached. This was previously read once at startup,
@@ -522,6 +672,271 @@ class HomeyDocsCompanion extends Homey.App {
     catch (e) { return 'malformed Origin header'; }
     if (originHost !== hostHeader) return 'cross-origin request from ' + origin + ' rejected';
     return null;
+  }
+
+  // ─── Writing advanced flows ──────────────────────────────────────────────────
+
+  _writesEnabled() {
+    const value = this.homey.settings.get('writes_enabled');
+    return value === true || value === 'true';
+  }
+
+  async _installedAppIds() {
+    if (this._appIds && (Date.now() - this._appIdsAt) < 60000) return this._appIds;
+    try {
+      const apps = await this._apiGet('/manager/apps/app');
+      this._appIds = new Set(Object.keys(apps || {}));
+      this._appIdsAt = Date.now();
+    } catch (e) {
+      this._appIds = null;   // unknown, so skip the check rather than block a write
+    }
+    return this._appIds;
+  }
+
+  // Every write goes through here: gate, read the live flow, keep a copy,
+  // mutate a draft, validate, PUT, then bring our own caches back in line.
+  // Reading live rather than from the snapshot matters — the snapshot can be
+  // five minutes old, and writing from it would silently revert a change made
+  // in the flow editor in the meantime.
+  async _mutateAdvancedFlow(flowId, describe, mutate) {
+    if (!this._writesEnabled()) {
+      return { error: 'Editing is turned off. Enable "Allow AI assistants to edit flows" in the app settings first.' };
+    }
+    if (!flowId) return { error: 'flowId is required' };
+
+    let flow;
+    try {
+      flow = await this._apiGet('/manager/flow/advancedflow/' + flowId);
+    } catch (e) {
+      return { error: 'Could not read flow ' + flowId + ': ' + e.message };
+    }
+    if (!flow || !flow.cards) {
+      return { error: 'Flow ' + flowId + ' is not an advanced flow (only advanced flows can be edited)' };
+    }
+
+    const revision = await this._saveRevision(flowId, flow);
+
+    const draft = JSON.parse(JSON.stringify(flow));
+    let outcome;
+    try {
+      outcome = await mutate(draft);
+    } catch (e) {
+      return { error: 'Edit failed: ' + e.message };
+    }
+    if (outcome && outcome.error) return outcome;
+
+    const problems = this._validateCards(draft.cards);
+    if (problems.length) {
+      return { error: 'Refusing to write — the result would be a broken flow', problems };
+    }
+
+    const body = {};
+    for (const field of ADVANCED_FLOW_WRITABLE) {
+      if (draft[field] !== undefined) body[field] = draft[field];
+    }
+
+    try {
+      await this._apiRequest('PUT', '/manager/flow/advancedflow/' + flowId, body);
+    } catch (e) {
+      return { error: 'Homey rejected the write: ' + e.message };
+    }
+
+    await this._resyncFlow(flowId);
+    return Object.assign({
+      ok: true,
+      flowId,
+      flow: draft.name,
+      changed: describe,
+      revisionSaved: revision.ts,
+      revertWith: 'revert_flow'
+    }, outcome || {});
+  }
+
+  // A write leaves the snapshot and the cross-reference index describing the
+  // previous state; without this the viewer serves a stale picture until the
+  // next refresh.
+  async _resyncFlow(flowId) {
+    try {
+      const fresh = await this._apiGet('/manager/flow/advancedflow/' + flowId);
+      if (fresh) this.snapshot.flows[flowId] = this._flowMeta(fresh, true);
+      await this._saveState();
+      this._xrefCache = null;
+      await this.regenerateXrefPage();
+    } catch (e) {
+      this.error('Post-write resync failed (the write succeeded):', e.message);
+    }
+  }
+
+  async setFlowEnabled(flowId, enabled) {
+    return this._mutateAdvancedFlow(flowId, enabled ? 'enabled the flow' : 'disabled the flow',
+      draft => { draft.enabled = !!enabled; });
+  }
+
+  async renameFlow(flowId, name) {
+    if (!name || typeof name !== 'string' || !name.trim()) return { error: 'name is required' };
+    return this._mutateAdvancedFlow(flowId, 'renamed to "' + name.trim() + '"',
+      draft => { draft.name = name.trim(); });
+  }
+
+  async updateCardArgs(flowId, cardId, args, replace) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return { error: 'args must be an object' };
+    }
+    return this._mutateAdvancedFlow(flowId, 'updated card arguments', draft => {
+      const found = this._resolveCardId(draft.cards, cardId);
+      if (found.error) return found;
+      const card = draft.cards[found.cardId];
+      const before = card.args || {};
+      card.args = replace ? args : Object.assign({}, before, args);
+      return { cardId: found.cardId, argsBefore: before, argsAfter: card.args };
+    });
+  }
+
+  async removeCard(flowId, cardId, confirm) {
+    if (confirm !== true) {
+      return { error: 'Removing a card is destructive. Pass confirm: true once the user has agreed.' };
+    }
+    return this._mutateAdvancedFlow(flowId, 'removed a card', draft => {
+      const found = this._resolveCardId(draft.cards, cardId);
+      if (found.error) return found;
+      const removed = draft.cards[found.cardId];
+      delete draft.cards[found.cardId];
+
+      // Every reference to it must go too, or the graph is left dangling
+      let unlinked = 0;
+      for (const card of Object.values(draft.cards)) {
+        for (const output of CARD_OUTPUTS) {
+          if (!Array.isArray(card[output])) continue;
+          const before = card[output].length;
+          card[output] = card[output].filter(target => target !== found.cardId);
+          unlinked += before - card[output].length;
+        }
+      }
+      return {
+        removedCardId: found.cardId,
+        removedType: removed.type,
+        removedCard: removed.id || null,
+        incomingLinksRemoved: unlinked
+      };
+    });
+  }
+
+  async connectCards(flowId, fromCardId, output, toCardId, connected) {
+    if (!CARD_OUTPUTS.includes(output)) {
+      return { error: 'output must be one of ' + CARD_OUTPUTS.join(', ') };
+    }
+    const join = connected !== false;
+    return this._mutateAdvancedFlow(flowId, join ? 'connected two cards' : 'disconnected two cards', draft => {
+      const from = this._resolveCardId(draft.cards, fromCardId);
+      if (from.error) return from;
+      const to = this._resolveCardId(draft.cards, toCardId);
+      if (to.error) return to;
+
+      const card = draft.cards[from.cardId];
+      const links = Array.isArray(card[output]) ? card[output] : [];
+      if (join) {
+        if (!links.includes(to.cardId)) links.push(to.cardId);
+      } else {
+        const index = links.indexOf(to.cardId);
+        if (index === -1) return { error: 'those cards are not connected on ' + output };
+        links.splice(index, 1);
+      }
+      card[output] = links;
+      return { from: from.cardId, output, to: to.cardId, connected: join };
+    });
+  }
+
+  async addCard(flowId, card, after) {
+    if (!card || typeof card !== 'object') return { error: 'card must be an object' };
+    if (!CARD_TYPES.has(card.type)) {
+      return { error: 'card.type must be one of ' + Array.from(CARD_TYPES).join(', ') };
+    }
+
+    const ownerApp = String(card.ownerUri || '').match(/^homey:app:([^:]+)$/);
+    if (ownerApp) {
+      const installed = await this._installedAppIds();
+      if (installed && !installed.has(ownerApp[1])) {
+        return { error: 'app ' + ownerApp[1] + ' is not installed, so its cards cannot be added' };
+      }
+    }
+
+    return this._mutateAdvancedFlow(flowId, 'added a ' + card.type + ' card', draft => {
+      const newCard = Object.assign({}, card);
+      const cardId = crypto.randomUUID();
+
+      // Place it rather than let it land on top of an existing card
+      if (typeof newCard.x !== 'number' || typeof newCard.y !== 'number') {
+        const existing = Object.values(draft.cards);
+        if (after) {
+          const anchor = this._resolveCardId(draft.cards, after);
+          if (anchor.error) return anchor;
+          const source = draft.cards[anchor.cardId];
+          newCard.x = (source.x || 0) + 320;
+          newCard.y = source.y || 0;
+          while (existing.some(c => c.x === newCard.x && c.y === newCard.y)) newCard.y += 160;
+        } else {
+          newCard.x = existing.length ? Math.min.apply(null, existing.map(c => c.x || 0)) : 0;
+          newCard.y = existing.length ? Math.max.apply(null, existing.map(c => c.y || 0)) + 200 : 0;
+        }
+      }
+
+      draft.cards[cardId] = newCard;
+
+      let linked = null;
+      if (after) {
+        const anchor = this._resolveCardId(draft.cards, after);
+        if (anchor.error) return anchor;
+        const source = draft.cards[anchor.cardId];
+        const output = source.type === 'condition' ? 'outputTrue' : 'outputSuccess';
+        source[output] = (source[output] || []).concat([cardId]);
+        linked = { from: anchor.cardId, output };
+      }
+      return { addedCardId: cardId, position: { x: newCard.x, y: newCard.y }, linkedFrom: linked };
+    });
+  }
+
+  async createAdvancedFlow(name, folder) {
+    if (!this._writesEnabled()) {
+      return { error: 'Editing is turned off. Enable "Allow AI assistants to edit flows" in the app settings first.' };
+    }
+    if (!name || typeof name !== 'string' || !name.trim()) return { error: 'name is required' };
+
+    // Created disabled: a new flow has no cards, and an empty enabled flow in
+    // the user's list is noise at best
+    const body = { name: name.trim(), enabled: false, cards: {} };
+    if (folder) body.folder = folder;
+
+    let created;
+    try {
+      created = await this._apiRequest('POST', '/manager/flow/advancedflow', body);
+    } catch (e) {
+      return { error: 'Homey rejected the create: ' + e.message };
+    }
+    const flowId = created && created.id;
+    if (flowId) await this._resyncFlow(flowId);
+    return { ok: true, flowId, flow: body.name, enabled: false, note: 'Created disabled and empty — add cards, then enable it.' };
+  }
+
+  async revertFlow(flowId, revision) {
+    if (!this._writesEnabled()) {
+      return { error: 'Editing is turned off. Enable "Allow AI assistants to edit flows" in the app settings first.' };
+    }
+    let found;
+    try {
+      found = await this._readRevision(flowId, revision);
+    } catch (e) {
+      return { error: 'Could not read that revision: ' + e.message };
+    }
+    if (!found) return { error: 'No revision ' + (revision || 1) + ' stored for flow ' + flowId };
+
+    // Going through the normal write path means the current state is itself
+    // saved first, so a revert can be undone
+    return this._mutateAdvancedFlow(flowId, 'reverted to the revision saved at ' + found.entry.ts, draft => {
+      for (const field of ADVANCED_FLOW_WRITABLE) {
+        if (found.flow[field] !== undefined) draft[field] = found.flow[field];
+      }
+      return { revertedTo: found.entry.ts, nameAtSave: found.entry.name };
+    });
   }
 
   // ─── Flow summaries and search ───────────────────────────────────────────────
@@ -694,7 +1109,17 @@ class HomeyDocsCompanion extends Homey.App {
     return parts.filter(Boolean).join(' ');
   }
 
-  _renderCardGraph(cards, titles, notes) {
+  // Shortest prefix that still distinguishes every card, so the ids shown are
+  // as short as they can be while remaining unambiguous to _resolveCardId.
+  _shortIdLength(cards) {
+    const ids = Object.keys(cards);
+    for (let length = 6; length < 36; length++) {
+      if (new Set(ids.map(id => id.slice(0, length))).size === ids.length) return length;
+    }
+    return 36;
+  }
+
+  _renderCardGraph(cards, titles, notes, showIds) {
     const referenced = new Set();
     const OUTPUTS = [['outputTrue', 'TRUE:'], ['outputFalse', 'FALSE:'],
                      ['outputSuccess', ''], ['outputError', 'ERROR:']];
@@ -746,17 +1171,21 @@ class HomeyDocsCompanion extends Homey.App {
       }
     }
 
+    const idLength = showIds ? this._shortIdLength(cards) : 0;
+    // Lines that are not a card still need to sit in the same column as those
+    // that are, or the tree structure stops being legible
+    const gutter = showIds ? ' '.repeat(idLength + 2) : '';
     const lines = [];
     const rendered = new Map();
     let marker = 0;
     const walk = (id, depth, branch) => {
       const card = cards[id];
       const pad = '  '.repeat(depth);
-      if (!card) { lines.push(pad + (branch ? branch + ' ' : '') + '[missing card]'); return; }
+      if (!card) { lines.push(gutter + pad + (branch ? branch + ' ' : '') + '[missing card]'); return; }
       const head = pad + (branch ? branch + ' ' : '');
       if (rendered.has(id)) {
         const at = rendered.get(id);
-        lines.push(head + (at
+        lines.push(gutter + head + (at
           ? '-> continues at [' + at + ']'
           : '-> continues at "' + this._cardLabel(card, titles) + '" above'));
         return;
@@ -769,14 +1198,15 @@ class HomeyDocsCompanion extends Homey.App {
       } else {
         rendered.set(id, null);
       }
-      for (const note of (notesByCard.get(id) || [])) lines.push(pad + '# ' + note);
-      lines.push(head + tag + this._cardLabel(card, titles));
+      for (const note of (notesByCard.get(id) || [])) lines.push(gutter + pad + '# ' + note);
+      const idPrefix = showIds ? id.slice(0, idLength) + '  ' : '';
+      lines.push(idPrefix + head + tag + this._cardLabel(card, titles));
       for (const [key, label] of OUTPUTS) {
         const children = card[key] || [];
         if (!children.length) continue;
         if (label) {
           // Name the branch once rather than repeating it on every child
-          lines.push('  '.repeat(depth + 1) + label);
+          lines.push(gutter + '  '.repeat(depth + 1) + label);
           for (const child of children) walk(child, depth + 2, '');
         } else {
           for (const child of children) walk(child, depth + 1, '');
@@ -794,13 +1224,14 @@ class HomeyDocsCompanion extends Homey.App {
     return lines;
   }
 
-  async getFlowSummary(id) {
+  async getFlowSummary(id, options) {
     const meta = (this.snapshot.flows || {})[id];
     if (!meta) return { error: 'Flow ' + id + ' not in snapshot' };
     const titles = await this._fetchFlowCardTitles();
     const folders = await this._fetchFolderNames();
     const cards = meta.cards_snapshot || {};
 
+    const showIds = !!(options && options.withCardIds);
     const out = [];
     out.push('Flow: ' + meta.name);
     const facts = [meta.isAdvanced ? 'advanced' : 'basic'];
@@ -818,7 +1249,10 @@ class HomeyDocsCompanion extends Homey.App {
         out.push('shown above the section they sit over.');
       }
       out.push('');
-      out.push(...this._renderCardGraph(cards, titles, notes));
+      if (showIds) {
+        out.push('The value before each line is that card\'s id, for use with the editing tools.');
+      }
+      out.push(...this._renderCardGraph(cards, titles, notes, showIds));
     } else {
       out.push('');
       if (cards.trigger) out.push(this._cardLabel(cards.trigger, titles));

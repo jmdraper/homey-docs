@@ -18,6 +18,8 @@
         cursor: pointer; white-space: nowrap;
       }
       .none { font-size: 13px; opacity: 0.6; }
+      .toggle { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 15px; }
+      .toggle input { width: 18px; height: 18px; }
     </style>
   </head>
   <body>
@@ -48,6 +50,37 @@
     </fieldset>
 
     <fieldset class="homey-form-fieldset">
+      <legend class="homey-form-legend">Flow editing</legend>
+
+      <div class="homey-form-group">
+        <label class="toggle">
+          <input type="checkbox" id="writes_enabled" />
+          <span>Allow AI assistants to edit flows</span>
+        </label>
+        <p class="hint">
+          Off by default. While off, every editing tool refuses and the MCP server
+          stays read-only. Turning this on lets a connected assistant change card
+          arguments, add and remove cards, rewire connections, rename flows and
+          enable or disable them. It cannot delete flows — that stays a manual
+          action in the Homey app, because a recreated flow gets a new id and
+          anything that triggers it would break.
+        </p>
+      </div>
+
+      <div class="homey-form-group">
+        <label class="homey-form-label" for="revision_depth">Revisions kept per flow</label>
+        <input class="homey-form-input" id="revision_depth" type="number" min="1" max="50" placeholder="10" />
+        <p class="hint">
+          A copy of a flow is saved before every edit, so a change can be undone
+          with the revert tool. Editing tends to be iterative, so keeping several
+          matters — the copy you want back is usually not the most recent one.
+          Consider installing Flow Version History as well: it records changes from
+          any source, including your own edits in the Homey app.
+        </p>
+      </div>
+    </fieldset>
+
+    <fieldset class="homey-form-fieldset">
       <legend class="homey-form-legend">Links and ports</legend>
 
       <div class="homey-form-group">
@@ -74,13 +107,22 @@
       function onHomeyReady(Homey) {
         Homey.ready();
 
-        var FIELDS = ['allowed_hosts', 'xref_base_url', 'xref_port', 'mcp_port'];
+        var FIELDS = ['allowed_hosts', 'xref_base_url', 'xref_port', 'mcp_port', 'revision_depth'];
+        var TOGGLES = ['writes_enabled'];
         var el = {};
-        FIELDS.forEach(function (name) {
+        FIELDS.concat(TOGGLES).forEach(function (name) {
           el[name] = document.getElementById(name);
+        });
+        FIELDS.forEach(function (name) {
           Homey.get(name, function (err, value) {
             if (err) return;
             if (value !== null && value !== undefined) el[name].value = value;
+          });
+        });
+        TOGGLES.forEach(function (name) {
+          Homey.get(name, function (err, value) {
+            if (err) return;
+            el[name].checked = value === true || value === 'true';
           });
         });
 
@@ -128,17 +170,20 @@
         document.getElementById('save').addEventListener('click', function () {
           var button = this;
           button.disabled = true;
-          var remaining = FIELDS.length;
+          var remaining = FIELDS.length + TOGGLES.length;
           var failed = null;
+          function done(err) {
+            if (err) failed = err;
+            if (--remaining > 0) return;
+            button.disabled = false;
+            if (failed) return Homey.alert(failed);
+            Homey.alert('Saved.');
+          }
           FIELDS.forEach(function (name) {
-            Homey.set(name, el[name].value.trim(), function (err) {
-              if (err) failed = err;
-              if (--remaining === 0) {
-                button.disabled = false;
-                if (failed) return Homey.alert(failed);
-                Homey.alert('Saved.');
-              }
-            });
+            Homey.set(name, el[name].value.trim(), done);
+          });
+          TOGGLES.forEach(function (name) {
+            Homey.set(name, el[name].checked === true, done);
           });
         });
       }
