@@ -479,8 +479,8 @@ class HomeyMcpServer {
         }
 
         case 'list_folders': {
-          const data = await app._apiGet('/manager/flow/folder');
-          return this._text(vals(data).map(f => ({ id: f.id, name: f.name })));
+          const names = await app._fetchFolderNames();
+          return this._text(Object.entries(names).map(([id, name]) => ({ id, name })));
         }
 
         case 'list_variables': {

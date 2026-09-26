@@ -9,13 +9,18 @@ const path = require('path');
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 // Flow card registries — used to turn card ids into human titles
-const FLOW_CARD_PATHS = [
-  '/manager/flow/flowcardtrigger',
-  '/manager/flow/flowcardcondition',
-  '/manager/flow/flowcardaction',
-  '/manager/flow/flowcardtriggerdevice',
-  '/manager/flow/flowcardconditiondevice',
-  '/manager/flow/flowcardactiondevice',
+const FLOW_CARD_PATHS = {
+  trigger: '/manager/flow/flowcardtrigger',
+  condition: '/manager/flow/flowcardcondition',
+  action: '/manager/flow/flowcardaction',
+};
+
+// Folder listing moved at some point; probe in order, first success wins
+const FLOW_FOLDER_PATHS = [
+  '/manager/flow/flowfolder',
+  '/manager/flow/advancedflowfolder',
+  '/manager/flow/folder',
+  '/manager/flowfolder/flowfolder',
 ];
 
 // Candidate paths for advanced flows — tried in order, first success wins
@@ -446,15 +451,17 @@ class HomeyDocsCompanion extends Homey.App {
   // Homey registers every flow card with a human title. Resolving card ids this
   // way turns "homey:manager:presence:user_athome" into "Someone is at home",
   // which is the difference between a readable summary and UUID soup.
+  // Titles are kept per card type. Card ids are only unique within a type —
+  // "on" is both a condition ("Is turned on") and an action ("Turn on") — so a
+  // single flat map hands actions their condition's wording.
   async _fetchFlowCardTitles() {
     if (this._cardTitles) return this._cardTitles;
-    const titles = {};
+    const titles = { trigger: {}, condition: {}, action: {}, any: {} };
     const probe = {};
-
-    const register = (key, text) => { if (key && text && !titles[key]) titles[key] = text; };
     const titleOf = t => (typeof t === 'string' ? t : (t && (t.en || Object.values(t)[0])) || null);
+    const put = (map, key, text) => { if (key && text && !map[key]) map[key] = text; };
 
-    for (const path of FLOW_CARD_PATHS) {
+    for (const [type, path] of Object.entries(FLOW_CARD_PATHS)) {
       try {
         const data = await this._apiGet(path);
         const entries = Object.entries(data || {});
@@ -462,12 +469,10 @@ class HomeyDocsCompanion extends Homey.App {
         for (const [key, card] of entries) {
           const text = titleOf(card && card.title);
           if (!text) continue;
-          // The registry may key by bare id, by full uri:id, or carry uri/id
-          // fields separately — register every shape so lookups hit whichever
-          // form the flow's card id uses.
-          register(key, text);
-          if (card.uri && card.id) register(card.uri + ':' + card.id, text);
-          if (card.id) register(card.id, text);
+          put(titles[type], key, text);
+          if (card.uri && card.id) put(titles[type], card.uri + ':' + card.id, text);
+          if (card.id) put(titles[type], card.id, text);
+          put(titles.any, key, text);
           added++;
         }
         probe[path] = { ok: true, entries: entries.length, titled: added };
@@ -476,13 +481,15 @@ class HomeyDocsCompanion extends Homey.App {
       }
     }
 
-    // App card titles from the store manifests — a proven source that covers
-    // homey:app:* ids even if the on-device registry is unavailable.
     try {
       const apps = await this.getAppActions();
+      const group = { triggers: 'trigger', conditions: 'condition', actions: 'action' };
       for (const app of Object.values(apps || {})) {
-        for (const group of ['triggers', 'conditions', 'actions']) {
-          for (const [cardId, text] of Object.entries(app[group] || {})) register(cardId, text);
+        for (const [key, type] of Object.entries(group)) {
+          for (const [cardId, text] of Object.entries(app[key] || {})) {
+            put(titles[type], cardId, text);
+            put(titles.any, cardId, text);
+          }
         }
       }
       probe.appManifests = { ok: true, apps: Object.keys(apps || {}).length };
@@ -492,20 +499,43 @@ class HomeyDocsCompanion extends Homey.App {
 
     this._cardTitleProbe = probe;
     this._cardTitles = titles;
-    this.log('Flow card titles resolved:', Object.keys(titles).length, JSON.stringify(probe));
+    this.log('Flow card titles resolved:', Object.keys(titles.any).length);
     return titles;
+  }
+
+  // Homey titles carry inversion markup, e.g. "Is turned !{{on|off}}" and
+  // "A user !{{is|is not}} at home" — the second option applies to an
+  // inverted card.
+  _renderTitleTemplate(text, inverted) {
+    return String(text)
+      .replace(/!\{\{([^|}]*)\|([^}]*)\}\}/g, (m, plain, negated) => (inverted ? negated : plain))
+      .replace(/\{\{([^|}]*)\|([^}]*)\}\}/g, (m, a, b) => (inverted ? b : a))
+      .trim();
+  }
+
+  _lookupCardTitle(card, titles) {
+    const id = String(card.id || '');
+    const byType = titles[card.type] || {};
+    const bare = id.split(':').pop();
+    const found = byType[id] || byType[bare] || titles.any[id];
+    return found ? this._renderTitleTemplate(found, card.inverted) : null;
   }
 
   async _fetchFolderNames() {
     if (this._folderNames) return this._folderNames;
     const names = {};
-    try {
-      const data = await this._apiGet('/manager/flow/folder');
-      for (const [id, folder] of Object.entries(data || {})) {
-        if (folder && folder.name) names[id] = folder.name;
+    this._folderProbe = {};
+    for (const path of FLOW_FOLDER_PATHS) {
+      try {
+        const data = await this._apiGet(path);
+        for (const [id, folder] of Object.entries(data || {})) {
+          if (folder && folder.name) names[id] = folder.name;
+        }
+        this._folderProbe[path] = { ok: true, folders: Object.keys(data || {}).length };
+        if (Object.keys(names).length) break;
+      } catch (e) {
+        this._folderProbe[path] = { ok: false, error: e.message };
       }
-    } catch (e) {
-      this.log('Could not fetch flow folders:', e.message);
     }
     this._folderNames = names;
     return names;
@@ -551,7 +581,7 @@ class HomeyDocsCompanion extends Homey.App {
     if (card.type === 'delay') return 'DELAY ' + this._argSummary(card.args || {});
 
     const id = String(card.id || '');
-    const title = titles[id];
+    const title = this._lookupCardTitle(card, titles);
     let subject = null;
     let name = title;
 
@@ -579,7 +609,7 @@ class HomeyDocsCompanion extends Homey.App {
       .filter(Boolean).join(' ');
   }
 
-  _renderCardGraph(cards, titles) {
+  _renderCardGraph(cards, titles, notes) {
     const referenced = new Set();
     const OUTPUTS = [['outputTrue', 'TRUE:'], ['outputFalse', 'FALSE:'],
                      ['outputSuccess', ''], ['outputError', 'ERROR:']];
@@ -589,6 +619,19 @@ class HomeyDocsCompanion extends Homey.App {
     const roots = Object.entries(cards)
       .filter(([id, c]) => c.type !== 'note' && !referenced.has(id))
       .sort((a, b) => (a[1].y || 0) - (b[1].y || 0) || (a[1].x || 0) - (b[1].x || 0));
+
+    // Notes sit above the section they describe, with sections stacked down the
+    // canvas, so attach each note to the first tree at or below it. This keeps
+    // the author's narrative order instead of dumping every note at the top.
+    const notesByRoot = new Map();
+    const trailing = [];
+    for (const note of (notes || [])) {
+      const target = roots.find(([, c]) => (c.y || 0) >= (note.y || 0) - 1);
+      const text = String(note.value).replace(/\s+/g, ' ').trim();
+      if (!target) { trailing.push(text); continue; }
+      if (!notesByRoot.has(target[0])) notesByRoot.set(target[0], []);
+      notesByRoot.get(target[0]).push(text);
+    }
 
     // Cards reached from more than one place get a stable marker, so a
     // cross-reference points at one specific card rather than at a label that
@@ -636,7 +679,12 @@ class HomeyDocsCompanion extends Homey.App {
         }
       }
     };
-    for (const [id] of roots) { walk(id, 0, ''); lines.push(''); }
+    for (const [id] of roots) {
+      for (const note of (notesByRoot.get(id) || [])) lines.push('# ' + note);
+      walk(id, 0, '');
+      lines.push('');
+    }
+    for (const note of trailing) lines.push('# ' + note);
     return lines;
   }
 
@@ -660,11 +708,11 @@ class HomeyDocsCompanion extends Homey.App {
         .filter(c => c && c.type === 'note' && c.value)
         .sort((a, b) => (a.y || 0) - (b.y || 0));
       if (notes.length) {
-        out.push('', "Notes written on the flow:");
-        for (const n of notes) out.push('  - ' + String(n.value).replace(/\s+/g, ' ').trim());
+        out.push('', 'Lines beginning # are notes the author wrote on the canvas,');
+        out.push('shown above the section they sit over.');
       }
       out.push('');
-      out.push(...this._renderCardGraph(cards, titles));
+      out.push(...this._renderCardGraph(cards, titles, notes));
     } else {
       out.push('');
       if (cards.trigger) out.push(this._cardLabel(cards.trigger, titles));
@@ -1525,10 +1573,13 @@ function copyPrompt(){
     result.advancedFlowPath = this._advancedFlowPath;
     await this._fetchFlowCardTitles();
     result.cardTitles = {
-      count: Object.keys(this._cardTitles || {}).length,
+      count: Object.keys((this._cardTitles || {}).any || {}).length,
       probe: this._cardTitleProbe || null
     };
-    result.folderNames = Object.keys(await this._fetchFolderNames()).length;
+    result.folderNames = {
+      count: Object.keys(await this._fetchFolderNames()).length,
+      probe: this._folderProbe || null
+    };
     result.appDir = __dirname;
 
     try {
