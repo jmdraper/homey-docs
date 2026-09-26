@@ -13,12 +13,20 @@ const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 // and broken is derived by Homey, so sending them back invites a rejection.
 const ADVANCED_FLOW_WRITABLE = ['name', 'enabled', 'folder', 'cards'];
 
-// Spacing measured from the flows already on this Homey: a child sits ~440px
-// right of its parent at the same height, and siblings stack ~80px apart.
-// Matching the house style means generated cards do not look foreign.
+// Spacing measured from the flows already on this Homey.
+//
+// Cards have a fixed width: the parent-to-child gap is 440px whatever the
+// parent's arguments contain. Height is not fixed and is not knowable — Homey
+// stores width/height only for note cards and computes every other card's size
+// at render time — so the gap below a card has to be estimated from how much
+// text it will show. Measured medians: 100px below a card with short
+// arguments, 120 around 250 characters, 240 around 350. The estimate below is
+// deliberately generous, because too much space is cosmetic while an overlap
+// is not.
 const CARD_GAP_X = 440;
-const CARD_GAP_Y = 80;
-const CARD_ROW_GAP_Y = 240;
+const CARD_GAP_Y = 100;
+const CARD_GAP_Y_MAX = 360;
+const CARD_ROW_GAP_Y = 260;
 
 const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
 const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
@@ -891,6 +899,16 @@ class HomeyDocsCompanion extends Homey.App {
     });
   }
 
+  // How far below a card the next sibling should sit, given how tall it will
+  // render. Argument length is the only signal available before rendering.
+  _siblingGapBelow(card) {
+    let text = '';
+    try { text = JSON.stringify(card.args || {}); } catch (e) { text = ''; }
+    if (text.length <= 200) return CARD_GAP_Y;
+    const extra = Math.ceil((text.length - 200) / 100) * 60;
+    return Math.min(CARD_GAP_Y + extra, CARD_GAP_Y_MAX);
+  }
+
   async addCard(flowId, card, after) {
     if (!card || typeof card !== 'object') return { error: 'card must be an object' };
     if (!CARD_TYPES.has(card.type)) {
@@ -927,9 +945,13 @@ class HomeyDocsCompanion extends Homey.App {
             .map(id => draft.cards[id])
             .filter(Boolean);
           newCard.x = (source.x || 0) + CARD_GAP_X;
-          newCard.y = siblings.length
-            ? Math.max.apply(null, siblings.map(c => c.y || 0)) + CARD_GAP_Y
-            : (source.y || 0);
+          if (siblings.length) {
+            // Stack below the lowest existing child, clearing however tall it is
+            const lowest = siblings.reduce((a, b) => ((a.y || 0) > (b.y || 0) ? a : b));
+            newCard.y = (lowest.y || 0) + this._siblingGapBelow(lowest);
+          } else {
+            newCard.y = source.y || 0;
+          }
         } else {
           // Unattached: start a new row below everything already placed
           newCard.x = existing.length ? Math.min.apply(null, existing.map(c => c.x || 0)) : 0;
@@ -938,8 +960,14 @@ class HomeyDocsCompanion extends Homey.App {
             : 0;
         }
         // Never land on top of something already there
-        while (existing.some(c => c.x === newCard.x && c.y === newCard.y)) {
-          newCard.y += CARD_GAP_Y;
+        // Never land on top of something already there. Compare against the
+        // occupant's own height, since a short card may sit above a tall one.
+        let guard = 0;
+        while (guard++ < 200) {
+          const clash = existing.find(c => c.x === newCard.x
+            && Math.abs((c.y || 0) - newCard.y) < this._siblingGapBelow(c));
+          if (!clash) break;
+          newCard.y = (clash.y || 0) + this._siblingGapBelow(clash);
         }
       }
 
