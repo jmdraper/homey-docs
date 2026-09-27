@@ -622,6 +622,77 @@ Against the finished tool set. It must teach:
   `ANY` it describes.
 - `list_folders` works. ✅ already true.
 
+## Step 8 — Bulk editing, safe retries, and load diagnosis
+
+A diagnosis session on 27 Sep 2026 — find out why Homey kept disabling *Dehumidifier
+drying*, then split its Button+ display section into its own flow — exercised the read
+path well and the write path badly. Six "Every 1 minute" triggers on one canvas were
+found in a handful of calls. Rebuilding the ~70-card display section through the MCP
+took ~60 sequential `add_card` / `connect_cards` calls, hit the per-turn tool-call
+limit, and then hung twice for four minutes on resuming. The split was done by hand in
+the Homey editor in minutes instead.
+
+### Step 8.0 — What actually happened
+
+The app keeps no log of its own that survives the event, so this was settled by
+reproducing the workload rather than by reading the record. Worth stating first,
+because it is the reason the rest of this section exists:
+
+**There is no retrievable log.** Simple Log holds only messages flows emit — 2,765
+entries over the relevant day, none from any app's console. Homey exposes no
+queryable console log for an installed app: `devkit get-state` is null once the dev
+session ends, and `POST /app/:id/crashlog` submits a report rather than reading one.
+Nothing in the MCP server records that a tool call started, so there was no evidence
+either way.
+
+Four of the five suspected causes are wrong, each disproved by measurement against the
+live Homey:
+
+- **Not O(flow size) per call.** Rebuilding the workload — a fresh flow grown to 70
+  cards, one `add_card` per call — took 72.5s over 70 calls, mean 1.04s, and did not
+  degrade: first ten 1054ms, last ten 1073ms, worst 3.1s. A no-op write on the largest
+  flow here (SolarEdge controller, 213 cards) costs the same ~0.6s as one on a 12-card
+  flow. The whole payload is small — the biggest flow on this Homey is 62KB.
+- **Not rate limiting.** 25 back-to-back PUTs to one advanced flow: 378–1583ms, no 429,
+  no degradation.
+- **Not memory.** 125MB RSS / 75MB PSS, in line with every other app installed here
+  (Flow Checker 119MB, Button+ 117MB). One crash in the app's lifetime.
+- **Not an unbounded revision store.** `_saveRevision` already caps at `revision_depth`.
+  The fault is the opposite one, below.
+
+So nothing server-side takes longer than about a second under the exact workload that
+hung for four minutes. The hang was the transport, and two things in `mcp-server.js`
+leave it unguarded:
+
+- **The SSE stream has no keepalive.** `GET /sse` writes one `endpoint` event and then
+  nothing until a tool response. An idle TCP connection dies silently at a router; the
+  server then writes the response into a dead socket, which neither errors nor arrives,
+  and nothing times out at either end. The hang followed a pause — the per-turn limit —
+  which is exactly when an idle connection dies, and restarting Claude Desktop, which
+  was what cleared it, is exactly the fix for a dead stream.
+- **Session state is in-memory only.** `_streamableSessions` and `_sessions` are lost on
+  any app restart, after which every non-initialize request gets a bare 404 "Session not
+  found".
+
+Two further defects found by reading, both of which make a long build worse:
+
+- **Writes are not serialised per flow.** Two overlapping calls both GET the same state
+  and both PUT; the second silently discards the first. During a fast build that loses
+  cards with no error anywhere.
+- **The revision cap destroys the history a build most needs.** The 70-card
+  reconstruction produced 70 revisions; the cap of 20 discarded everything before card
+  51. A build both floods the stack and erases the state worth returning to.
+
+### Step 8.1 — Findings that change the brief
+
+- **There is no cheap change signal from Homey.** `list_flows_metadata` does not return
+  a hash — `hash` came out in step 1 — and an advanced flow carries only
+  `id, name, folder, triggerable, enabled, broken, cards`. No `updatedAt`, no revision
+  counter. Freshness detection has to hash the payload we already fetch.
+- **The Dehumidifier drying revision index is empty**, so the pre-split state named as
+  the acceptance criterion for the trigger-load analysis is not there to run against.
+
+
 ## Follow-ups
 
 Spotted while working; none blocking, all deferred deliberately.
