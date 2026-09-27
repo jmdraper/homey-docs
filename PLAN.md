@@ -626,10 +626,13 @@ Against the finished tool set. It must teach:
 
 Spotted while working; none blocking, all deferred deliberately.
 
-- **`snapshot.apps` is a dead path.** `_appMeta` is never called, and `getApps()` and
-  the `/apps` endpoint have always returned `{}` — neither the old `_buildSnapshot`
-  nor `_poll` ever populated it. Either wire it up or delete all three. Pre-dates this
-  work.
+- ~~**`snapshot.apps` is a dead path.**~~ **Resolved.** All four pieces removed —
+  `snapshot.apps`, `_appMeta`, `getApps()` and the `/apps` endpoint. Filling it in
+  would have been the wrong repair: the snapshot is five minutes old at worst, and an
+  app that crashed two minutes ago has already broken every flow using its cards. The
+  information now arrives as `list_apps`, read live from `/manager/apps/app`, which is
+  worth having — a crashed or disabled app is invisible in `get_flow_summary`, because
+  its cards still read correctly.
 - ~~Step 5 must also cover the xref server on port 8734.~~ **Done** — both servers are
   guarded, with same-origin POSTs permitted on the viewer and no Origin accepted at
   all on MCP.
