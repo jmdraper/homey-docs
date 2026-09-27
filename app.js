@@ -313,7 +313,8 @@ class HomeyDocsCompanion extends Homey.App {
 
   async onInit() {
     this._startedAt = new Date().toISOString();
-    this.log('Homey Docs Companion ' + this.appVersion() + ' initialising...');
+    this.log('Homey Docs Companion ' + this.appVersion()
+      + ' (build ' + this._buildId() + ') initialising...');
 
     this.snapshot = this.homey.settings.get('snapshot') || {
       flows: {}, variables: {}, devices: {}, zones: {},
@@ -1063,6 +1064,24 @@ class HomeyDocsCompanion extends Homey.App {
 
   appVersion() {
     return (this.homey && this.homey.manifest && this.homey.manifest.version) || 'unknown';
+  }
+
+  // The version alone does not identify a build. Development installs go on
+  // repeatedly at the same version, so "1.0.8" is true of the build running and
+  // of the one from three edits ago, and the whole point of reporting it is to
+  // tell a stale build from a current one. A digest of the code answers that.
+  _buildId() {
+    if (this._buildIdCache) return this._buildIdCache;
+    try {
+      const hash = crypto.createHash('sha1');
+      for (const file of ['app.js', 'mcp-server.js', 'api.js', 'app.json']) {
+        hash.update(fs.readFileSync(path.join(__dirname, file)));
+      }
+      this._buildIdCache = hash.digest('hex').slice(0, 12);
+    } catch (e) {
+      this._buildIdCache = 'unknown';
+    }
+    return this._buildIdCache;
   }
 
   // ─── Request guards ──────────────────────────────────────────────────────────
@@ -4944,6 +4963,7 @@ function copyPrompt(){
     // were missing, and only a restart fixed it. Comparing the tools listed
     // here against the ones the client is offering identifies that at once.
     result.appVersion = this.appVersion();
+    result.buildId = this._buildId();
     result.startedAt = this._startedAt || null;
     result.mcpPort = this._mcpPort || null;
     result.tools = this._mcpServer ? this._mcpServer.toolNames() : 'MCP server not running';

@@ -799,7 +799,14 @@ class HomeyMcpServer {
             result: {
               protocolVersion: params.protocolVersion || '2024-11-05',
               capabilities: { tools: {} },
-              serverInfo: { name: 'homey-mcp', version: this._app.appVersion() }
+              serverInfo: {
+                name: 'homey-mcp',
+                version: this._app.appVersion(),
+                // A development install goes on repeatedly at the same version,
+                // so the version alone cannot tell a client which build it is
+                // talking to
+                build: this._app._buildId(),
+              }
             }
           };
 
