@@ -545,7 +545,14 @@ const TOOLS = [
 // client waits for ever. Nothing in the protocol detects it and nothing here
 // timed out. A comment line every 20s keeps the path warm and surfaces the
 // failure as a write error on this side, which is what closes the session.
-const SSE_KEEPALIVE_MS = 20000;
+const SSE_KEEPALIVE_MS = 15000;
+
+// Idle sockets are also told to prove themselves at the TCP layer. The SSE
+// comment frame is the layer that matters — it is what a proxy or a router sees
+// as traffic — but TCP keepalive catches the case where the peer has gone
+// without closing and nothing is being written, which is how a session can be
+// dead for a whole call before anyone notices.
+const TCP_KEEPALIVE_MS = 30000;
 
 // Keep the last few calls so get_diagnostics can show what the server was
 // doing. There was no record of a tool call at all, which is why the 27 Sep
@@ -561,6 +568,25 @@ class HomeyMcpServer {
     this._startedAt = new Date().toISOString();
     this._calls = [];
     this._callsStarted = 0;
+    this._responsesLost = [];   // tool responses that had nowhere to go
+  }
+
+  // Every successful write to a stream, keepalive or response, is recorded. The
+  // gap since the last one is what says whether a session is really still there.
+  _wrote(session) {
+    session.lastWriteAt = new Date().toISOString();
+    session.lastWriteMs = Date.now();
+  }
+
+  // A response that could not be delivered is the failure this whole change is
+  // about, and it used to happen in silence: the handler took a reference to the
+  // stream, awaited the tool call, and wrote into whatever was left. Losing an
+  // answer should be at least as visible as returning one.
+  _responseLost(reason, detail) {
+    const entry = Object.assign({ at: new Date().toISOString(), reason }, detail);
+    this._responsesLost.unshift(entry);
+    if (this._responsesLost.length > 20) this._responsesLost.pop();
+    this._app.error('MCP response lost —', reason + ':', JSON.stringify(detail));
   }
 
   start(port) {
@@ -574,6 +600,15 @@ class HomeyMcpServer {
           }
         });
       });
+      // A second layer, below the SSE comment frames. Those are what stop a
+      // router or proxy timing the connection out; this catches a peer that has
+      // gone without closing, which the application layer cannot see on its
+      // own. Set on every connection, so the streamable transport gets it too.
+      this._server.on('connection', socket => {
+        socket.setKeepAlive(true, TCP_KEEPALIVE_MS);
+        socket.setNoDelay(true);
+      });
+
       this._server.listen(port, '0.0.0.0', () => {
         this._app.log(`MCP server running on port ${port}`);
         resolve();
@@ -592,6 +627,22 @@ class HomeyMcpServer {
       if (this._server) this._server.close(resolve);
       else resolve();
     });
+  }
+
+  // One way in to every stream write, so success is recorded and failure is
+  // never swallowed. Returns false when the stream would not take it.
+  _writeTo(session, payload, what) {
+    if (!session || !session.res || session.res.writableEnded || session.res.destroyed) {
+      return false;
+    }
+    try {
+      session.res.write(payload);
+      this._wrote(session);
+      return true;
+    } catch (e) {
+      this._app.log('SSE ' + what + ' write to', session.id, 'failed:', e.message);
+      return false;
+    }
   }
 
   _endSse(session) {
@@ -634,6 +685,7 @@ class HomeyMcpServer {
         return;
       }
 
+      const receivedMs = Date.now();
       const incomingSessionId = req.headers['mcp-session-id'];
       const messages = Array.isArray(body) ? body : [body];
       const isInitialize = messages.some(m => m.method === 'initialize');
@@ -662,6 +714,23 @@ class HomeyMcpServer {
 
       const headers = { 'Content-Type': 'application/json' };
       if (newSessionId) headers['Mcp-Session-Id'] = newSessionId;
+
+      // This is the transport mcp-remote actually negotiates — it reports
+      // "http-first" and connects with StreamableHTTPClientTransport — so a
+      // response lost here is a response lost to the real client. The answer
+      // travels back on the request's own socket, which is the transport's main
+      // advantage: there is no separate stream to go stale. But a client that
+      // gave up during a slow call leaves a destroyed socket, and writing into
+      // it succeeds silently, so the loss is recorded rather than swallowed.
+      if (res.writableEnded || res.destroyed || !res.socket || res.socket.destroyed) {
+        this._responseLost('the client disconnected before the answer was ready', {
+          tool: messages.map(m => (m.params && m.params.name) || m.method || 'unknown').join(', '),
+          sessionId: incomingSessionId || newSessionId || null,
+          afterMs: Date.now() - receivedMs,
+          transport: 'streamable-http',
+        });
+        return;
+      }
 
       if (responses.length === 0) {
         res.writeHead(202, headers);
@@ -701,15 +770,17 @@ class HomeyMcpServer {
         'Connection': 'keep-alive',
       });
 
-      const session = { res, keepalive: null, openedAt: new Date().toISOString() };
+      const session = {
+        id: sessionId, res, keepalive: null,
+        openedAt: new Date().toISOString(),
+        lastWriteAt: null, lastWriteMs: 0,
+      };
       session.keepalive = this._app.homey.setInterval(() => {
         // A comment line: valid SSE, ignored by every client, and the write
         // fails once the socket is actually dead — which is the only way this
         // side ever finds out.
-        try {
-          res.write(': keepalive\n\n');
-        } catch (e) {
-          this._app.log('SSE session', sessionId, 'is dead, closing:', e.message);
+        if (!this._writeTo(session, ': keepalive\n\n', 'keepalive')) {
+          this._app.log('SSE session', sessionId, 'is dead, closing');
           this._endSse(session);
           this._sessions.delete(sessionId);
         }
@@ -729,7 +800,7 @@ class HomeyMcpServer {
 
       // Send absolute URL — the MCP spec requires this, relative paths confuse some clients
       const host = req.headers.host || `localhost:${this._server.address().port}`;
-      res.write(`event: endpoint\ndata: http://${host}/message?sessionId=${sessionId}\n\n`);
+      this._writeTo(session, `event: endpoint\ndata: http://${host}/message?sessionId=${sessionId}\n\n`, 'endpoint');
       return;
     }
 
@@ -743,8 +814,6 @@ class HomeyMcpServer {
         res.end(JSON.stringify(this._sessionGone(sessionId)));
         return;
       }
-      const sseStream = session.res;
-
       let body;
       try {
         body = await this._readBody(req);
@@ -760,9 +829,28 @@ class HomeyMcpServer {
 
       const messages = Array.isArray(body) ? body : [body];
       for (const msg of messages) {
+        const startedMs = Date.now();
         const response = await this._handleRpc(msg);
-        if (response !== null) {
-          sseStream.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+        if (response === null) continue;
+
+        // Re-look-up rather than reusing the reference taken before the await.
+        // A tool call can take seconds, and the session can die inside that
+        // window — which is exactly the four-minute case this change is about.
+        // Writing into the captured stream would succeed silently into nothing.
+        const live = this._sessions.get(sessionId);
+        const describe = {
+          tool: (msg.params && msg.params.name) || msg.method || 'unknown',
+          sessionId,
+          afterMs: Date.now() - startedMs,
+        };
+        if (!live) {
+          this._responseLost('the session closed while the call was running', describe);
+          continue;
+        }
+        if (!this._writeTo(live, `event: message\ndata: ${JSON.stringify(response)}\n\n`, 'response')) {
+          this._responseLost('the stream would not accept the response', describe);
+          this._endSse(live);
+          this._sessions.delete(sessionId);
         }
       }
       return;
@@ -1130,12 +1218,30 @@ class HomeyMcpServer {
   // What the server has been asked to do lately, newest first. Reported by
   // get_diagnostics.
   recentCalls() {
+    const now = Date.now();
     return {
       startedAt: this._startedAt,
       totalCalls: this._callsStarted,
       inFlight: this._inFlight ? Array.from(this._inFlight) : [],
       sseSessions: this._sessions.size,
       streamableSessions: this._streamableSessions.size,
+      keepaliveSeconds: Math.round(SSE_KEEPALIVE_MS / 1000),
+      // Time since anything last reached each stream. A figure much larger than
+      // the keepalive interval means the keepalive is not getting through, which
+      // is the state that used to end in a four-minute wait.
+      openSessions: Array.from(this._sessions.values()).map(session => ({
+        sessionId: session.id,
+        openedAt: session.openedAt,
+        lastWriteAt: session.lastWriteAt,
+        secondsSinceLastWrite: session.lastWriteMs
+          ? Math.round((now - session.lastWriteMs) / 1000)
+          : null,
+        healthy: session.lastWriteMs
+          ? (now - session.lastWriteMs) < (SSE_KEEPALIVE_MS * 2)
+          : true,
+      })),
+      responsesLost: this._responsesLost.length,
+      responsesLostDetail: this._responsesLost.length ? this._responsesLost : undefined,
       recent: this._calls,
     };
   }
