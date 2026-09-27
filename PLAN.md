@@ -647,6 +647,13 @@ Spotted while working; none blocking, all deferred deliberately.
   user's own hand-drawn flows, which look fine in the editor. `_layoutCards` only
   ever uses it to compare two arrangements of the *same* flow, where the same
   estimate applies to both. Do not report the number to anyone.
+- **Measure layout changes against all 101 flows, not one.** Two changes in this
+  round looked like clear wins on the flow being worked on and were losses across
+  the estate, and one — putting gates in their own lane — looked like a 40% increase
+  in overlapping cards purely because the check measured every card as 400px wide
+  when a gate is nearer 120. The numbers that matter: notes attached, notes landing
+  on a different card after a relayout, overlapping cards, connector travel, flows
+  that move on a second relayout.
 - **Long notes are expensive.** A note's height is estimated from its text, and the
   layout holds that much room beside the card it annotates, so three explanatory
   sentences stacked in one column add several hundred pixels and every connector
@@ -655,11 +662,15 @@ Spotted while working; none blocking, all deferred deliberately.
   stripped. The user's own version of the same flow uses seven notes of the minimum
   80px, spread over two columns, and lands at 3920. Keep notes short, and prefer a
   short note on a sparse column to a long one in the deepest column.
-- **The arrangement search is capped at 32.** Thirteen flows drift rather than
+- **A note anchored to a gate can stick out over the next column.** Notes render
+  card-width (~400) but sit at their anchor's x, and a gate's lane is only 180-200
+  from the next column of cards, so a note on a gate can overlap it. `_overlapCount`
+  sees this and the arrangement search avoids it where it can, but nothing places
+  the note anywhere else. Showed up as a near-miss on the Ensuite humidity rebuild.
+- **The arrangement search is capped at 48.** Thirteen flows drift rather than
   settle and would otherwise burn the whole budget — at 400 the largest flow took
-  2.2s, which is too slow for a device-side call. At 32 the slowest is 137ms and
-  nothing moves on a second relayout. The cap is a bound on quality, not on
-  correctness; raising it did not improve any measured score.
+  2.2s, which is too slow for a device-side call. At 48 the slowest is 244ms and
+  nothing moves on a second relayout, on any of the 101 flows.
 
 ### Deferred from step 3
 
