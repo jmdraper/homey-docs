@@ -638,12 +638,16 @@ The app keeps no log of its own that survives the event, so this was settled by
 reproducing the workload rather than by reading the record. Worth stating first,
 because it is the reason the rest of this section exists:
 
-**There is no retrievable log.** Simple Log holds only messages flows emit — 2,765
-entries over the relevant day, none from any app's console. Homey exposes no
-queryable console log for an installed app: `devkit get-state` is null once the dev
+**There is no retrievable log on the Homey side.** Simple Log holds only messages flows
+emit — 2,765 entries over the relevant day, none from any app's console. Homey exposes
+no queryable console log for an installed app: `devkit get-state` is null once the dev
 session ends, and `POST /app/:id/crashlog` submits a report rather than reading one.
-Nothing in the MCP server records that a tool call started, so there was no evidence
+Nothing in the MCP server recorded that a tool call started, so there was no evidence
 either way.
+
+**There is one on the client side, and it holds the answer** — see step 8.6.
+`~/Library/Logs/Claude/mcp-server-homey.log` covered both incidents in full. Looking
+there first would have saved two wrong diagnoses.
 
 Four of the five suspected causes are wrong, each disproved by measurement against the
 live Homey:
@@ -851,6 +855,62 @@ an answer that never arrives. Sessions would still be in-memory and still lost o
 restart, but that produces a clean 404 rather than a wait. The remaining work would be
 retiring `GET /sse` and `POST /message` and the session map behind them — perhaps 80
 lines — after checking no other client uses them. Not done here, deliberately.
+
+### Step 8.6 — The answer, from the client's logs
+
+Two wrong diagnoses were reached before anyone looked at Claude Desktop's own MCP log.
+It is at `~/Library/Logs/Claude/mcp-server-homey.log`, timestamps in UTC, and it covered
+both incidents of 27 Sep 2026 completely. **Look there first.**
+
+**The four minutes is Claude Desktop's request timeout.** Each hung call is followed by
+`notifications/cancelled` at an interval that is the same to the millisecond:
+
+| call | sent | cancelled after |
+|---|---|---|
+| id=8 | 10:46:23.575Z | 240.003s |
+| id=9 | 10:50:26.410Z | 240.022s |
+| id=85 | 11:34:48.272Z | 240.005s |
+| id=86 | 11:41:59.833Z | 239.997s |
+
+A dead connection does not produce 240.003s four times. The app was not working for four
+minutes; the client was waiting out a fixed timeout.
+
+**What mcp-remote was actually hitting, and did not report.** Two errors, neither
+surfaced to Claude Desktop as a JSON-RPC response:
+
+- `connect ECONNREFUSED 192.168.1.100:8735` at 11:34:48 — nothing was listening. The
+  Companion was down or mid-restart.
+- `{"error":"Session not found"}`, code 404, at 10:46, 10:50 and again once the app came
+  back — this server refusing a session id created before a restart.
+
+mcp-remote logs both to its own stderr and returns nothing to the client, which is why
+the symptom was silence rather than an error.
+
+**The stale tool set was the same fault.** One long-lived mcp-remote process
+(pid-tagged `[11027]`, later `[61104]`) went on advertising the tool list it had cached
+at its last successful `initialize` — from a build old enough to still carry
+`get_changelog` and `list_folders` — while posting into a session the app no longer knew.
+There is no duplicate or stale Companion entry: `claude_desktop_config.json` holds
+exactly one, on the right URL, unmodified since the day before. Restarting Claude Desktop
+forced a fresh `initialize`, which is the whole of why that fixed it.
+
+**The fix: adopt an unknown session id rather than refuse it.** The spec permits the 404
+so a client can re-initialise; mcp-remote does not re-initialise. Refusing buys nothing
+here — a session holds no state, `_streamableSessions` is only a record of ids seen — and
+it cost four minutes on every restart of an app that gets restarted constantly during
+development. The set is capped at 200, oldest evicted first, so invented ids cannot grow
+it without end.
+
+Verified by reproducing the failure: establish a session, restart the app underneath it,
+call again with the same id. HTTP 200 in 47ms, against a 404 and a 240s wait before.
+
+**What this says about the earlier conclusions.** Step 8.0 blamed the missing SSE
+keepalive; step 8.5 corrected that to "mechanism not established". Both were reached
+without the one log that had the answer. The keepalive and the loss-visibility work are
+still right — they fixed real defects, and a 31-minute idle session now takes 123
+keepalive frames and answers in 116ms — but neither was the cause. The lesson worth
+keeping is procedural: when a client hangs, the client's log is evidence, and it is not
+on the device.
 
 ## Follow-ups
 

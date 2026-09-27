@@ -44,17 +44,47 @@ reports `transport strategy: http-first` and connects with
 (`streamableSessions` increments, `sseSessions` does not). The SSE endpoint is served
 for compatibility and is not in use here.
 
-**So the precise mechanism of the four-minute hangs is not established**, and cannot now
-be, because nothing recorded a tool call at the time. What is known: on the streamable
-transport the answer travels back on the request's own socket, so a hang means either
-the server never finished the call or the answer never got back over a connection that
-had gone bad. Both are now instrumented — every call is logged with its duration, every
-undeliverable response is recorded with the tool and session, and each session's idle
-time is reported — so a recurrence will say which.
+**The mechanism is now established**, from Claude Desktop's own MCP logs
+(`~/Library/Logs/Claude/mcp-server-homey.log`, timestamps in UTC).
 
-**What makes the symptom impossible regardless of the cause** is the bounded write: a
-write now answers within 30 seconds saying whether Homey was told, so an indefinite wait
-becomes an explicit error. That is the part a skill should rely on.
+**The four minutes is Claude Desktop's request timeout**, firing to the millisecond:
+calls 8, 9, 85 and 86 were cancelled 240.003s, 240.022s, 240.005s and 239.997s after
+being sent, each followed by `notifications/cancelled`. That precision rules out a
+network fault. The app was never working for four minutes; the client was waiting out
+its own clock.
+
+**Underneath, mcp-remote had one of two errors, and surfaced neither.** At 11:34:48 it
+was `connect ECONNREFUSED 192.168.1.100:8735` — the Companion was down, mid-restart. At
+10:46, 10:50 and again after the app came back, it was `{"error":"Session not found"}`,
+a 404 from the Companion because the session predated a restart. In every case
+mcp-remote logged the error to its own stderr and **returned no JSON-RPC error to the
+client**, so Claude Desktop heard silence rather than a failure.
+
+**The stale tool set was the same fault, not a separate one.** One long-lived mcp-remote
+process was still advertising the tool list it had cached when it last successfully
+initialised — against a build old enough to still have `get_changelog` — while posting
+into a session the app no longer recognised. There was no duplicate or stale config
+entry; `claude_desktop_config.json` has exactly one Companion entry and had not been
+touched that day. Restarting Claude Desktop forced a fresh `initialize`, which is why it
+fixed things.
+
+**Fixed since:** the Companion now adopts an unknown session id instead of returning 404,
+so a restart of the app is invisible to the client. Verified by reproducing the failure —
+hold a session, restart the app underneath it, call again with the same id: HTTP 200 in
+47ms, where before it was a 404 followed by a 240s wait.
+
+**What a skill should take from this:**
+
+- A call that hangs for **about four minutes exactly** is the client's timeout, not Homey
+  thinking. Do not wait it out twice.
+- The likeliest cause is that the Companion restarted — which happens on every
+  `homey app install` — or was briefly down. Check `get_diagnostics`: `startedAt` and
+  `buildId` say whether it restarted recently, and `sessionsAdopted` says whether a
+  client turned up holding a pre-restart session.
+- If the tool list on offer disagrees with `get_diagnostics`'s `tools`, the client is
+  holding a stale connection and only a Claude Desktop restart will clear it.
+- A **write** that genuinely fails now says so within 30 seconds with `putSent`, so a
+  silent wait is never the app working.
 
 **Implication for the skill:** do not teach "avoid large builds because the app can't
 cope". The correct lessons are *use the batch tools because round trips are the
