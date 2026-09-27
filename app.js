@@ -34,6 +34,13 @@ const ADVANCED_FLOW_WRITABLE = ['name', 'enabled', 'folder', 'cards'];
 const CARD_WIDTH_ESTIMATE = 400;
 const NOTE_WIDTH_ESTIMATE = 400;
 
+// Gates render narrow enough to sit beside a card rather than under it
+const GATE_TYPES = new Set(['all', 'any']);
+// Measured off the canvas: a card is about five times the width of a gate
+const GATE_WIDTH_ESTIMATE = 120;
+// How far right of the cards at the same depth their gates are drawn
+const GATE_LANE_OFFSET = 460;
+
 const CARD_GAP_X_BY_TYPE = {
   start: 160,
   all: 180,
@@ -1392,15 +1399,29 @@ class HomeyDocsCompanion extends Homey.App {
     };
     group.forEach(depthOf);
 
+    // A gate renders about a fifth as wide as a card, so a gate and a card at
+    // the same depth can sit side by side in the space one card needs. Packed
+    // into one column they cannot: a card landing among the gates pushes them
+    // apart, and everything feeding them stretches to follow. Splitting them
+    // into two lanes lets each pack against its own neighbours. The lanes are
+    // numbered so a depth's cards come before its gates, which is the order
+    // they are drawn in left to right.
+    const laneOf = id => (depth[id] * 2) + (GATE_TYPES.has(cards[id].type) ? 1 : 0);
     const columns = {};
-    for (const id of group) (columns[depth[id]] = columns[depth[id]] || []).push(id);
+    for (const id of group) (columns[laneOf(id)] = columns[laneOf(id)] || []).push(id);
     const order = Object.keys(columns).map(Number).sort((a, b) => a - b);
 
     const columnX = {};
     let nextX = originX;
-    for (const column of order) {
+    for (let column = 0; column <= order[order.length - 1]; column++) {
+      const members = columns[column];
+      if (!members) continue;
       columnX[column] = nextX;
-      nextX += Math.max.apply(null, columns[column].map(id => this._columnGapAfter(cards[id])));
+      // A card lane is followed by its gate lane, which needs only the gates'
+      // own width; the gap to the next depth is taken from whichever lane
+      // reaches furthest right.
+      const gap = Math.max.apply(null, members.map(id => this._columnGapAfter(cards[id])));
+      nextX += (column % 2 === 0 && columns[column + 1]) ? GATE_LANE_OFFSET : gap;
     }
 
     const placedY = {};
@@ -1519,7 +1540,7 @@ class HomeyDocsCompanion extends Homey.App {
         const offsets = new Set([0]);
         for (const id of members) {
           for (const other of parents[id].concat(children[id])) {
-            if (!inGroup.has(other) || depth[other] === column) continue;
+            if (!inGroup.has(other) || laneOf(other) === column) continue;
             offsets.add((placedY[other] || 0) - (placedY[id] || 0));
           }
         }
@@ -1671,10 +1692,17 @@ class HomeyDocsCompanion extends Homey.App {
     const list = Object.values(cards).filter(Boolean);
     const heightOf = card =>
       (card.type === 'note' ? this._noteHeight(card) : this._siblingGapBelow(card));
+    // A gate is narrow, so the next column can sit close to it without
+    // touching. Measuring every card as one width counted those as overlaps
+    // and made a layout that puts gates in their own lane look far worse than
+    // it is.
+    const widthOf = card =>
+      (GATE_TYPES.has(card.type) ? GATE_WIDTH_ESTIMATE : CARD_WIDTH_ESTIMATE);
     let count = 0;
     for (let a = 0; a < list.length; a++) {
       for (let b = a + 1; b < list.length; b++) {
-        if (Math.abs((list[a].x || 0) - (list[b].x || 0)) >= CARD_WIDTH_ESTIMATE) continue;
+        if ((list[a].x || 0) >= (list[b].x || 0) + widthOf(list[b])
+          || (list[b].x || 0) >= (list[a].x || 0) + widthOf(list[a])) continue;
         if ((list[a].y || 0) < (list[b].y || 0) + heightOf(list[b])
           && (list[b].y || 0) < (list[a].y || 0) + heightOf(list[a])) count++;
       }
