@@ -1972,8 +1972,18 @@ class HomeyDocsCompanion extends Homey.App {
           + 'Use update_card_args to change a card\'s arguments.' };
       }
       const before = card.value;
+      const heightBefore = this._noteHeight(card);
       card.value = String(text).trim();
-      return { noteCardId: found.cardId, textBefore: before, textAfter: card.value };
+
+      // A note grows and shrinks with its text, from its top edge, so its
+      // centre moves — and the centre is what decides which card it reads as
+      // annotating. Shortening a note was enough, on its own, to hand it to
+      // the card above. Keep the centre where the author put it.
+      const drift = (heightBefore - this._noteHeight(card)) / 2;
+      if (drift) card.y = (card.y || 0) + drift;
+
+      return { noteCardId: found.cardId, textBefore: before, textAfter: card.value,
+        movedBy: drift || undefined };
     });
   }
 
