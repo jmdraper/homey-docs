@@ -67,6 +67,8 @@ const CARD_BAND_GAP_Y = 0;
 const LAYOUT_ROUNDS = 6;
 // How many times to re-read the note anchors before accepting a cycle
 const LAYOUT_SETTLE_PASSES = 64;
+// A ceiling on the search, for flows that drift instead of settling
+const LAYOUT_MAX_ARRANGEMENTS = 32;
 // Note height also grows with its text: measured 80 for a short note, rising
 // 20 per 40 characters. A note sits its own height above the card it heads.
 const NOTE_HEIGHT_BASE = 80;
@@ -1605,65 +1607,9 @@ class HomeyDocsCompanion extends Homey.App {
     return stack + separation;
   }
 
-  // Lay out a flow's cards. knownAnchors maps a note id to the card it belongs
-  // to, for callers that know the association rather than having to guess it
-  // from where the note currently sits.
-  //
-  // One pass is not enough. Positioning reads the current arrangement — which
-  // behaviour sits above which, which card each note belongs to — so its
-  // output is a new arrangement that would position differently again. Most
-  // flows reach a point where nothing more moves after two passes, a few
-  // oscillate between two or three arrangements for ever, and the difference
-  // matters because the user runs this by hand and expects a second run to be
-  // a no-op. So iterate until an arrangement repeats, then, where that repeat
-  // is a cycle rather than a fixed point, take the cycle's member with the
-  // lowest key. Which one that is doesn't matter; that it is the same one
-  // whichever member the flow is currently sitting on does.
-  _layoutCards(cards, knownAnchors) {
-    const ids = Object.keys(cards).filter(id => cards[id] && cards[id].type !== 'note');
-    if (!ids.length) return { error: 'this flow has no cards to lay out' };
-
-    const before = this._copyPositions(cards);
-    const key = state => JSON.stringify(Object.keys(state).sort()
-      .map(id => [id, state[id].x, state[id].y]));
-
-    const seen = [];
-    let state = cards;
-    for (let pass = 0; pass < LAYOUT_SETTLE_PASSES; pass++) {
-      const anchors = this._captureNoteAnchors(state);
-      for (const [noteId, anchorId] of Object.entries(knownAnchors || {})) {
-        // An anchor the caller states is authoritative: reading it back off the
-        // note's position cannot repair a note that is already misplaced,
-        // because it reads the same position that misplaced it.
-        if (state[noteId] && state[anchorId]) {
-          anchors[noteId] = { anchor: anchorId, dx: 0, dy: -1 };
-        }
-      }
-
-      const next = this._copyPositions(state);
-      const result = this._positionCards(next, anchors);
-      if (result && result.error) return result;
-
-      const k = key(next);
-      const repeat = seen.findIndex(entry => entry.key === k);
-      if (repeat >= 0) {
-        const chosen = seen.slice(repeat).reduce((a, b) =>
-          (a.travel < b.travel || (a.travel === b.travel && a.key <= b.key) ? a : b));
-        return this._finishLayout(cards, before, chosen);
-      }
-      seen.push({ key: k, cards: next, result, travel: this._flowTravel(next) });
-      state = next;
-    }
-    // No repeat inside the budget: a handful of flows drift rather than cycle.
-    // Take the flattest arrangement seen, which at least does not depend on
-    // how far the budget happened to reach.
-    return this._finishLayout(cards, before, seen.reduce((a, b) =>
-      (a.travel < b.travel || (a.travel === b.travel && a.key <= b.key) ? a : b)));
-  }
-
-  // The same measure the per-behaviour packing minimises, over the whole flow:
-  // how far the connectors have to travel vertically. Used to choose between
-  // arrangements the layout will not settle between on its own.
+  // The same measure the per-behaviour packing minimises, but over the whole
+  // flow: how far the connectors have to travel vertically. Used to choose
+  // between arrangements the layout will not settle between on its own.
   _flowTravel(cards) {
     let total = 0;
     for (const card of Object.values(cards)) {
@@ -1678,14 +1624,147 @@ class HomeyDocsCompanion extends Homey.App {
     return total;
   }
 
-  _finishLayout(cards, before, chosen) {
-    this._adoptPositions(cards, chosen.cards);
+  // Cards sharing a column that would render on top of each other. Heights are
+  // estimated from the arguments, so the count is too high in absolute terms —
+  // it flags hand-drawn layouts that look fine. It is only ever used to compare
+  // two arrangements of the same flow, where the same estimate applies to both.
+  _overlapCount(cards) {
+    const list = Object.values(cards).filter(Boolean);
+    const heightOf = card =>
+      (card.type === 'note' ? this._noteHeight(card) : this._siblingGapBelow(card));
+    let count = 0;
+    for (let a = 0; a < list.length; a++) {
+      for (let b = a + 1; b < list.length; b++) {
+        if (Math.abs((list[a].x || 0) - (list[b].x || 0)) >= CARD_WIDTH_ESTIMATE) continue;
+        if ((list[a].y || 0) < (list[b].y || 0) + heightOf(list[b])
+          && (list[b].y || 0) < (list[a].y || 0) + heightOf(list[a])) count++;
+      }
+    }
+    return count;
+  }
+
+  // How many notes would not read as belonging to the card they annotate.
+  // Zero is the whole point of holding space for them; a note that loses this
+  // comparison is reported by get_flow_summary as annotating a neighbour, or
+  // as belonging to no card at all.
+  _notesMisattached(cards, noteAnchors) {
+    const { attached } = this._noteAttachments(cards);
+    let wrong = 0;
+    for (const [noteId, anchor] of Object.entries(noteAnchors)) {
+      if (attached[noteId] !== anchor.anchor) wrong++;
+    }
+    return wrong;
+  }
+
+  // Lay out a flow's cards. knownAnchors maps a note id to the card it belongs
+  // to, for callers that know the association rather than having to guess it
+  // from where the note currently sits.
+  //
+  // One pass is not enough. Positioning reads the current arrangement — which
+  // behaviour sits above which, which card each note belongs to — so its
+  // output is a new arrangement that would position differently again. Most
+  // flows reach a point where nothing more moves after two passes, a few
+  // oscillate between two or three arrangements for ever, and the difference
+  // matters because the user runs this by hand and expects a second run to be
+  // a no-op. So iterate until an arrangement repeats, and keep the best of
+  // everything seen: first by how many notes end up reading as belonging to
+  // the card they annotate, then by how far the connectors have to travel.
+  // Scoring everything visited rather than taking the last pass is also what
+  // settles the flows that cycle, since the same arrangements are visited
+  // whichever member of the cycle the flow happens to be sitting on.
+  _layoutCards(cards, knownAnchors) {
+    const ids = Object.keys(cards).filter(id => cards[id] && cards[id].type !== 'note');
+    if (!ids.length) return { error: 'this flow has no cards to lay out' };
+
+    const before = this._copyPositions(cards);
+    const key = state => JSON.stringify(Object.keys(state).sort()
+      .map(id => [id, state[id].x, state[id].y]));
+    const anchorsFor = state => {
+      const anchors = this._captureNoteAnchors(state);
+      for (const [noteId, anchorId] of Object.entries(knownAnchors || {})) {
+        // An anchor the caller states is authoritative: reading it back off the
+        // note's position cannot repair a note that is already misplaced,
+        // because it reads the same position that misplaced it.
+        if (state[noteId] && state[anchorId]) {
+          anchors[noteId] = { anchor: anchorId, dx: 0, dy: -1 };
+        }
+      }
+      return anchors;
+    };
+
+    // Score an arrangement: cards rendering on top of each other first, since
+    // that is a defect anyone can see, then notes that read as annotating the
+    // wrong card, then how far the connectors travel.
+    //
+    // Always against the associations the flow arrived with. Scoring against
+    // the ones each step re-read off its own input lets them drift: a note
+    // moves a little, the next step reads it as belonging to its new
+    // neighbour, and every step after that agrees — so the arrangement scores
+    // perfectly while the note now annotates a card the author never put it on.
+    const original = anchorsFor(cards);
+    const score = state => {
+      const wrong = this._notesMisattached(state, original);
+      const overlaps = this._overlapCount(state);
+      return { wrong, overlaps, defects: wrong + overlaps, travel: this._flowTravel(state) };
+    };
+    // Two cards on top of each other and a note that has drifted onto the
+    // wrong card are both defects a reader would notice, and neither is worth
+    // trading for the other, so they are counted together. Travel only
+    // separates arrangements with the same number of defects.
+    const better = (a, b) => {
+      for (const field of ['defects', 'travel']) {
+        if (a[field] !== b[field]) return a[field] < b[field] ? a : b;
+      }
+      return a.key <= b.key ? a : b;
+    };
+
+    // Explore every arrangement reachable from this one, rather than following
+    // a single chain to its first repeat. Both matter: which arrangement a
+    // chain ends on depends on where it started, so the answer would change
+    // from one run to the next — and the flow arrived in one of those
+    // arrangements, so the search has to be able to come back to it.
+    //
+    // Holding space beside annotated cards makes their column taller, and
+    // every connector into that column then has to reach further down. Often
+    // it buys nothing, because the packing left a big enough gap by itself, so
+    // both are tried and scored.
+    const seen = new Map();
+    let failed = null;
+    const add = state => {
+      const k = key(state);
+      if (seen.has(k)) return null;
+      const entry = Object.assign({ key: k, cards: state }, score(state));
+      seen.set(k, entry);
+      return entry;
+    };
+
+    add(this._copyPositions(cards));
+    const queue = Array.from(seen.values());
+    while (queue.length && seen.size < LAYOUT_MAX_ARRANGEMENTS) {
+      const from = queue.shift();
+      for (const holdSpace of [true, false]) {
+        const anchors = anchorsFor(from.cards);
+        const next = this._copyPositions(from.cards);
+        const result = this._positionCards(next, anchors, holdSpace);
+        if (result && result.error) { failed = result; continue; }
+        const entry = add(next);
+        if (entry) { entry.result = result; queue.push(entry); }
+      }
+    }
+    if (seen.size <= 1) return failed || { error: 'this flow could not be laid out' };
+
+    const best = Array.from(seen.values()).reduce(better);
+
+    this._adoptPositions(cards, best.cards);
     let moved = 0;
     for (const [id, card] of Object.entries(cards)) {
       if (!before[id]) continue;
       if (card.x !== before[id].x || card.y !== before[id].y) moved++;
     }
-    return Object.assign({}, chosen.result, { cardsRepositioned: moved });
+    return Object.assign({
+      independentBehaviours: null, widestBehaviour: null, notesMoved: null,
+    }, best.result, { cardsRepositioned: moved, notesMisplaced: best.wrong,
+      arrangementsTried: seen.size });
   }
 
   _copyPositions(cards) {
@@ -1704,7 +1783,7 @@ class HomeyDocsCompanion extends Homey.App {
 
   // One pass: position every card and drop the notes into the space held for
   // them, given a fixed idea of which card each note belongs to.
-  _positionCards(cards, noteAnchors) {
+  _positionCards(cards, noteAnchors, holdSpace) {
     const ids = Object.keys(cards).filter(id => cards[id] && cards[id].type !== 'note');
     if (!ids.length) return { error: 'this flow has no cards to lay out' };
 
@@ -1743,9 +1822,14 @@ class HomeyDocsCompanion extends Homey.App {
       if (anchor.dy <= 0) slot.aboveNotes.push(noteId);
       else slot.belowNotes.push(noteId);
     }
+    // Holding space costs connector travel — a column carrying three notes is
+    // several hundred pixels taller, and everything feeding it drops to reach
+    // it. Worth paying only where the packing would not have left a big enough
+    // gap anyway, which is not knowable until the flow is laid out, so both
+    // are tried and the better one kept.
     for (const [cardId, slot] of Object.entries(reserve)) {
-      slot.above = this._noteStackDepth(cards, cardId, slot.aboveNotes);
-      slot.below = this._noteStackDepth(cards, cardId, slot.belowNotes);
+      slot.above = holdSpace ? this._noteStackDepth(cards, cardId, slot.aboveNotes) : 0;
+      slot.below = holdSpace ? this._noteStackDepth(cards, cardId, slot.belowNotes) : 0;
     }
 
     let moved = 0;
