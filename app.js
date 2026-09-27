@@ -68,7 +68,7 @@ const LAYOUT_ROUNDS = 6;
 // How many times to re-read the note anchors before accepting a cycle
 const LAYOUT_SETTLE_PASSES = 64;
 // A ceiling on the search, for flows that drift instead of settling
-const LAYOUT_MAX_ARRANGEMENTS = 32;
+const LAYOUT_MAX_ARRANGEMENTS = 48;
 // Note height also grows with its text: measured 80 for a short note, rising
 // 20 per 40 characters. A note sits its own height above the card it heads.
 const NOTE_HEIGHT_BASE = 80;
@@ -1502,6 +1502,45 @@ class HomeyDocsCompanion extends Homey.App {
       if (!improved) break;
     }
     restore(best.y);
+
+    // Slide whole columns. Every column is packed from its own preferred
+    // positions, which fixes the spacing inside it but says nothing about
+    // where it should sit as a whole — so a column made tall by the cards or
+    // notes in it ends up too low for the ones feeding it, and every
+    // connector into it runs down the canvas. Moving a column moves all of it
+    // at once, so the spacing inside is untouched and no overlap can appear.
+    //
+    // The useful offsets are the ones that flatten a connector completely, so
+    // only those are tried.
+    for (let round = 0; round < LAYOUT_ROUNDS; round++) {
+      let improved = false;
+      for (const column of order) {
+        const members = columns[column];
+        const offsets = new Set([0]);
+        for (const id of members) {
+          for (const other of parents[id].concat(children[id])) {
+            if (!inGroup.has(other) || depth[other] === column) continue;
+            offsets.add((placedY[other] || 0) - (placedY[id] || 0));
+          }
+        }
+        let bestOffset = 0;
+        let bestCost = travel();
+        for (const offset of offsets) {
+          if (!offset) continue;
+          for (const id of members) placedY[id] = (placedY[id] || 0) + offset;
+          const cost = travel();
+          for (const id of members) placedY[id] = (placedY[id] || 0) - offset;
+          if (cost < bestCost) { bestCost = cost; bestOffset = offset; }
+        }
+        if (!bestOffset) continue;
+        for (const id of members) {
+          placedY[id] = (placedY[id] || 0) + bestOffset;
+          cards[id].y = placedY[id];
+        }
+        improved = true;
+      }
+      if (!improved) break;
+    }
 
     // Slide the finished band into position
     const top = Math.min.apply(null, group.map(id => cards[id].y || 0));
