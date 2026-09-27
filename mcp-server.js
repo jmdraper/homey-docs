@@ -268,7 +268,11 @@ const TOOLS = [
   },
   {
     name: 'add_card',
-    description: 'Add a card to an advanced flow. Pass `after` to place and connect it downstream of an existing card; otherwise it is placed below the flow, unconnected. Coordinates are chosen automatically so cards do not overlap.',
+    description: 'Add ONE card to an advanced flow. Pass `after` to place and connect it '
+      + 'downstream of an existing card; otherwise it is placed below the flow, unconnected. '
+      + 'Coordinates are chosen automatically so cards do not overlap. For more than two or '
+      + 'three cards use apply_cards instead, which does the whole batch in one write and one '
+      + 'revision — a flow built a card at a time costs a round trip each and a revision each.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -297,6 +301,104 @@ const TOOLS = [
         },
       },
       required: ['flowId', 'card'],
+    },
+    annotations: { readOnlyHint: false },
+  },
+  {
+    name: 'apply_cards',
+    description: 'Add several cards and the connections between them to an advanced flow in one '
+      + 'call — one read of the flow, one write, one revision, and either all of it applies or '
+      + 'none of it does. Use this instead of a run of add_card / connect_cards calls: building '
+      + 'a 70-card flow one card at a time takes about 80 round trips and is what exhausts a '
+      + 'turn. Cards name each other with local refs such as "$fastLed"; a from/to that is not '
+      + 'one of those refs is read as an existing card id or prefix in the flow, so a batch can '
+      + 'hang off what is already there. Every connection names its output explicitly.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string' },
+        cards: {
+          type: 'array',
+          description: 'The cards to add. Each needs a `ref` (any string, conventionally "$name") '
+            + 'and a `type`. A trigger, condition or action also needs `id` (the full card id) '
+            + 'and usually `ownerUri` and `args`; delay, all, any and start are structural and '
+            + 'have no id. A note takes `value` and optionally `color`. Give `x` and '
+            + '`y` to place a card exactly; leave them out and the batch is laid out in columns '
+            + 'below the existing flow, following the connections.',
+          items: { type: 'object' },
+        },
+        connections: {
+          type: 'array',
+          description: 'Connections to make, as { from, output, to }. `from` and `to` are refs '
+            + 'from this batch or existing card ids. `output` is required and must be one the '
+            + 'source card actually has: trigger, delay, all, any, start — outputSuccess; '
+            + 'condition — outputTrue, outputFalse, outputError; action — outputSuccess, '
+            + 'outputError.',
+          items: { type: 'object' },
+        },
+        relayout: {
+          type: 'boolean',
+          description: 'Lay the whole flow out afterwards, in the same write. Worth it when the '
+            + 'batch builds a flow; it moves existing cards too, so leave it off when adding to '
+            + 'a flow someone has arranged by hand.',
+        },
+        requestId: {
+          type: 'string',
+          description: 'Idempotency key. Repeating a call with the same requestId within ten '
+            + 'minutes returns the first call\'s result rather than adding everything twice.',
+        },
+      },
+      required: ['flowId', 'cards'],
+    },
+    annotations: { readOnlyHint: false },
+  },
+  {
+    name: 'copy_cards',
+    description: 'Copy a group of cards from one advanced flow to another, keeping their '
+      + 'arguments, ownerUri, droptokens, relative positions and the connections between them, '
+      + 'with fresh card ids. This is how a section moves between flows in one call rather than '
+      + 'in eighty. Say what to copy either with cardIds or, better, with sectionNoteId — the '
+      + 'yellow heading note above the section, which selects everything under it using the same '
+      + 'attribution get_flow_summary uses to place notes. Connections crossing the edge of the '
+      + 'selection are not copied and are listed in the result so you can rewire them, as are '
+      + 'any cards left using a token produced by a card that stayed behind.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fromFlowId: { type: 'string', description: 'The flow to copy from' },
+        toFlowId: { type: 'string', description: 'The flow to copy into. It must already exist — '
+          + 'create it with create_advanced_flow first.' },
+        cardIds: {
+          type: 'array', items: { type: 'string' },
+          description: 'Card ids, or unambiguous prefixes, from the source flow. Get them from '
+            + 'get_flow_summary with withCardIds.',
+        },
+        sectionNoteId: {
+          type: 'string',
+          description: 'The id of a yellow section-heading note in the source flow. Everything '
+            + 'under that heading, down to the next one, is selected — the cards in its band and '
+            + 'whatever they go on to drive.',
+        },
+        includeNotes: {
+          type: 'boolean',
+          description: 'Copy the notes attached to the selected cards, and the heading note '
+            + 'itself. Default true.',
+        },
+        removeFromSource: {
+          type: 'boolean',
+          description: 'Delete the cards from the source flow once the copy has succeeded, '
+            + 'turning the copy into a move. The copy is written first, so a failure leaves the '
+            + 'source untouched.',
+        },
+        dryRun: {
+          type: 'boolean',
+          description: 'Report what would be copied — the cards, the connections that would be '
+            + 'dropped, the tokens that would dangle — and write nothing. Worth doing first for '
+            + 'a section selection, to check the section is the one you meant.',
+        },
+        requestId: { type: 'string', description: 'Idempotency key; see apply_cards.' },
+      },
+      required: ['fromFlowId', 'toFlowId'],
     },
     annotations: { readOnlyHint: false },
   },
@@ -887,6 +989,21 @@ class HomeyMcpServer {
 
         case 'update_card_args':
           return this._text(await app.updateCardArgs(args.flowId, args.cardId, args.args, args.replace));
+
+        case 'apply_cards':
+          return this._text(await app.applyCards(args.flowId, args.cards, args.connections, {
+            relayout: args.relayout, requestId: args.requestId,
+          }));
+
+        case 'copy_cards':
+          return this._text(await app.copyCards(args.fromFlowId, args.toFlowId, {
+            cardIds: args.cardIds,
+            sectionNoteId: args.sectionNoteId,
+            includeNotes: args.includeNotes,
+            removeFromSource: args.removeFromSource,
+            dryRun: args.dryRun,
+            requestId: args.requestId,
+          }));
 
         case 'add_card':
           return this._text(await app.addCard(args.flowId, args.card, args.after, {

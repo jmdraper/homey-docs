@@ -107,6 +107,11 @@ const NOTE_ATTACH_MARGIN = 20;
 const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
 const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
 
+// The card types that name a Homey flow card and so carry an `id`. The rest —
+// delay, all, any, start, note — are structural, and 853 of the cards here have
+// no id for that reason.
+const CARD_ID_REQUIRED = new Set(['trigger', 'condition', 'action']);
+
 // Which outputs each card type can actually drive. Taken from what the 5,003
 // cards on this Homey use, not from guesswork: a condition really does have an
 // outputError (16 cards use it), and an action really has no true/false branch.
@@ -2486,6 +2491,613 @@ class HomeyDocsCompanion extends Homey.App {
       draft.folder = folderId || null;
       return { folder: folderId || null, folderName: folderId ? folders[folderId] : null };
     });
+  }
+
+
+  // ─── Bulk structural edits ───────────────────────────────────────────────────
+
+  // A card id is referenced from four places, not one. Missing any of them
+  // leaves a copied section quietly half-wired:
+  //   - the output arrays, which are the visible connections
+  //   - an ALL gate's `input` array, as "<cardId>::<output>"
+  //   - a card's `droptoken`, as "trigger::<cardId>::<token>"
+  //   - tokens embedded in argument text, as "[[trigger::<cardId>::<token>]]"
+  // The last two are how a card uses a value produced by an earlier card, and
+  // 476 cards on this Homey carry one. Copying a section without them produces
+  // something that looks right in the editor and has lost its data flow.
+  _remapIdsIn(value, mapping, dangling) {
+    const swap = id => {
+      if (mapping[id]) return mapping[id];
+      if (!dangling.includes(id)) dangling.push(id);
+      return id;
+    };
+    const rewriteToken = text => text
+      .replace(/\b(trigger|action)::([0-9a-f-]{36})::/gi,
+        (whole, kind, id) => kind + '::' + swap(id) + '::');
+
+    if (typeof value === 'string') return rewriteToken(value);
+    if (Array.isArray(value)) return value.map(item => this._remapIdsIn(item, mapping, dangling));
+    if (value && typeof value === 'object') {
+      const out = {};
+      for (const [key, item] of Object.entries(value)) {
+        out[key] = this._remapIdsIn(item, mapping, dangling);
+      }
+      return out;
+    }
+    return value;
+  }
+
+  // Returns a copy of `card` with every reference rewritten through `mapping`.
+  // References to cards outside the mapping are left alone and reported, since
+  // silently dropping them would lose the only record that they existed.
+  _remapCard(card, mapping) {
+    const copy = JSON.parse(JSON.stringify(card));
+    const droppedEdges = [];
+    const danglingTokens = [];
+
+    for (const output of CARD_OUTPUTS) {
+      if (!Array.isArray(copy[output])) continue;
+      const kept = [];
+      for (const target of copy[output]) {
+        if (mapping[target]) kept.push(mapping[target]);
+        else droppedEdges.push({ output, to: target });
+      }
+      if (kept.length) copy[output] = kept;
+      else delete copy[output];
+    }
+
+    if (Array.isArray(copy.input)) {
+      copy.input = copy.input
+        .map(entry => {
+          const [id, output] = String(entry).split('::');
+          return mapping[id] ? mapping[id] + '::' + output : null;
+        })
+        .filter(Boolean);
+    }
+
+    if (copy.droptoken) {
+      copy.droptoken = this._remapIdsIn(copy.droptoken, mapping, danglingTokens);
+    }
+    if (copy.args) {
+      copy.args = this._remapIdsIn(copy.args, mapping, danglingTokens);
+    }
+
+    return { card: copy, droppedEdges, danglingTokens };
+  }
+
+  // The section a heading note names. Headings sit at the left margin — the same
+  // test get_flow_summary uses to decide a note heads a section rather than
+  // labelling one card — so consecutive headings divide the canvas into bands,
+  // and a section is the cards in its band plus whatever they go on to drive.
+  //
+  // Reading it off geometry rather than off the graph matches how a person sees
+  // the canvas, and matches how the layout code already groups behaviours into
+  // bands. Downstream closure then catches the cards that sit slightly below
+  // their band but plainly belong to it.
+  _sectionOf(cards, noteId) {
+    const note = cards[noteId];
+    if (!note || note.type !== 'note') {
+      return { error: 'card ' + noteId + ' is not a note, so it cannot name a section' };
+    }
+    const { headings } = this._noteAttachments(cards);
+    if (!headings.has(noteId)) {
+      return { error: 'note "' + String(note.value).slice(0, 60) + '" sits out in the flow, not '
+        + 'at the left margin, so it labels one card rather than heading a section. Select the '
+        + 'cards with cardIds instead, or use the heading note above the section.' };
+    }
+
+    const headingNotes = Array.from(headings)
+      .map(id => ({ id, y: cards[id].y || 0 }))
+      .sort((a, b) => a.y - b.y);
+    const position = headingNotes.findIndex(entry => entry.id === noteId);
+    const top = headingNotes[position].y;
+    const next = headingNotes[position + 1];
+    const bottom = next ? next.y : Infinity;
+
+    const bandOf = card => {
+      const y = card.y || 0;
+      let owner = null;
+      for (const heading of headingNotes) {
+        if (y >= heading.y) owner = heading.id; else break;
+      }
+      return owner;
+    };
+
+    const selected = new Set();
+    const queue = [];
+    for (const [id, card] of Object.entries(cards)) {
+      if (!card || card.type === 'note') continue;
+      const y = card.y || 0;
+      if (y >= top && y < bottom) { selected.add(id); queue.push(id); }
+    }
+    if (!selected.size) {
+      return { error: 'no cards sit under the note "' + String(note.value).slice(0, 60)
+        + '", so there is no section to copy' };
+    }
+
+    // Follow the wiring out of the band, but never into another section
+    while (queue.length) {
+      const id = queue.shift();
+      for (const output of CARD_OUTPUTS) {
+        for (const target of (cards[id][output] || [])) {
+          const card = cards[target];
+          if (!card || card.type === 'note' || selected.has(target)) continue;
+          if (bandOf(card) !== noteId) continue;
+          selected.add(target);
+          queue.push(target);
+        }
+      }
+    }
+
+    return { ids: selected, heading: String(note.value).replace(/\s+/g, ' ').trim(), headingNoteId: noteId };
+  }
+
+  // Notes belonging to the selected cards, by the same nearest-card attribution
+  // get_flow_summary uses. A note is part of the section it annotates.
+  _notesFor(cards, selected, headingNoteId) {
+    const { attached } = this._noteAttachments(cards);
+    const notes = new Set();
+    if (headingNoteId) notes.add(headingNoteId);
+    for (const [noteId, cardId] of Object.entries(attached)) {
+      if (selected.has(cardId)) notes.add(noteId);
+    }
+    return notes;
+  }
+
+
+  // create_advanced_flow has to seed a start card, because Homey refuses a flow
+  // with no cards at all. Once a batch brings in real triggers that card is
+  // litter — it sits at the top of the canvas and at the top of every summary,
+  // saying nothing. Removing it is only safe when it is demonstrably the
+  // placeholder: the only card, a start, and wired to nothing.
+  //
+  // Must be read BEFORE the batch is added, while the flow still has only the
+  // one card.
+  _placeholderStartCardId(draft) {
+    const ids = Object.keys(draft.cards);
+    if (ids.length !== 1) return null;
+    const card = draft.cards[ids[0]];
+    if (!card || card.type !== 'start') return null;
+    if (CARD_OUTPUTS.some(output => (card[output] || []).length)) return null;
+    return ids[0];
+  }
+
+  _dropPlaceholderStart(draft, placeholderId, incomingTypes) {
+    if (!placeholderId || !draft.cards[placeholderId]) return null;
+    if (!incomingTypes.has('trigger') && !incomingTypes.has('start')) return null;
+    // Only if nothing in the batch wired itself to it
+    for (const card of Object.values(draft.cards)) {
+      for (const output of CARD_OUTPUTS) {
+        if ((card[output] || []).includes(placeholderId)) return null;
+      }
+    }
+    delete draft.cards[placeholderId];
+    return placeholderId;
+  }
+
+  async copyCards(fromFlowId, toFlowId, options) {
+    const opts = options || {};
+    if (opts.requestId) {
+      return this._idempotent(opts.requestId,
+        () => this.copyCards(fromFlowId, toFlowId, Object.assign({}, opts, { requestId: null })));
+    }
+    if (!this._writesEnabled() && !opts.dryRun) {
+      return { error: 'Editing is turned off. Enable "Allow AI assistants to edit flows" in the app settings first.' };
+    }
+    if (!fromFlowId || !toFlowId) return { error: 'fromFlowId and toFlowId are both required' };
+
+    let source;
+    try {
+      source = await this._apiGet('/manager/flow/advancedflow/' + fromFlowId);
+    } catch (e) {
+      return { error: 'Could not read the source flow ' + fromFlowId + ': ' + e.message };
+    }
+    if (!source || !source.cards) {
+      return { error: 'Flow ' + fromFlowId + ' is not an advanced flow' };
+    }
+
+    // ── choose the cards ──
+    let selected;
+    let heading = null;
+    let headingNoteId = null;
+    if (opts.sectionNoteId) {
+      const resolved = this._resolveCardId(source.cards, opts.sectionNoteId);
+      if (resolved.error) return resolved;
+      const section = this._sectionOf(source.cards, resolved.cardId);
+      if (section.error) return section;
+      selected = section.ids;
+      heading = section.heading;
+      headingNoteId = section.headingNoteId;
+    } else if (Array.isArray(opts.cardIds) && opts.cardIds.length) {
+      selected = new Set();
+      const problems = [];
+      for (const given of opts.cardIds) {
+        const resolved = this._resolveCardId(source.cards, given);
+        if (resolved.error) problems.push(given + ': ' + resolved.error);
+        else selected.add(resolved.cardId);
+      }
+      if (problems.length) return { error: 'Some card ids did not resolve', problems };
+    } else {
+      return { error: 'Give either cardIds or sectionNoteId to say what to copy' };
+    }
+
+    if (opts.includeNotes !== false) {
+      for (const noteId of this._notesFor(source.cards, selected, headingNoteId)) selected.add(noteId);
+    } else if (headingNoteId) {
+      selected.delete(headingNoteId);
+    }
+
+    // ── build the copy ──
+    const mapping = {};
+    for (const id of selected) mapping[id] = crypto.randomUUID();
+
+    const copied = {};
+    const droppedConnections = [];
+    const danglingTokens = [];
+    const appIds = new Set();
+    for (const id of selected) {
+      const original = source.cards[id];
+      const { card, droppedEdges, danglingTokens: stray } = this._remapCard(original, mapping);
+      copied[mapping[id]] = card;
+      for (const edge of droppedEdges) {
+        droppedConnections.push({
+          direction: 'out', fromCardId: id, from: this._cardLabel(original, this._cardTitles || {}),
+          output: edge.output, toCardId: edge.to,
+          to: source.cards[edge.to] ? this._cardLabel(source.cards[edge.to], this._cardTitles || {}) : 'unknown card',
+        });
+      }
+      for (const strayId of stray) {
+        danglingTokens.push({
+          cardId: id, card: this._cardLabel(original, this._cardTitles || {}),
+          usesTokenFrom: strayId,
+          producer: source.cards[strayId] ? this._cardLabel(source.cards[strayId], this._cardTitles || {}) : 'a card not in this flow',
+        });
+      }
+      const owner = String(original.ownerUri || '').match(/^homey:app:([^:]+)$/);
+      if (owner) appIds.add(owner[1]);
+    }
+
+    // Edges INTO the selection are just as much a loose end, and the caller
+    // cannot see them from the copy — only the source shows them.
+    for (const [id, card] of Object.entries(source.cards)) {
+      if (selected.has(id) || !card || card.type === 'note') continue;
+      for (const output of CARD_OUTPUTS) {
+        for (const target of (card[output] || [])) {
+          if (!selected.has(target)) continue;
+          droppedConnections.push({
+            direction: 'in', fromCardId: id, from: this._cardLabel(card, this._cardTitles || {}),
+            output, toCardId: target,
+            to: this._cardLabel(source.cards[target], this._cardTitles || {}),
+          });
+        }
+      }
+    }
+
+    const installed = await this._installedAppIds();
+    const missingApps = installed ? Array.from(appIds).filter(id => !installed.has(id)) : [];
+    if (missingApps.length) {
+      return { error: 'These cards belong to apps that are not installed, so they cannot be '
+        + 'added: ' + missingApps.join(', ') };
+    }
+
+    // A flow usually has several section headings, and the first often names
+    // the flow as much as the section. Saying which others exist is what stops
+    // "copy the section" quietly meaning "copy the first fifth of it".
+    const otherSections = [];
+    {
+      const { headings } = this._noteAttachments(source.cards);
+      for (const noteId of headings) {
+        if (noteId === headingNoteId) continue;
+        otherSections.push({
+          sectionNoteId: noteId.slice(0, 6),
+          heading: String(source.cards[noteId].value).replace(/\s+/g, ' ').trim(),
+        });
+      }
+      otherSections.sort((a, b) =>
+        (source.cards[a.sectionNoteId] ? 0 : 0) || a.heading.localeCompare(b.heading));
+    }
+
+    const summary = {
+      from: { flowId: fromFlowId, flow: source.name },
+      to: { flowId: toFlowId },
+      section: heading,
+      otherSectionsInSource: opts.sectionNoteId && otherSections.length ? otherSections : undefined,
+      otherSectionsNote: opts.sectionNoteId && otherSections.length
+        ? 'The source flow has other sections, listed above. This call copied only the one named. '
+          + 'Copy the rest with further copy_cards calls, or select every card with cardIds.'
+        : undefined,
+      cardsSelected: selected.size,
+      notes: Array.from(selected).filter(id => source.cards[id].type === 'note').length,
+      connectionsKept: Object.values(copied)
+        .reduce((total, card) => total + CARD_OUTPUTS
+          .reduce((n, output) => n + (card[output] || []).length, 0), 0),
+      droppedConnections,
+      danglingTokens: danglingTokens.length ? danglingTokens : undefined,
+    };
+    if (droppedConnections.length) {
+      summary.rewireNote = 'These connections crossed the edge of the selection and were not '
+        + 'copied. Reconnect whatever of them still matters with connect_cards.';
+    }
+    if (danglingTokens.length) {
+      summary.tokenNote = 'These cards use a token produced by a card that was NOT copied. The '
+        + 'token reference has been left pointing at the original card, which does not exist in '
+        + 'the target flow, so those arguments will not resolve. Copy the producing card too, or '
+        + 'rewrite the argument with update_card_args.';
+    }
+
+    if (opts.dryRun) {
+      return Object.assign({ dryRun: true, wrote: false, cards: Object.values(copied)
+        .map(card => this._cardLabel(card, this._cardTitles || {})) }, summary);
+    }
+
+    // ── write into the target ──
+    const written = await this._mutateAdvancedFlow(toFlowId,
+      'copied ' + selected.size + ' card(s) from "' + source.name + '"', draft => {
+        const placeholderId = this._placeholderStartCardId(draft);
+        // The placeholder is about to go, so do not reserve space below it
+        const existing = Object.entries(draft.cards)
+          .filter(([id]) => id !== placeholderId)
+          .map(([, card]) => card);
+        // Land clear of whatever is already there, keeping the section's own
+        // shape: relative geometry is what makes a copied section read as the
+        // same section rather than a heap of cards.
+        const sourceTop = Math.min(...Array.from(selected).map(id => source.cards[id].y || 0));
+        const sourceLeft = Math.min(...Array.from(selected).map(id => source.cards[id].x || 0));
+        const offsetY = existing.length
+          ? Math.max(...existing.map(card => card.y || 0)) + CARD_ROW_GAP_Y - sourceTop
+          : CANVAS_TOP_MARGIN - sourceTop;
+        const offsetX = (existing.length
+          ? Math.min(...existing.map(card => card.x || 0))
+          : 0) - sourceLeft;
+
+        for (const [newId, card] of Object.entries(copied)) {
+          const placed = Object.assign({}, card);
+          placed.x = (card.x || 0) + offsetX;
+          placed.y = (card.y || 0) + offsetY;
+          draft.cards[newId] = placed;
+        }
+        const placeholder = this._dropPlaceholderStart(draft, placeholderId,
+          new Set(Object.values(copied).map(card => card.type)));
+        return {
+          addedCardIds: Object.keys(copied), offsetX, offsetY,
+          removedPlaceholderStartCard: placeholder || undefined,
+        };
+      });
+
+    if (written.error) return Object.assign(written, summary);
+
+    const result = Object.assign({}, written, summary, {
+      idMap: Object.fromEntries(Object.entries(mapping)
+        .map(([oldId, newId]) => [oldId.slice(0, 8), newId])),
+    });
+
+    // ── and, if this is a move, take them out of the source ──
+    if (opts.removeFromSource) {
+      const removal = await this._mutateAdvancedFlow(fromFlowId,
+        'removed ' + selected.size + ' card(s) copied to another flow', draft => {
+          let unlinked = 0;
+          for (const id of selected) delete draft.cards[id];
+          for (const card of Object.values(draft.cards)) {
+            for (const output of CARD_OUTPUTS) {
+              if (!Array.isArray(card[output])) continue;
+              const before = card[output].length;
+              card[output] = card[output].filter(target => !selected.has(target));
+              unlinked += before - card[output].length;
+            }
+          }
+          return { removedFromSource: selected.size, incomingLinksRemoved: unlinked };
+        });
+      result.removedFromSource = removal.error
+        ? { failed: removal.error, warning: 'The copy succeeded, so the cards now exist in BOTH '
+            + 'flows. Remove them from the source by hand, or call again with removeFromSource.' }
+        : { ok: true, cards: selected.size, revisionSaved: removal.revisionSaved };
+    }
+
+    return result;
+  }
+
+
+  // Add several cards and the connections between them in one read-modify-write.
+  // Cards name each other with local refs — "$fastLed" — which are resolved to
+  // freshly minted ids here; a ref that is not local is taken as an existing
+  // card id or prefix in the target flow.
+  //
+  // All or nothing. A batch that is wrong in any particular writes nothing and
+  // reports every problem it found, rather than applying the good half and
+  // leaving the caller to work out where it stopped.
+  async applyCards(flowId, cards, connections, options) {
+    const opts = options || {};
+    if (opts.requestId) {
+      return this._idempotent(opts.requestId, () => this.applyCards(flowId, cards, connections,
+        Object.assign({}, opts, { requestId: null })));
+    }
+    if (!Array.isArray(cards) || !cards.length) {
+      return { error: 'cards must be a non-empty array' };
+    }
+    const links = connections || [];
+    if (!Array.isArray(links)) return { error: 'connections must be an array' };
+
+    // ── shape checks that need nothing from Homey ──
+    const problems = [];
+    const refs = new Map();
+    cards.forEach((card, index) => {
+      const where = 'cards[' + index + ']' + (card && card.ref ? ' (' + card.ref + ')' : '');
+      if (!card || typeof card !== 'object') { problems.push(where + ' is not an object'); return; }
+      if (!card.ref) problems.push(where + ' needs a ref, such as "$trigger", so connections can name it');
+      else if (refs.has(card.ref)) problems.push('two cards share the ref ' + card.ref);
+      else refs.set(card.ref, { index, card });
+      if (!CARD_TYPES.has(card.type)) {
+        problems.push(where + ' has type ' + JSON.stringify(card.type)
+          + '; it must be one of ' + Array.from(CARD_TYPES).join(', '));
+      }
+      if (card.type === 'note' && !card.value) problems.push(where + ' is a note with no value');
+      // Only the card types that name a Homey flow card carry an id. A delay,
+      // a gate, a start and a note are structural and have none.
+      if (CARD_ID_REQUIRED.has(card.type) && !card.id) {
+        problems.push(where + ' is a ' + card.type + ' and needs an id, the full card id such as '
+          + 'homey:device:<uuid>:on');
+      }
+    });
+    links.forEach((link, index) => {
+      const where = 'connections[' + index + ']';
+      if (!link || typeof link !== 'object') { problems.push(where + ' is not an object'); return; }
+      if (!link.from) problems.push(where + ' needs from');
+      if (!link.to) problems.push(where + ' needs to');
+      if (!link.output) problems.push(where + ' needs output — name it explicitly rather than '
+        + 'leaving a condition to default to its true branch');
+      else if (!CARD_OUTPUTS.includes(link.output)) {
+        problems.push(where + ' has output ' + JSON.stringify(link.output)
+          + '; it must be one of ' + CARD_OUTPUTS.join(', '));
+      }
+    });
+    if (problems.length) return { error: 'Nothing was written — the batch is not valid', problems };
+
+    const appIds = new Set();
+    for (const card of cards) {
+      const owner = String(card.ownerUri || '').match(/^homey:app:([^:]+)$/);
+      if (owner) appIds.add(owner[1]);
+    }
+    const installed = await this._installedAppIds();
+    const missing = installed ? Array.from(appIds).filter(id => !installed.has(id)) : [];
+    if (missing.length) {
+      return { error: 'Nothing was written — these apps are not installed, so their cards '
+        + 'cannot be added: ' + missing.join(', ') };
+    }
+
+    const newIds = new Map();
+    for (const ref of refs.keys()) newIds.set(ref, crypto.randomUUID());
+
+    return this._mutateAdvancedFlow(flowId,
+      'added ' + cards.length + ' card(s) and ' + links.length + ' connection(s)', draft => {
+        const resolve = given => {
+          if (newIds.has(given)) return { cardId: newIds.get(given) };
+          const found = this._resolveCardId(draft.cards, given);
+          if (found.error) {
+            return { error: given + ' is neither a ref in this batch nor a card in the flow — '
+              + found.error };
+          }
+          return found;
+        };
+
+        const placeholderId = this._placeholderStartCardId(draft);
+
+        // Resolve everything before touching the draft, so a bad ref costs
+        // nothing rather than leaving half a batch in place
+        const resolvedLinks = [];
+        const linkProblems = [];
+        for (const link of links) {
+          const from = resolve(link.from);
+          const to = resolve(link.to);
+          if (from.error) linkProblems.push(from.error);
+          if (to.error) linkProblems.push(to.error);
+          if (from.error || to.error) continue;
+          if (from.cardId === to.cardId) {
+            linkProblems.push(link.from + ' is connected to itself');
+            continue;
+          }
+          resolvedLinks.push({ from: from.cardId, to: to.cardId, output: link.output, spec: link });
+        }
+        if (linkProblems.length) {
+          return { error: 'Nothing was written — some connections did not resolve',
+            problems: Array.from(new Set(linkProblems)) };
+        }
+
+        // Where the batch hangs off the existing flow, and how deep each new
+        // card sits below that. Cards with explicit coordinates keep them.
+        const incoming = new Map();
+        for (const link of resolvedLinks) {
+          if (!incoming.has(link.to)) incoming.set(link.to, []);
+          incoming.get(link.to).push(link.from);
+        }
+        const mine = new Set(newIds.values());
+        const depthOf = new Map();
+        const depth = (id, guard) => {
+          if (depthOf.has(id)) return depthOf.get(id);
+          if (guard.has(id)) return 0;              // a cycle: stop rather than recurse
+          guard.add(id);
+          let best = 0;
+          for (const parent of (incoming.get(id) || [])) {
+            const step = mine.has(parent) ? depth(parent, guard) + 1 : 1;
+            if (step > best) best = step;
+          }
+          depthOf.set(id, best);
+          return best;
+        };
+        for (const id of mine) depth(id, new Set());
+
+        const existing = Object.entries(draft.cards)
+          .filter(([id]) => id !== placeholderId)
+          .map(([, card]) => card);
+        const anchorX = existing.length ? Math.min(...existing.map(c => c.x || 0)) : 0;
+        const baseY = existing.length
+          ? Math.max(...existing.map(c => c.y || 0)) + CARD_ROW_GAP_Y
+          : CANVAS_TOP_MARGIN;
+        const nextY = new Map();
+
+        const added = [];
+        for (const [ref, entry] of refs) {
+          const id = newIds.get(ref);
+          const card = Object.assign({}, entry.card);
+          delete card.ref;
+          delete card.beside;
+
+          if (card.type === 'note') {
+            if (!card.color) card.color = 'yellow';
+            card.width = null;
+            card.height = null;
+          }
+
+          if (typeof card.x !== 'number' || typeof card.y !== 'number') {
+            const column = card.type === 'note' ? 0 : depthOf.get(id) || 0;
+            const x = anchorX + (column * CARD_GAP_X);
+            const y = nextY.has(column) ? nextY.get(column) : baseY;
+            card.x = x;
+            card.y = y;
+            nextY.set(column, y + this._siblingGapBelow(card));
+          }
+          draft.cards[id] = card;
+          added.push({ ref, cardId: id, type: card.type });
+        }
+
+        // Connections last, once every card exists
+        const outputProblems = [];
+        for (const link of resolvedLinks) {
+          const source = draft.cards[link.from];
+          const valid = this._resolveOutput(source, link.output);
+          if (valid.error) { outputProblems.push(link.spec.from + ' → ' + valid.error); continue; }
+          const list = Array.isArray(source[link.output]) ? source[link.output] : [];
+          if (!list.includes(link.to)) list.push(link.to);
+          source[link.output] = list;
+        }
+        if (outputProblems.length) {
+          return { error: 'Nothing was written — some connections name an output the source card '
+            + 'does not have', problems: Array.from(new Set(outputProblems)) };
+        }
+
+        const placeholder = this._dropPlaceholderStart(draft, placeholderId,
+          new Set(added.map(entry => entry.type)));
+
+        const result = {
+          added,
+          cardsAdded: added.length,
+          connectionsAdded: resolvedLinks.length,
+          removedPlaceholderStartCard: placeholder || undefined,
+          refs: Object.fromEntries(added.map(entry => [entry.ref, entry.cardId])),
+        };
+        if (added.some(entry => entry.type === 'note')) {
+          result.noteWarning = 'A note records only its position, so one added before the flow is '
+            + 'laid out is filed against a position that is about to move. Run relayout_flow and '
+            + 'check the notes landed where they belong.';
+        }
+        if (opts.relayout) {
+          const laidOut = this._layoutCards(draft.cards);
+          if (laidOut && !laidOut.error) result.relayout = laidOut;
+        } else {
+          result.layoutNote = 'Cards were placed below the existing flow in the order the batch '
+            + 'implies. Run relayout_flow to tidy the whole canvas.';
+        }
+        return result;
+      });
   }
 
   // ─── Tracing behaviour across flows ──────────────────────────────────────────
