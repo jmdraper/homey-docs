@@ -1127,7 +1127,25 @@ class HomeyDocsCompanion extends Homey.App {
         source[output] = (source[output] || []).concat([cardId]);
         linked = { from: anchorId, output };
       }
-      return { addedCardId: cardId, position: { x: newCard.x, y: newCard.y }, linkedFrom: linked };
+      const result = { addedCardId: cardId, position: { x: newCard.x, y: newCard.y }, linkedFrom: linked };
+
+      // A note's position is the only record of what it labels — Homey stores
+      // no anchor — so it can only be placed against where its anchor sits
+      // *now*. In a flow that has not been laid out, cards are still stacked in
+      // one column, so the note is filed against a meaningless position and
+      // relayout later reads it as heading whichever behaviour it happens to
+      // sit above. Cheap to detect: an unlaid flow has nearly every card at one x.
+      if (isNote && anchorId) {
+        const placed = Object.values(draft.cards).filter(c => c && c.type !== 'note');
+        const sharing = placed.filter(c => (c.x || 0) === (draft.cards[anchorId].x || 0));
+        if (placed.length > 2 && sharing.length > placed.length / 2) {
+          result.warning = 'This flow does not look laid out yet — most of its cards share '
+            + 'one column — so this note has been placed against a position that is about to '
+            + 'change. Call relayout_flow first, then add notes, or this one may end up '
+            + 'labelling the wrong section.';
+        }
+      }
+      return result;
     });
   }
 

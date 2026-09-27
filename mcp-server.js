@@ -216,7 +216,7 @@ const TOOLS = [
         flowId: { type: 'string' },
         card: {
           type: 'object',
-          description: 'The card: type (trigger/condition/action/all/any/delay/note), id (the full card id such as homey:device:<uuid>:on), ownerUri, and args. For a note, pass type \'note\' with a value (the text) and optionally a color — yellow, blue, green or red; notes are never connected, and `after` places one above the card it labels.',
+          description: 'The card: type (trigger/condition/action/all/any/delay/note), id (the full card id such as homey:device:<uuid>:on), ownerUri, and args. For a note, pass type \'note\' with a value (the text) and optionally a color — yellow, blue, green or red; notes are never connected, and `after` places one above the card it labels. Add notes LAST, after relayout_flow: a note records only its position, so one attached before the cards are laid out is filed against a position that then moves, and can end up labelling the wrong part of the flow.',
         },
         after: { type: 'string', description: 'Card id to place this one after and connect from' },
       },
