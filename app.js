@@ -337,6 +337,7 @@ class HomeyDocsCompanion extends Homey.App {
           stack: String((error && error.stack) || '').split('\n').slice(0, 12).join('\n'),
         };
         try { detail.uptimeSeconds = Math.round(process.uptime()); } catch (e) { /* optional */ }
+        try { detail.buildId = this._buildId(); } catch (e) { /* optional */ }
         // Synchronous: the process is about to go, and an awaited write would
         // not finish. Nor would a settings write.
         fs.writeFileSync(CRASH_FILE, JSON.stringify(detail, null, 1), 'utf8');
@@ -5021,8 +5022,21 @@ function copyPrompt(){
     result.buildId = this._buildId();
     result.startedAt = this._startedAt || null;
     result.uptimeSeconds = Math.round(process.uptime());
-    // Survives the restart it describes, unlike the app log
-    result.lastCrash = this._lastCrash();
+    // Survives the restart it describes, unlike the app log. A crash from an
+    // earlier build is history, not a current fault, so say which it is rather
+    // than leaving a stale entry looking like today's problem.
+    const crash = this._lastCrash();
+    if (crash) {
+      const ageHours = (Date.now() - new Date(crash.at).getTime()) / 3600000;
+      crash.hoursAgo = Math.round(ageHours * 10) / 10;
+      crash.fromThisBuild = crash.buildId === this._buildId();
+      if (!crash.fromThisBuild) {
+        crash.note = 'Recorded by a different build of the app'
+          + (crash.buildId ? ' (' + crash.buildId + ')' : '')
+          + ', so it does not describe the code running now.';
+      }
+    }
+    result.lastCrash = crash;
     result.mcpPort = this._mcpPort || null;
     result.tools = this._mcpServer ? this._mcpServer.toolNames() : 'MCP server not running';
     result.toolCount = Array.isArray(result.tools) ? result.tools.length : 0;
