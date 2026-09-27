@@ -642,6 +642,19 @@ Spotted while working; none blocking, all deferred deliberately.
   was reported indefinitely. Fixed — null now means "could not read", `[]` means
   "no variables".
 
+- **Three flows still drift under relayout.** Positioning reads the current
+  arrangement, so its output would position differently again. `_layoutCards` now
+  iterates until an arrangement repeats and keeps the flattest member of the cycle,
+  which settled 98 of 101 flows. `Patio lights`, `Computer states` and one other
+  never repeat within 64 passes — they drift rather than cycle, so they fall back to
+  the flattest arrangement seen, which is stable enough in practice but is not a
+  fixed point. The underlying cause is in `_positionCards`, not in the note handling.
+- **Reserving note space costs ~15% connector travel** on flows that have notes, and
+  nothing on flows that don't. Deliberate: the alternative is notes squeezed into
+  whatever gap the packing left, which is how they ended up attributed to the wrong
+  card. Worth revisiting if a smaller reservation can still win the nearest-card
+  comparison by `NOTE_ATTACH_MARGIN`.
+
 ### Deferred from step 3
 
 - **`trigger_tokens` has no viewer tab, deliberately.** It holds 93 entries, but its
