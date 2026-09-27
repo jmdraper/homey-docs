@@ -107,6 +107,22 @@ const NOTE_ATTACH_MARGIN = 20;
 const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
 const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
 
+// Which outputs each card type can actually drive. Taken from what the 5,003
+// cards on this Homey use, not from guesswork: a condition really does have an
+// outputError (16 cards use it), and an action really has no true/false branch.
+// Used to check explicit requests only — never to validate a whole draft, since
+// a flow written by hand is allowed to be odder than this.
+const OUTPUTS_BY_TYPE = {
+  trigger: ['outputSuccess'],
+  delay: ['outputSuccess'],
+  all: ['outputSuccess'],
+  any: ['outputSuccess'],
+  start: ['outputSuccess'],
+  condition: ['outputTrue', 'outputFalse', 'outputError'],
+  action: ['outputSuccess', 'outputError'],
+  note: [],
+};
+
 // Pre-edit copies live on disk; app settings hold only the index. Ten revisions
 // of a 213-card flow is far too much to keep in settings alongside the snapshot.
 const REVISION_DIR = '/userdata/revisions';
@@ -255,7 +271,8 @@ const FLOWBITS_FAMILIES = [
 class HomeyDocsCompanion extends Homey.App {
 
   async onInit() {
-    this.log('Homey Docs Companion initialising...');
+    this._startedAt = new Date().toISOString();
+    this.log('Homey Docs Companion ' + this.appVersion() + ' initialising...');
 
     this.snapshot = this.homey.settings.get('snapshot') || {
       flows: {}, variables: {}, devices: {}, zones: {},
@@ -772,6 +789,33 @@ class HomeyDocsCompanion extends Homey.App {
     return { error: `"${given}" matches ${matches.length} cards; use more characters` };
   }
 
+  // The output to connect from, given what the caller asked for and what the
+  // source card can drive. Defaulting silently to outputSuccess is what made a
+  // card added after a condition land on the true branch when the false one was
+  // meant, with nothing in the result to say so.
+  _resolveOutput(card, requested) {
+    const valid = OUTPUTS_BY_TYPE[card.type] || CARD_OUTPUTS;
+    if (!requested) {
+      if (!valid.length) return { error: 'a ' + card.type + ' card has no outputs to connect from' };
+      return { output: valid[0] };
+    }
+    if (!CARD_OUTPUTS.includes(requested)) {
+      return { error: 'output must be one of ' + CARD_OUTPUTS.join(', ') };
+    }
+    if (!valid.includes(requested)) {
+      const list = valid.length > 1
+        ? valid.slice(0, -1).join(', ') + ' or ' + valid[valid.length - 1]
+        : valid[0];
+      return { error: 'a ' + card.type + ' card has no ' + requested
+        + (valid.length ? '; it drives ' + list : ' — it has no outputs at all') };
+    }
+    return { output: requested };
+  }
+
+  appVersion() {
+    return (this.homey && this.homey.manifest && this.homey.manifest.version) || 'unknown';
+  }
+
   // ─── Request guards ──────────────────────────────────────────────────────────
 
   // Read through rather than cached. This was previously read once at startup,
@@ -1124,10 +1168,14 @@ class HomeyDocsCompanion extends Homey.App {
     return Math.min(CARD_GAP_Y + extra, CARD_GAP_Y_MAX);
   }
 
-  async addCard(flowId, card, after) {
+  async addCard(flowId, card, after, options) {
+    const opts = options || {};
     if (!card || typeof card !== 'object') return { error: 'card must be an object' };
     if (!CARD_TYPES.has(card.type)) {
       return { error: 'card.type must be one of ' + Array.from(CARD_TYPES).join(', ') };
+    }
+    if (opts.output && !after) {
+      return { error: 'output only means something with after — it names which output of that card to connect from' };
     }
 
     const ownerApp = String(card.ownerUri || '').match(/^homey:app:([^:]+)$/);
@@ -1271,9 +1319,10 @@ class HomeyDocsCompanion extends Homey.App {
       let linked = null;
       if (anchorId && !isNote) {
         const source = draft.cards[anchorId];
-        const output = source.type === 'condition' ? 'outputTrue' : 'outputSuccess';
-        source[output] = (source[output] || []).concat([cardId]);
-        linked = { from: anchorId, output };
+        const chosen = this._resolveOutput(source, opts.output);
+        if (chosen.error) return chosen;
+        source[chosen.output] = (source[chosen.output] || []).concat([cardId]);
+        linked = { from: anchorId, output: chosen.output, requested: opts.output || null };
       }
       result.addedCardId = cardId;
       result.position = { x: newCard.x, y: newCard.y };
@@ -1731,11 +1780,16 @@ class HomeyDocsCompanion extends Homey.App {
   // Zero is the whole point of holding space for them; a note that loses this
   // comparison is reported by get_flow_summary as annotating a neighbour, or
   // as belonging to no card at all.
+  // Returns the notes that would read as annotating a different card than the
+  // one they arrived on — as a list, not a count, because a bare number tells
+  // the caller a note has gone astray without telling them which one to look at.
   _notesMisattached(cards, noteAnchors) {
     const { attached } = this._noteAttachments(cards);
-    let wrong = 0;
+    const wrong = [];
     for (const [noteId, anchor] of Object.entries(noteAnchors)) {
-      if (attached[noteId] !== anchor.anchor) wrong++;
+      if (attached[noteId] !== anchor.anchor) {
+        wrong.push({ noteId, wanted: anchor.anchor, landedOn: attached[noteId] || null });
+      }
     }
     return wrong;
   }
@@ -1787,9 +1841,10 @@ class HomeyDocsCompanion extends Homey.App {
     // perfectly while the note now annotates a card the author never put it on.
     const original = anchorsFor(cards);
     const score = state => {
-      const wrong = this._notesMisattached(state, original);
+      const astray = this._notesMisattached(state, original);
       const overlaps = this._overlapCount(state);
-      return { wrong, overlaps, defects: wrong + overlaps, travel: this._flowTravel(state) };
+      return { wrong: astray.length, astray, overlaps,
+        defects: astray.length + overlaps, travel: this._flowTravel(state) };
     };
     // Two cards on top of each other and a note that has drifted onto the
     // wrong card are both defects a reader would notice, and neither is worth
@@ -1845,9 +1900,32 @@ class HomeyDocsCompanion extends Homey.App {
       if (!before[id]) continue;
       if (card.x !== before[id].x || card.y !== before[id].y) moved++;
     }
+    // Name them. A count on its own leaves the reader to find the stray note by
+    // eye across a canvas that has just moved wholesale, which is the one moment
+    // it is hardest to do.
+    const misplaced = best.astray.map(entry => {
+      const note = cards[entry.noteId];
+      const landedOn = entry.landedOn ? cards[entry.landedOn] : null;
+      return {
+        noteId: entry.noteId,
+        text: String((note && note.value) || '').replace(/\s+/g, ' ').trim(),
+        colour: (note && note.color) || null,
+        wasBeside: entry.wanted,
+        nowReadsAsLabelling: entry.landedOn
+          ? this._cardLabel(landedOn, this._cardTitles || {})
+          : 'nothing — it is too far from any card, so it now reads as a flow-level note',
+      };
+    });
+
     return Object.assign({
       independentBehaviours: null, widestBehaviour: null, notesMoved: null,
-    }, best.result, { cardsRepositioned: moved, notesMisplaced: best.wrong,
+    }, best.result, { cardsRepositioned: moved, notesMisplaced: misplaced.length,
+      misplacedNotes: misplaced.length ? misplaced : undefined,
+      misplacedNotesAdvice: misplaced.length
+        ? 'Each of these now sits nearest a different card than before, so get_flow_summary '
+          + 'will show it under that one. Move or re-add them with add_flow_note, naming the '
+          + 'card each belongs to.'
+        : undefined,
       arrangementsTried: seen.size });
   }
 
@@ -1980,20 +2058,36 @@ class HomeyDocsCompanion extends Homey.App {
       draft => this._layoutCards(draft.cards));
   }
 
-  async createAdvancedFlow(name, folder) {
+  async createAdvancedFlow(name, folder, options) {
+    const opts = options || {};
     if (!this._writesEnabled()) {
       return { error: 'Editing is turned off. Enable "Allow AI assistants to edit flows" in the app settings first.' };
     }
     if (!name || typeof name !== 'string' || !name.trim()) return { error: 'name is required' };
 
     // Homey rejects a flow with no cards ("Advanced Flow is empty, add at least
-    // one Flow card"), so seed a start card: the minimal valid flow, and one
-    // that cannot fire on its own. Created disabled as well.
-    const startCardId = crypto.randomUUID();
+    // one Flow card"), so by default seed a start card: the minimal valid flow,
+    // and one that cannot fire on its own. It is a real card, though, and it
+    // stays on the canvas until something removes it — which surprises anyone
+    // who asked for an empty flow — so it can now be declined. Created disabled
+    // either way.
+    // Homey refuses to create a flow with no cards at all — "Advanced Flow is
+    // empty, add at least one Flow card" — so declining the placeholder only
+    // makes sense when the caller is supplying the real cards in the same call.
+    const withStartCard = opts.withStartCard !== false;
+    if (!withStartCard) {
+      return { error: 'Homey will not create a flow with no cards ("Advanced Flow is empty, '
+        + 'add at least one Flow card"), so withStartCard: false is only possible when the '
+        + 'flow is created with its real cards. Either leave the placeholder in and remove it '
+        + 'once the flow has a trigger, or build the flow with apply_cards / copy_cards.' };
+    }
+    const startCardId = withStartCard ? crypto.randomUUID() : null;
     const body = {
       name: name.trim(),
       enabled: false,
-      cards: { [startCardId]: { type: 'start', x: 0, y: 0, outputSuccess: [] } }
+      cards: withStartCard
+        ? { [startCardId]: { type: 'start', x: 0, y: 0, outputSuccess: [] } }
+        : {}
     };
     if (folder) body.folder = folder;
 
@@ -2007,8 +2101,13 @@ class HomeyDocsCompanion extends Homey.App {
     if (flowId) await this._resyncFlow(flowId);
     return {
       ok: true, flowId, flow: body.name, enabled: false, startCardId,
-      note: 'Created disabled, containing only a start card. Add cards with add_card '
-        + '(pass after: startCardId to chain from it), then enable it.'
+      note: withStartCard
+        ? 'Created disabled, containing one placeholder start card — that card is why the '
+          + 'flow is not empty. Build it with apply_cards or copy_cards, or add_card one at a '
+          + 'time (pass after: startCardId to chain from it), then enable it. Remove the start '
+          + 'card once something else triggers the flow.'
+        : 'Created disabled and empty. Add cards before anything else reads it: Homey will not '
+          + 'hold a flow with no cards, so an empty flow may not survive.'
     };
   }
 
@@ -3389,6 +3488,17 @@ function copyPrompt(){
 
   async getDiagnostics() {
     const result = { errors: [] };
+    // First, because this is what identifies the build answering the call. A
+    // client that connected before a restart keeps serving whatever tool list
+    // it cached then — in the 27 Sep session Claude Desktop presented
+    // get_changelog and list_folders while search_flows and get_flow_summary
+    // were missing, and only a restart fixed it. Comparing the tools listed
+    // here against the ones the client is offering identifies that at once.
+    result.appVersion = this.appVersion();
+    result.startedAt = this._startedAt || null;
+    result.mcpPort = this._mcpPort || null;
+    result.tools = this._mcpServer ? this._mcpServer.toolNames() : 'MCP server not running';
+    result.toolCount = Array.isArray(result.tools) ? result.tools.length : 0;
     result.localUrl = this._baseUrl || 'not set';
     result.tokenOk = typeof this._token === 'string' && this._token.length > 0;
     result.snapshot = {

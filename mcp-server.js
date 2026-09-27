@@ -131,12 +131,13 @@ const TOOLS = [
   },
   {
     name: 'get_logs',
-    description: 'Fetch log entries from the Simple (Sys) Log app. Returns entries newest-first. Each entry has: id, timestamp (ISO 8601), severity, app, message.',
+    description: 'Fetch log entries from the Simple (Sys) Log app. Returns entries newest-first. Each entry has: id, timestamp (ISO 8601), severity, app, message. To read a window that has since scrolled past, give both since and until — with only since, the newest `limit` entries come back, which for a window hours ago is everything except the window.',
     inputSchema: {
       type: 'object',
       properties: {
         search: { type: 'string', description: 'Case-insensitive substring filter applied to the message field.' },
         since: { type: 'string', description: 'ISO 8601 datetime — only return entries at or after this timestamp.' },
+        until: { type: 'string', description: 'ISO 8601 datetime — only return entries at or before this timestamp. Pair it with since to bound a window; the limit then applies inside the window rather than to the whole log.' },
         limit: { type: 'integer', description: 'Maximum number of entries to return. Default 100, max 1000.' },
       },
     },
@@ -277,6 +278,16 @@ const TOOLS = [
           description: 'The card: type (trigger/condition/action/all/any/delay/note), id (the full card id such as homey:device:<uuid>:on), ownerUri, and args. For a note, pass type \'note\' with a value (the text) and optionally a color — yellow, blue, green or red; notes are never connected, and `after` places one above the card it labels. Add notes LAST, after relayout_flow: a note records only its position, so one attached before the cards are laid out is filed against a position that then moves, and can end up labelling the wrong part of the flow.',
         },
         after: { type: 'string', description: 'Card id to place this one after and connect from' },
+        output: {
+          type: 'string',
+          enum: ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'],
+          description: 'Which output of `after` to connect from. Defaults to outputTrue for a '
+            + 'condition and outputSuccess for everything else, which is why a card added after '
+            + 'a condition used to be unreachable on the false branch. Valid outputs by card '
+            + 'type: trigger, delay, all, any, start — outputSuccess only; condition — '
+            + 'outputTrue, outputFalse, outputError; action — outputSuccess, outputError. '
+            + 'Notes have none and are never connected.',
+        },
       },
       required: ['flowId', 'card'],
     },
@@ -324,12 +335,23 @@ const TOOLS = [
   },
   {
     name: 'create_advanced_flow',
-    description: 'Create an empty advanced flow. It is created disabled; add cards with add_card, then enable it with set_flow_enabled.',
+    description: 'Create an advanced flow, disabled. Homey rejects a flow with no cards, so by '
+      + 'default it is seeded with one start card — harmless, since a start card cannot fire on '
+      + 'its own, but it is a real card that stays until removed, and it is why a newly created '
+      + 'flow is not empty. Pass withStartCard: false to skip it, in which case add the first '
+      + 'card immediately: Homey refuses to hold a flow with no cards at all. Enable it with '
+      + 'set_flow_enabled once it is built.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string' },
         folder: { type: 'string', description: 'Folder id from list_folders' },
+        withStartCard: {
+          type: 'boolean',
+          description: 'Seed a placeholder start card so the flow is valid on creation. Default '
+            + 'true, and false is refused on its own — Homey will not hold a flow with no cards, '
+            + 'so the only way to skip the placeholder is to create the flow with its real cards.',
+        },
       },
       required: ['name'],
     },
@@ -578,7 +600,7 @@ class HomeyMcpServer {
             result: {
               protocolVersion: params.protocolVersion || '2024-11-05',
               capabilities: { tools: {} },
-              serverInfo: { name: 'homey-mcp', version: '1.0.0' }
+              serverInfo: { name: 'homey-mcp', version: this._app.appVersion() }
             }
           };
 
@@ -705,12 +727,47 @@ class HomeyMcpServer {
           return this._text(app.getFlowsMetadata());
 
         case 'get_logs': {
+          // An unparseable date silently matches nothing, which reads as "the
+          // log is empty for that window" — say so instead.
+          const bound = (name, value) => {
+            if (value === undefined || value === null || value === '') return null;
+            const at = new Date(value);
+            if (Number.isNaN(at.getTime())) {
+              throw new Error(`${name} is not a valid ISO 8601 datetime: ${JSON.stringify(value)}`);
+            }
+            return at;
+          };
+          const since = bound('since', args.since);
+          const until = bound('until', args.until);
+          if (since && until && since > until) {
+            throw new Error('since is later than until, so the window is empty');
+          }
+
           const data = await app._apiGet('/app/nl.nielsdeklerk.log/');
           let logs = (data && data.logs) || [];
-          if (args.since) { const d = new Date(args.since); logs = logs.filter(e => new Date(e.timestamp) >= d); }
+          const held = logs.length;
+          const oldestHeld = logs.length ? logs[logs.length - 1].timestamp : null;
+          if (since) logs = logs.filter(e => new Date(e.timestamp) >= since);
+          if (until) logs = logs.filter(e => new Date(e.timestamp) <= until);
           if (args.search) { const n = args.search.toLowerCase(); logs = logs.filter(e => e.message.toLowerCase().includes(n)); }
           const limit = Math.min(args.limit || 100, 1000);
-          return this._text({ count: logs.length, logs: logs.slice(0, limit) });
+
+          const result = { count: logs.length, returned: Math.min(logs.length, limit) };
+          // Entries are newest-first, so the limit drops the OLDEST matches.
+          // Without saying so, a truncated window reads as a complete one.
+          if (logs.length > limit) {
+            result.truncated = `${logs.length} entries matched; the newest ${limit} are `
+              + 'returned and the older ones dropped. Narrow the window or raise limit.';
+          }
+          // Simple Log keeps a rolling buffer. A window that starts before the
+          // oldest entry it still holds is not empty because nothing happened.
+          if (since && oldestHeld && new Date(oldestHeld) > since) {
+            result.beforeRetention = `Simple Log holds ${held} entries going back only to `
+              + `${oldestHeld}, which is after the requested since. Anything earlier has `
+              + 'already been discarded.';
+          }
+          result.logs = logs.slice(0, limit);
+          return this._text(result);
         }
 
         case 'list_apps':
@@ -750,7 +807,9 @@ class HomeyMcpServer {
           return this._text(await app.updateCardArgs(args.flowId, args.cardId, args.args, args.replace));
 
         case 'add_card':
-          return this._text(await app.addCard(args.flowId, args.card, args.after));
+          return this._text(await app.addCard(args.flowId, args.card, args.after, {
+            output: args.output, requestId: args.requestId,
+          }));
 
         case 'remove_card':
           return this._text(await app.removeCard(args.flowId, args.cardId, args.confirm));
@@ -762,7 +821,9 @@ class HomeyMcpServer {
           return this._text(await app.relayoutFlow(args.flowId));
 
         case 'create_advanced_flow':
-          return this._text(await app.createAdvancedFlow(args.name, args.folder));
+          return this._text(await app.createAdvancedFlow(args.name, args.folder, {
+            withStartCard: args.withStartCard,
+          }));
 
         case 'get_diagnostics':
           return this._text(await app.getDiagnostics());
@@ -782,6 +843,15 @@ class HomeyMcpServer {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
     }
   }
+
+  // The tools this build exposes. get_diagnostics reports these: a client
+  // holding a stale connection presents whatever tool list it cached at
+  // startup, and comparing the two is the only way to see that from inside a
+  // conversation.
+  toolNames() {
+    return TOOLS.map(tool => tool.name).sort();
+  }
 }
 
 module.exports = HomeyMcpServer;
+module.exports.TOOLS = TOOLS;
