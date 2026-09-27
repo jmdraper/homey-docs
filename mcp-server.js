@@ -559,6 +559,10 @@ const TCP_KEEPALIVE_MS = 30000;
 // stall could only be diagnosed by reproducing it.
 const CALL_LOG_LIMIT = 40;
 
+// Session ids are remembered, not verified, so the set is capped. Oldest out
+// first; a real client re-presents its id on the next call and is re-adopted.
+const MAX_STREAMABLE_SESSIONS = 200;
+
 class HomeyMcpServer {
   constructor(app) {
     this._app = app;
@@ -569,6 +573,20 @@ class HomeyMcpServer {
     this._calls = [];
     this._callsStarted = 0;
     this._responsesLost = [];   // tool responses that had nowhere to go
+    this._sessionsAdopted = 0;
+  }
+
+  // Sessions carry no state, so the only cost of remembering one is the id.
+  // Bounded anyway, so that a caller inventing ids cannot grow it without end.
+  _adoptSession(sessionId) {
+    this._streamableSessions.add(sessionId);
+    this._sessionsAdopted += 1;
+    this._app.log('Adopted MCP session', sessionId,
+      '— unknown to this process, so the app has restarted since the client connected');
+    while (this._streamableSessions.size > MAX_STREAMABLE_SESSIONS) {
+      const oldest = this._streamableSessions.values().next().value;
+      this._streamableSessions.delete(oldest);
+    }
   }
 
   // Every successful write to a stream, keepalive or response, is recorded. The
@@ -690,11 +708,23 @@ class HomeyMcpServer {
       const messages = Array.isArray(body) ? body : [body];
       const isInitialize = messages.some(m => m.method === 'initialize');
 
-      // Reject non-initialize requests with unknown session IDs
+      // An unknown session id is adopted rather than refused.
+      //
+      // The spec allows a server to answer 404 so the client re-initialises,
+      // and that is what this did. It cost four minutes every time the app
+      // restarted. mcp-remote does not re-initialise on a 404: it logs
+      // "Session not found" to its own stderr and returns nothing to the
+      // client, which then waits out its request timeout — measured at exactly
+      // 240s, four times, on 27 Sep 2026. Both incidents that day were this,
+      // and the stale tool list was the same stale process.
+      //
+      // Refusing buys nothing, because a session here holds no state: the set
+      // is only a record of which ids have been seen. So take the id at its
+      // word and carry on. Developing this app means restarting it constantly,
+      // and a restart is now invisible to the client instead of costing four
+      // minutes and a Claude Desktop restart.
       if (!isInitialize && incomingSessionId && !this._streamableSessions.has(incomingSessionId)) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(this._sessionGone(incomingSessionId)));
-        return;
+        this._adoptSession(incomingSessionId);
       }
 
       const responses = [];
@@ -1240,6 +1270,7 @@ class HomeyMcpServer {
           ? (now - session.lastWriteMs) < (SSE_KEEPALIVE_MS * 2)
           : true,
       })),
+      sessionsAdopted: this._sessionsAdopted,
       responsesLost: this._responsesLost.length,
       responsesLostDetail: this._responsesLost.length ? this._responsesLost : undefined,
       recent: this._calls,
