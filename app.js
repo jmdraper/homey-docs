@@ -128,6 +128,18 @@ const OUTPUTS_BY_TYPE = {
 const REVISION_DIR = '/userdata/revisions';
 const DEFAULT_REVISION_DEPTH = 10;
 
+// How long a write may take before the caller is told rather than left waiting.
+// The work is not cancelled — an HTTP PUT already sent cannot be recalled — so
+// the answer says which phase it reached and whether Homey has the change.
+// Measured: a write on the largest flow here costs about 0.6s, and the slowest
+// seen across a 70-card build was 3.1s, so 30s is far outside normal.
+const WRITE_TIMEOUT_MS = 30000;
+
+// How long a requestId can be replayed for. Long enough to cover a client
+// reconnecting and retrying, short enough that a genuinely new call reusing an
+// old id is not silently answered with a stale result.
+const REQUEST_REPLAY_MS = 10 * 60 * 1000;
+
 // Rebuilding the cross-reference page walks every card in every flow and
 // writes a page of a couple of hundred kilobytes into settings. That is fine
 // once, but a burst of writes — building a flow card by card makes dozens —
@@ -962,16 +974,159 @@ class HomeyDocsCompanion extends Homey.App {
     }).sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  // Writes to one flow run one at a time. Every write is a read-modify-write of
+  // the whole card graph, so two overlapping calls both read the same state and
+  // both PUT it — and the second silently discards the first. Nothing reports
+  // that; cards simply go missing. Queueing per flow costs nothing (writes take
+  // under a second) and removes the failure entirely. Different flows still run
+  // in parallel.
+  _queueFlowWrite(flowId, work) {
+    if (!this._flowWrites) this._flowWrites = new Map();
+    const previous = this._flowWrites.get(flowId) || Promise.resolve();
+    const queued = previous.then(work, work);
+    // The chain must not break on a rejection, or every later write to this
+    // flow inherits it
+    const settled = queued.then(() => {}, () => {});
+    this._flowWrites.set(flowId, settled);
+    settled.then(() => {
+      if (this._flowWrites.get(flowId) === settled) this._flowWrites.delete(flowId);
+    });
+    return queued;
+  }
+
+  // Answer the caller within WRITE_TIMEOUT_MS whatever happens. The work keeps
+  // running — an HTTP PUT cannot be unsent, and abandoning it midway would leave
+  // our caches describing a state Homey does not have — so the timeout is a
+  // report, not a cancellation. What the caller needs to know is whether Homey
+  // has already been told, which is the difference between "retry" and "check
+  // first", and that is what `phase` carries.
+  //
+  // Before this, nothing bounded a tool call at all: the per-request socket
+  // timeout covers one HTTP round trip, and a call makes several with file and
+  // settings writes between them.
+  async _answerWithin(phase, work) {
+    let timer = null;
+    const expired = Symbol('expired');
+    const timeout = new Promise(resolve => {
+      timer = setTimeout(() => resolve(expired), WRITE_TIMEOUT_MS);
+      if (timer.unref) timer.unref();
+    });
+
+    const result = await Promise.race([work, timeout]);
+    clearTimeout(timer);
+    if (result !== expired) return result;
+
+    // Saying "nothing was written" is only honest if the write is also stopped.
+    // Everything up to the PUT is local work, so a timeout that arrives before
+    // it abandons the call outright — set here, checked in the one synchronous
+    // breath before the PUT goes out, so there is no window where both sides
+    // think the other is handling it. Once the PUT is away it cannot be
+    // recalled, and the answer says so instead.
+    const wasQueued = phase.name === 'queued';
+    if (!phase.putSent) phase.abandoned = true;
+
+    const seconds = Math.round(WRITE_TIMEOUT_MS / 1000);
+    const common = {
+      timedOut: true, afterSeconds: seconds, phase: phase.name,
+      putSent: phase.putSent, putSentAt: phase.putAt,
+    };
+    if (phase.putSent) {
+      return Object.assign({ error: 'Timed out after ' + seconds + 's waiting for Homey to '
+        + 'acknowledge the write. The PUT was sent at ' + phase.putAt + ', so Homey may well '
+        + 'have applied it. Do not retry blind — read the flow back and check. A revision was '
+        + 'saved before the write, so revert_flow undoes it either way.' }, common);
+    }
+    if (wasQueued) {
+      return Object.assign({ error: 'Timed out after ' + seconds + 's still queued behind '
+        + 'earlier writes to this flow. This call has been abandoned and wrote nothing, so it '
+        + 'is safe to retry — but something is holding that queue, so find out what before '
+        + 'retrying or this will queue behind it too.' }, common);
+    }
+    return Object.assign({ error: 'Timed out after ' + seconds + 's during "' + phase.name
+      + '". The call has been abandoned before anything was sent to Homey, so nothing was '
+      + 'written and this is safe to retry.' }, common);
+  }
+
+  // A repeated requestId returns the first call's result instead of doing the
+  // work again. The point is a retry after a timeout or a dropped connection:
+  // without it, the only safe response to "did that add_card land?" is to read
+  // the flow back and compare, and the unsafe response is to call it again and
+  // end up with two cards.
+  //
+  // A plain failure is not remembered — it wrote nothing, so a retry should
+  // really retry. A timeout is, because the original work is still running and
+  // the retry should wait for it and report what it did.
+  _replayable(result) {
+    if (!result || typeof result !== 'object') return true;
+    // Remember a failure only when Homey may already have the change. Anything
+    // that demonstrably wrote nothing should be genuinely retried, not answered
+    // with a stale copy of its own failure.
+    if (result.error) return !!result.putSent;
+    return true;
+  }
+
+  async _idempotent(requestId, work) {
+    if (!requestId) return work();
+    const id = String(requestId);
+    if (!this._requests) this._requests = new Map();
+
+    const cutoff = Date.now() - REQUEST_REPLAY_MS;
+    for (const [key, entry] of this._requests) {
+      if (entry.startedMs < cutoff) this._requests.delete(key);
+    }
+
+    const existing = this._requests.get(id);
+    if (existing) {
+      const result = await existing.promise;
+      this.log('requestId ' + id + ' replayed rather than repeated');
+      return Object.assign({}, result, {
+        replayed: true, requestId: id, originallyRanAt: existing.at,
+        replayNote: 'This is the result of the earlier call with the same requestId, not a '
+          + 'second write. Nothing was written again.',
+      });
+    }
+
+    const entry = { at: new Date().toISOString(), startedMs: Date.now() };
+    entry.promise = Promise.resolve().then(work).then(result => {
+      if (!this._replayable(result)) this._requests.delete(id);
+      return result;
+    }, error => {
+      this._requests.delete(id);
+      throw error;
+    });
+    this._requests.set(id, entry);
+    const result = await entry.promise;
+    return Object.assign({}, result, { requestId: id });
+  }
+
   // Every write goes through here: gate, read the live flow, keep a copy,
   // mutate a draft, validate, PUT, then bring our own caches back in line.
   // Reading live rather than from the snapshot matters — the snapshot can be
   // five minutes old, and writing from it would silently revert a change made
   // in the flow editor in the meantime.
-  async _mutateAdvancedFlow(flowId, describe, mutate) {
+  async _mutateAdvancedFlow(flowId, describe, mutate, options) {
     if (!this._writesEnabled()) {
       return { error: 'Editing is turned off. Enable "Allow AI assistants to edit flows" in the app settings first.' };
     }
     if (!flowId) return { error: 'flowId is required' };
+
+    const phase = { name: 'queued', putSent: false, putAt: null };
+    const work = this._queueFlowWrite(flowId,
+      () => this._writeAdvancedFlow(flowId, describe, mutate, phase, options || {}));
+    // Never leave an unhandled rejection behind when the timeout answers first
+    work.catch(e => this.error('Write to ' + flowId + ' failed after the caller was answered:', e.message));
+    return this._answerWithin(phase, work);
+  }
+
+  _abandoned(phase, where) {
+    return { error: 'Abandoned while ' + where + ': the caller had already been told this call '
+      + 'timed out. Nothing was written.', abandoned: true, timedOut: true, putSent: false };
+  }
+
+  async _writeAdvancedFlow(flowId, describe, mutate, phase, options) {
+    const startedMs = Date.now();
+    if (phase.abandoned) return this._abandoned(phase, 'still queued');
+    phase.name = 'reading the flow';
 
     let flow;
     try {
@@ -985,6 +1140,7 @@ class HomeyDocsCompanion extends Homey.App {
 
     const draft = JSON.parse(JSON.stringify(flow));
     let outcome;
+    phase.name = 'applying the edit';
     try {
       outcome = await mutate(draft);
     } catch (e) {
@@ -992,7 +1148,20 @@ class HomeyDocsCompanion extends Homey.App {
     }
     if (outcome && outcome.error) return outcome;
 
+    // An edit that changes nothing still cost a revision and a PUT, which is
+    // how a retry of something that had already worked looked identical to a
+    // fresh write. Say so instead, and touch nothing.
+    if (outcome && outcome.noChange) {
+      const { noChange, ...rest } = outcome;
+      return Object.assign({
+        ok: true, flowId, flow: draft.name,
+        changed: 'nothing — the flow was already in this state',
+        wrote: false,
+      }, rest);
+    }
+
     this._syncAllInputs(draft.cards);
+    phase.name = 'validating';
     const problems = this._validateCards(draft.cards);
     if (problems.length) {
       return { error: 'Refusing to write — the result would be a broken flow', problems };
@@ -1002,6 +1171,7 @@ class HomeyDocsCompanion extends Homey.App {
     // a rejected edit still consumed a revision, pushing the one worth keeping
     // down the stack — so a revert after a failed call restored the state the
     // failure had left, not the state before the last real change.
+    phase.name = 'saving a revision';
     const revision = await this._saveRevision(flowId, flow);
 
     const body = {};
@@ -1009,19 +1179,31 @@ class HomeyDocsCompanion extends Homey.App {
       if (draft[field] !== undefined) body[field] = draft[field];
     }
 
+    // The atomic point. Nothing may await between the check and setting
+    // putSent, or a timeout landing in the gap would be told nothing was sent
+    // while the PUT went out anyway.
+    if (phase.abandoned) return this._abandoned(phase, 'about to write');
+    phase.name = 'writing to Homey';
+    phase.putSent = true;
+    phase.putAt = new Date().toISOString();
     try {
       await this._apiRequest('PUT', '/manager/flow/advancedflow/' + flowId, body);
     } catch (e) {
-      return { error: this._explainWriteFailure(e) };
+      return { error: this._explainWriteFailure(e), putSent: true, putSentAt: phase.putAt };
     }
 
+    phase.name = 'refreshing our own caches';
     await this._resyncFlow(flowId);
+    phase.name = 'done';
     return Object.assign({
       ok: true,
       flowId,
       flow: draft.name,
       changed: describe,
+      wrote: true,
       revisionSaved: revision.ts,
+      revisionMergedWrites: revision.writes > 1 ? revision.writes : undefined,
+      tookMs: Date.now() - startedMs,
       revertWith: 'revert_flow'
     }, outcome || {});
   }
@@ -1118,16 +1300,30 @@ class HomeyDocsCompanion extends Homey.App {
       if (to.error) return to;
 
       const card = draft.cards[from.cardId];
+      const valid = this._resolveOutput(card, output);
+      if (valid.error) return valid;
+
       const links = Array.isArray(card[output]) ? card[output] : [];
-      if (join) {
-        if (!links.includes(to.cardId)) links.push(to.cardId);
-      } else {
-        const index = links.indexOf(to.cardId);
-        if (index === -1) return { error: 'those cards are not connected on ' + output };
-        links.splice(index, 1);
+      const already = links.includes(to.cardId);
+      const common = { from: from.cardId, output, to: to.cardId, connected: join };
+
+      // Both directions report the no-op rather than hiding it. Connecting was
+      // silently successful whether or not it did anything, so a retry after a
+      // dropped response looked exactly like the first call and there was no
+      // way to tell the two apart. Disconnecting an absent link was an error,
+      // which made the same retry look like a failure. Neither told the truth:
+      // the flow is in the state that was asked for, and nothing was written.
+      if (join && already) {
+        return Object.assign({ noChange: true, alreadyConnected: true }, common);
       }
+      if (!join && !already) {
+        return Object.assign({ noChange: true, alreadyDisconnected: true }, common);
+      }
+
+      if (join) links.push(to.cardId);
+      else links.splice(links.indexOf(to.cardId), 1);
       card[output] = links;
-      return { from: from.cardId, output, to: to.cardId, connected: join };
+      return Object.assign({ alreadyConnected: false }, common);
     });
   }
 
@@ -1170,6 +1366,10 @@ class HomeyDocsCompanion extends Homey.App {
 
   async addCard(flowId, card, after, options) {
     const opts = options || {};
+    if (opts.requestId) {
+      return this._idempotent(opts.requestId,
+        () => this.addCard(flowId, card, after, Object.assign({}, opts, { requestId: null })));
+    }
     if (!card || typeof card !== 'object') return { error: 'card must be an object' };
     if (!CARD_TYPES.has(card.type)) {
       return { error: 'card.type must be one of ' + Array.from(CARD_TYPES).join(', ') };
@@ -3499,6 +3699,9 @@ function copyPrompt(){
     result.mcpPort = this._mcpPort || null;
     result.tools = this._mcpServer ? this._mcpServer.toolNames() : 'MCP server not running';
     result.toolCount = Array.isArray(result.tools) ? result.tools.length : 0;
+    result.mcp = this._mcpServer ? this._mcpServer.recentCalls() : null;
+    result.writesQueued = this._flowWrites ? this._flowWrites.size : 0;
+    result.replayableRequestIds = this._requests ? this._requests.size : 0;
     result.localUrl = this._baseUrl || 'not set';
     result.tokenOk = typeof this._token === 'string' && this._token.length > 0;
     result.snapshot = {

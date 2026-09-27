@@ -288,6 +288,13 @@ const TOOLS = [
             + 'outputTrue, outputFalse, outputError; action — outputSuccess, outputError. '
             + 'Notes have none and are never connected.',
         },
+        requestId: {
+          type: 'string',
+          description: 'An idempotency key of your choosing. Repeating a call with the same '
+            + 'requestId within ten minutes returns the first call\'s result instead of adding '
+            + 'a second card — so a retry after a timeout or a dropped connection is safe. Use '
+            + 'a fresh id for every card you actually mean to add.',
+        },
       },
       required: ['flowId', 'card'],
     },
@@ -309,7 +316,11 @@ const TOOLS = [
   },
   {
     name: 'connect_cards',
-    description: 'Connect or disconnect two cards. The output is outputTrue/outputFalse for conditions, or outputSuccess/outputError for actions.',
+    description: 'Connect or disconnect two cards. Valid outputs by card type: trigger, delay, '
+      + 'all, any, start — outputSuccess only; condition — outputTrue, outputFalse, outputError; '
+      + 'action — outputSuccess, outputError. Safe to retry: a connection that already exists '
+      + 'comes back as alreadyConnected with wrote: false and nothing written, and disconnecting '
+      + 'something already disconnected reports alreadyDisconnected rather than failing.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -388,12 +399,27 @@ const TOOLS = [
   },
 ];
 
+// An idle SSE connection dies silently at a router or NAT: the socket is gone,
+// but neither end is told, so the server writes a response into nothing and the
+// client waits for ever. Nothing in the protocol detects it and nothing here
+// timed out. A comment line every 20s keeps the path warm and surfaces the
+// failure as a write error on this side, which is what closes the session.
+const SSE_KEEPALIVE_MS = 20000;
+
+// Keep the last few calls so get_diagnostics can show what the server was
+// doing. There was no record of a tool call at all, which is why the 27 Sep
+// stall could only be diagnosed by reproducing it.
+const CALL_LOG_LIMIT = 40;
+
 class HomeyMcpServer {
   constructor(app) {
     this._app = app;
     this._server = null;
-    this._sessions = new Map();          // SSE transport: sessionId -> response stream
+    this._sessions = new Map();          // SSE transport: sessionId -> { res, keepalive }
     this._streamableSessions = new Set(); // Streamable HTTP transport: active session IDs
+    this._startedAt = new Date().toISOString();
+    this._calls = [];
+    this._callsStarted = 0;
   }
 
   start(port) {
@@ -419,10 +445,18 @@ class HomeyMcpServer {
   }
 
   stop() {
+    for (const session of this._sessions.values()) this._endSse(session);
+    this._sessions.clear();
     return new Promise(resolve => {
       if (this._server) this._server.close(resolve);
       else resolve();
     });
+  }
+
+  _endSse(session) {
+    if (session.keepalive) this._app.homey.clearInterval(session.keepalive);
+    session.keepalive = null;
+    try { session.res.end(); } catch (e) { /* already gone */ }
   }
 
   async _handleHttp(req, res) {
@@ -466,7 +500,7 @@ class HomeyMcpServer {
       // Reject non-initialize requests with unknown session IDs
       if (!isInitialize && incomingSessionId && !this._streamableSessions.has(incomingSessionId)) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Session not found' }));
+        res.end(JSON.stringify(this._sessionGone(incomingSessionId)));
         return;
       }
 
@@ -526,8 +560,31 @@ class HomeyMcpServer {
         'Connection': 'keep-alive',
       });
 
-      this._sessions.set(sessionId, res);
-      req.on('close', () => this._sessions.delete(sessionId));
+      const session = { res, keepalive: null, openedAt: new Date().toISOString() };
+      session.keepalive = this._app.homey.setInterval(() => {
+        // A comment line: valid SSE, ignored by every client, and the write
+        // fails once the socket is actually dead — which is the only way this
+        // side ever finds out.
+        try {
+          res.write(': keepalive\n\n');
+        } catch (e) {
+          this._app.log('SSE session', sessionId, 'is dead, closing:', e.message);
+          this._endSse(session);
+          this._sessions.delete(sessionId);
+        }
+      }, SSE_KEEPALIVE_MS);
+
+      this._sessions.set(sessionId, session);
+      const close = () => {
+        if (!this._sessions.has(sessionId)) return;
+        this._endSse(session);
+        this._sessions.delete(sessionId);
+        this._app.log('SSE session closed:', sessionId, '—', this._sessions.size, 'open');
+      };
+      req.on('close', close);
+      res.on('error', err => { this._app.log('SSE write failed:', err.message); close(); });
+
+      this._app.log('SSE session opened:', sessionId, '—', this._sessions.size, 'open');
 
       // Send absolute URL — the MCP spec requires this, relative paths confuse some clients
       const host = req.headers.host || `localhost:${this._server.address().port}`;
@@ -538,13 +595,14 @@ class HomeyMcpServer {
     // Message endpoint — client POSTs JSON-RPC requests here
     if (req.method === 'POST' && url.pathname === '/message') {
       const sessionId = url.searchParams.get('sessionId');
-      const sseStream = sessionId ? this._sessions.get(sessionId) : null;
+      const session = sessionId ? this._sessions.get(sessionId) : null;
 
-      if (!sseStream) {
+      if (!session) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Session not found' }));
+        res.end(JSON.stringify(this._sessionGone(sessionId)));
         return;
       }
+      const sseStream = session.res;
 
       let body;
       try {
@@ -628,6 +686,30 @@ class HomeyMcpServer {
   }
 
   async _callTool(name, args) {
+    const startedMs = Date.now();
+    this._callsStarted += 1;
+    if (!this._inFlight) this._inFlight = new Set();
+    const tag = name + '#' + this._callsStarted;
+    this._inFlight.add(tag);
+    try {
+      const result = await this._runTool(name, args);
+      const failed = !!(result && result.isError);
+      this._recordCall(name, startedMs, failed ? 'error' : 'ok');
+      // Only the slow ones, or the log becomes noise. Nothing here took longer
+      // than about a second in testing, so anything at 5s is worth seeing.
+      const took = Date.now() - startedMs;
+      if (took > 5000) this._app.log('Slow MCP call:', name, took + 'ms');
+      return result;
+    } catch (err) {
+      this._recordCall(name, startedMs, 'threw: ' + err.message);
+      this._app.error('MCP call', name, 'threw after', (Date.now() - startedMs) + 'ms:', err.message);
+      throw err;
+    } finally {
+      this._inFlight.delete(tag);
+    }
+  }
+
+  async _runTool(name, args) {
     const app = this._app;
 
     try {
@@ -842,6 +924,46 @@ class HomeyMcpServer {
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
     }
+  }
+
+  // Sessions live in memory only, so an app restart invalidates every one of
+  // them. Answering with a bare "Session not found" told the client nothing
+  // about why, and reconnecting is the fix — which is what a restart of the
+  // client turns out to do.
+  _sessionGone(sessionId) {
+    this._app.log('Rejected a request for unknown MCP session', sessionId,
+      '— server started', this._startedAt);
+    return {
+      error: 'Session not found',
+      sessionId: sessionId || null,
+      serverStartedAt: this._startedAt,
+      detail: 'MCP sessions are held in memory, so they do not survive a restart of the '
+        + 'Homey Docs Companion app. This server started at ' + this._startedAt
+        + '. Reconnect (initialize again) to get a new session.',
+    };
+  }
+
+  _recordCall(name, startedMs, outcome) {
+    this._calls.unshift({
+      tool: name,
+      at: new Date(startedMs).toISOString(),
+      ms: Date.now() - startedMs,
+      outcome,
+    });
+    if (this._calls.length > CALL_LOG_LIMIT) this._calls.pop();
+  }
+
+  // What the server has been asked to do lately, newest first. Reported by
+  // get_diagnostics.
+  recentCalls() {
+    return {
+      startedAt: this._startedAt,
+      totalCalls: this._callsStarted,
+      inFlight: this._inFlight ? Array.from(this._inFlight) : [],
+      sseSessions: this._sessions.size,
+      streamableSessions: this._streamableSessions.size,
+      recent: this._calls,
+    };
   }
 
   // The tools this build exposes. get_diagnostics reports these: a client
