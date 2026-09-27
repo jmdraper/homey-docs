@@ -72,6 +72,11 @@ const NOTE_HEIGHT_PER_CHARS = 40;
 const NOTE_HEIGHT_MAX = 200;
 // Breathing room between a heading note and whatever sits above it
 const NOTE_GAP_ABOVE = 40;
+// Homey's canvas controls float over the top of the flow, so anything up there
+// is hidden at the default scroll position. Flows on this Homey start at y=0,
+// 20, 40 or 60 and none above it — the one exception was a note this app
+// placed at -80, which is what prompted the margin.
+const CANVAS_TOP_MARGIN = 60;
 // How close a note must be to a card before it is taken to be about that card,
 // measured centre to centre. Distance between bounding boxes was tried first
 // and is worse: it saturates at zero the moment two boxes overlap, so a note
@@ -1131,8 +1136,8 @@ class HomeyDocsCompanion extends Homey.App {
         const base = anchor ? (anchor.y || 0)
           : (existing.length ? Math.min.apply(null, existing.map(c => c.y || 0)) : 0);
 
-        // Is this rectangle clear of every card already placed?
-        const free = y => !existing.some(card => {
+        // Clear of every card already placed, and below the canvas controls
+        const free = y => y >= CANVAS_TOP_MARGIN && !existing.some(card => {
           if (Math.abs((card.x || 0) - column) >= CARD_GAP_X) return false;
           const top = card.y || 0;
           return y < top + this._siblingGapBelow(card) && top < y + height;
@@ -1141,7 +1146,7 @@ class HomeyDocsCompanion extends Homey.App {
         // Above the card it labels reads best, below is the next choice, and
         // beyond that step further out. Anywhere clear beats overlapping.
         const below = anchor ? this._siblingGapBelow(anchor) + NOTE_GAP_ABOVE : clearance;
-        let chosen = base - clearance;
+        let chosen = Math.max(base - clearance, CANVAS_TOP_MARGIN);
         for (let step = 0; step < 10; step++) {
           const above = base - clearance - (step * (height + NOTE_GAP_ABOVE));
           if (free(above)) { chosen = above; break; }
@@ -1511,10 +1516,10 @@ class HomeyDocsCompanion extends Homey.App {
 
       const originX = Math.min.apply(null, ids.map(id => cards[id].x || 0));
       const originY = Math.min.apply(null, ids.map(id => cards[id].y || 0));
-      // Finish with the flow's topmost element at the origin. Preserving
-      // wherever it currently starts would keep any drift it has already
-      // accumulated, and the canvas origin carries no meaning of its own.
-      const topBefore = 0;
+      // Finish with the flow's topmost element clear of the canvas controls.
+      // Preserving wherever it currently starts would keep any drift it has
+      // already accumulated, and the origin carries no meaning of its own.
+      const topBefore = CANVAS_TOP_MARGIN;
 
       // A note heading a band sits above that band's first card, so the band
       // has to start low enough to leave room for it — otherwise the note

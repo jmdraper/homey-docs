@@ -569,7 +569,16 @@ Settled values, measured over 517 notes with centre distance:
   which reads wrongly for headings.
 - With `withCardIds`, each note's own card id is printed so it can be edited.
 
-**Result on live data: 477 of 517 notes attach, 40 stay flow-level.**
+**Result on live data: 485 of 517 notes attach, 36 stay flow-level.** A heading
+sitting equidistant between two sections attaches to the one below it: a left-margin
+note heads the section under it, and that placement is common enough that declining to
+guess lost real attachments.
+
+**Nothing is placed above `y = 60`.** Homey's canvas controls float over the top of
+the flow, so anything up there is hidden at the default scroll position. Flows on this
+Homey start at y 0, 20, 40 or 60 and never above it — the sole exception in 101 flows
+was a note this app placed at −80, which is what prompted the margin. Relayout
+normalises the topmost element to it, and note placement refuses positions above it.
 
 ### D. Folders
 
