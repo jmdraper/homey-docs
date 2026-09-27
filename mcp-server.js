@@ -574,6 +574,7 @@ class HomeyMcpServer {
     this._callsStarted = 0;
     this._responsesLost = [];   // tool responses that had nowhere to go
     this._sessionsAdopted = 0;
+    this._needsToolRefresh = new Set();
   }
 
   // Sessions carry no state, so the only cost of remembering one is the id.
@@ -581,11 +582,18 @@ class HomeyMcpServer {
   _adoptSession(sessionId) {
     this._streamableSessions.add(sessionId);
     this._sessionsAdopted += 1;
+    // Adopting keeps the client working, but it is still holding the tool list
+    // it cached before the restart — which is exactly how Claude Desktop came
+    // to offer get_changelog long after that tool was removed. Mark it to be
+    // told. Only adopted sessions are marked: a session created by initialize
+    // has just read tools/list and needs no telling.
+    this._needsToolRefresh.add(sessionId);
     this._app.log('Adopted MCP session', sessionId,
       '— unknown to this process, so the app has restarted since the client connected');
     while (this._streamableSessions.size > MAX_STREAMABLE_SESSIONS) {
       const oldest = this._streamableSessions.values().next().value;
       this._streamableSessions.delete(oldest);
+      this._needsToolRefresh.delete(oldest);
     }
   }
 
@@ -762,8 +770,30 @@ class HomeyMcpServer {
         return;
       }
 
+      const sessionId = incomingSessionId || newSessionId;
+      const needsToolRefresh = !!sessionId && this._needsToolRefresh.has(sessionId);
+
       if (responses.length === 0) {
         res.writeHead(202, headers);
+        res.end();
+      } else if (needsToolRefresh) {
+        // A POST may answer with an SSE stream carrying several messages, which
+        // is how a server-initiated notification reaches a client that has no
+        // stream of its own — this server answers GET /mcp with 405, so there
+        // is no other channel. The notification goes first so the client
+        // re-reads tools/list before acting on a result from a build it may not
+        // know about.
+        this._needsToolRefresh.delete(sessionId);
+        this._app.log('Telling adopted session', sessionId, 'that the tool list has changed');
+        headers['Content-Type'] = 'text/event-stream';
+        headers['Cache-Control'] = 'no-cache';
+        res.writeHead(200, headers);
+        res.write('event: message\ndata: '
+          + JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })
+          + '\n\n');
+        for (const response of responses) {
+          res.write('event: message\ndata: ' + JSON.stringify(response) + '\n\n');
+        }
         res.end();
       } else {
         res.writeHead(200, headers);
@@ -782,7 +812,7 @@ class HomeyMcpServer {
     // DELETE /mcp — client terminates the session
     if (req.method === 'DELETE' && url.pathname === '/mcp') {
       const sid = req.headers['mcp-session-id'];
-      if (sid) this._streamableSessions.delete(sid);
+      if (sid) { this._streamableSessions.delete(sid); this._needsToolRefresh.delete(sid); }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{}');
       return;
@@ -916,7 +946,11 @@ class HomeyMcpServer {
             jsonrpc: '2.0', id,
             result: {
               protocolVersion: params.protocolVersion || '2024-11-05',
-              capabilities: { tools: {} },
+              // listChanged is declared because the server really does send it:
+              // an adopted session gets notifications/tools/list_changed, since
+              // a client that survived our restart is holding the tool list
+              // from before it.
+              capabilities: { tools: { listChanged: true } },
               serverInfo: {
                 name: 'homey-mcp',
                 version: this._app.appVersion(),

@@ -139,6 +139,12 @@ const OUTPUTS_BY_TYPE = {
 // Pre-edit copies live on disk; app settings hold only the index. Ten revisions
 // of a 213-card flow is far too much to keep in settings alongside the snapshot.
 const REVISION_DIR = '/userdata/revisions';
+
+// A crash leaves nothing behind. Homey records that an app crashed — and resets
+// the count on reinstall — but not why, and the app log does not survive the
+// restart. One synchronous file, written on the way down, is the difference
+// between "it crashed at some point" and a stack trace.
+const CRASH_FILE = '/userdata/last-crash.json';
 const DEFAULT_REVISION_DEPTH = 10;
 
 // Consecutive writes to one flow inside this window share a revision, which
@@ -311,8 +317,57 @@ const FLOWBITS_FAMILIES = [
 
 class HomeyDocsCompanion extends Homey.App {
 
+  // Node stops the process on an unhandled rejection, and nothing here recorded
+  // why. The app crashed once during the 27 Sep session with crashedMessage
+  // null, and the cause is not recoverable: there was no handler, no persisted
+  // trace, and the app log does not survive a restart. This does not change
+  // whether the app dies — it should — only whether the next one can be read.
+  _installCrashHandlers() {
+    const record = (kind, error) => {
+      // Nothing optional before the write. An earlier version gathered
+      // process.memoryUsage() first, which throws "ENOENT:
+      // uv_resident_set_memory" inside Homey's app sandbox — so the handler
+      // died before it recorded anything, and a deliberate crash left no trace
+      // at all. Whatever else fails here, the file gets written.
+      try {
+        const detail = {
+          at: new Date().toISOString(),
+          kind,
+          message: String((error && error.message) || error),
+          stack: String((error && error.stack) || '').split('\n').slice(0, 12).join('\n'),
+        };
+        try { detail.uptimeSeconds = Math.round(process.uptime()); } catch (e) { /* optional */ }
+        // Synchronous: the process is about to go, and an awaited write would
+        // not finish. Nor would a settings write.
+        fs.writeFileSync(CRASH_FILE, JSON.stringify(detail, null, 1), 'utf8');
+      } catch (e) { /* nothing left to do about it */ }
+      try { this.error('FATAL (' + kind + '):', String((error && error.stack) || error)); }
+      catch (e) { /* nor this */ }
+    };
+
+    // prependListener, not on. The Homey SDK registers its own handlers at
+    // bootstrap and stops the process from them, so a listener added here runs
+    // second and never runs at all — which is why the first version of this
+    // wrote nothing during a deliberate crash. Going first also means not
+    // exiting: the SDK's handler still runs afterwards and reports the crash to
+    // Homey exactly as before. This only leaves a note on the way past.
+    process.prependListener('unhandledRejection', reason => record('unhandledRejection', reason));
+    process.prependListener('uncaughtException', error => record('uncaughtException', error));
+  }
+
+  _lastCrash() {
+    try { return JSON.parse(fs.readFileSync(CRASH_FILE, 'utf8')); }
+    catch (e) { return null; }
+  }
+
   async onInit() {
     this._startedAt = new Date().toISOString();
+    this._installCrashHandlers();
+    const previousCrash = this._lastCrash();
+    if (previousCrash) {
+      this.error('The previous run ended in a', previousCrash.kind, 'at',
+        previousCrash.at + ':', previousCrash.message);
+    }
     this.log('Homey Docs Companion ' + this.appVersion()
       + ' (build ' + this._buildId() + ') initialising...');
 
@@ -4965,6 +5020,9 @@ function copyPrompt(){
     result.appVersion = this.appVersion();
     result.buildId = this._buildId();
     result.startedAt = this._startedAt || null;
+    result.uptimeSeconds = Math.round(process.uptime());
+    // Survives the restart it describes, unlike the app log
+    result.lastCrash = this._lastCrash();
     result.mcpPort = this._mcpPort || null;
     result.tools = this._mcpServer ? this._mcpServer.toolNames() : 'MCP server not running';
     result.toolCount = Array.isArray(result.tools) ? result.tools.length : 0;
