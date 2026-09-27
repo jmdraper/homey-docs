@@ -128,6 +128,18 @@ const OUTPUTS_BY_TYPE = {
 const REVISION_DIR = '/userdata/revisions';
 const DEFAULT_REVISION_DEPTH = 10;
 
+// Consecutive writes to one flow inside this window share a revision, which
+// holds the state from before the first of them. Agent editing is iterative —
+// a single rebuild produced about 80 writes — and a stack of 80 near-identical
+// states is not history, it is noise that pushes the state worth keeping off
+// the end. Two minutes is long enough to cover a run of edits and short enough
+// that coming back to a flow later starts a fresh one.
+const REVISION_MERGE_WINDOW_MS = 2 * 60 * 1000;
+
+// Beyond the per-flow cap, one revision per day is kept: the oldest of that
+// day, so it is the state the flow was in before that day's work.
+const REVISION_DAILY_DAYS = 30;
+
 // How long a write may take before the caller is told rather than left waiting.
 // The work is not cancelled — an HTTP PUT already sent cannot be recalled — so
 // the answer says which phase it reached and whether Homey has the change.
@@ -597,8 +609,14 @@ class HomeyDocsCompanion extends Homey.App {
   // tools — not a record of history. Refreshing overwrites it wholesale.
   async _refreshSnapshot() {
     const flows = await this._fetchAllFlows();
-    if (flows) this.snapshot.flows = flows;
-    else this.error('Flow read failed — keeping the cached index rather than emptying it');
+    if (flows) {
+      this.snapshot.flows = flows;
+      // Only when the read succeeded. Pruning on a failed read would read as
+      // "every flow has been deleted" and throw away all the history at once.
+      await this._dropOrphanedRevisions(flows);
+    } else {
+      this.error('Flow read failed — keeping the cached index rather than emptying it');
+    }
 
     const devices = await this._fetchAllDevices();
     if (devices) this.snapshot.devices = devices;
@@ -656,23 +674,103 @@ class HomeyDocsCompanion extends Homey.App {
 
   // Called before every write. A single pre-edit slot would be overwritten by
   // the next edit in the same session, which is exactly when a revert is wanted.
+  //
+  // Writes that arrive close together share one revision rather than each
+  // taking their own. The shared revision is the FIRST one — the file is left
+  // exactly as written, and only the count of writes folded into it goes up —
+  // so it holds the state from before the run of edits began, which is the
+  // state anyone reverting a run of edits actually wants.
   async _saveRevision(flowId, flow) {
     const dir = path.join(REVISION_DIR, flowId);
-    await fs.promises.mkdir(dir, { recursive: true });
+    const key = this._revisionKey(flowId);
+    const index = this.homey.settings.get(key) || [];
+    const nowMs = Date.now();
+    const newest = index[0];
 
-    const now = new Date().toISOString();
+    if (newest && !newest.daily
+        && (nowMs - new Date(newest.ts).getTime()) < REVISION_MERGE_WINDOW_MS) {
+      newest.writes = (newest.writes || 1) + 1;
+      newest.lastWriteAt = new Date(nowMs).toISOString();
+      this.homey.settings.set(key, index);
+      return newest;
+    }
+
+    await fs.promises.mkdir(dir, { recursive: true });
+    const now = new Date(nowMs).toISOString();
     const file = now.replace(/[:.]/g, '-') + '.json';
     await fs.promises.writeFile(path.join(dir, file), JSON.stringify(flow), 'utf8');
 
-    const key = this._revisionKey(flowId);
-    const index = this.homey.settings.get(key) || [];
-    index.unshift({ file, ts: now, name: flow.name, cards: Object.keys(flow.cards || {}).length });
-
-    for (const dropped of index.splice(this._revisionDepth())) {
-      await fs.promises.unlink(path.join(dir, dropped.file)).catch(() => {});
-    }
+    index.unshift({
+      file, ts: now, name: flow.name,
+      cards: Object.keys(flow.cards || {}).length,
+      writes: 1,
+    });
+    await this._pruneRevisions(flowId, index);
     this.homey.settings.set(key, index);
     return index[0];
+  }
+
+  // Keep the most recent `depth`, and beyond them one per day — the OLDEST of
+  // each day, so a daily entry is the state the flow was in before that day's
+  // work rather than after most of it. Everything else goes, file and all.
+  //
+  // Mutates `index` in place; the caller persists it.
+  async _pruneRevisions(flowId, index) {
+    const depth = this._revisionDepth();
+    const dir = path.join(REVISION_DIR, flowId);
+    const dayOf = entry => String(entry.ts).slice(0, 10);
+
+    const recent = index.slice(0, depth);
+    const older = index.slice(depth);
+
+    // Walking newest-first, the last entry seen for a day is its oldest
+    const oldestOfDay = new Map();
+    for (const entry of older) oldestOfDay.set(dayOf(entry), entry);
+
+    const cutoffDay = new Date(Date.now() - (REVISION_DAILY_DAYS * 86400000))
+      .toISOString().slice(0, 10);
+    const archive = [];
+    for (const entry of older) {
+      if (oldestOfDay.get(dayOf(entry)) === entry && dayOf(entry) >= cutoffDay) {
+        entry.daily = true;
+        archive.push(entry);
+      }
+    }
+
+    const kept = new Set(recent.concat(archive));
+    for (const entry of index) {
+      if (kept.has(entry)) continue;
+      await fs.promises.unlink(path.join(dir, entry.file)).catch(() => {});
+    }
+    index.length = 0;
+    index.push(...recent, ...archive);
+  }
+
+  async _dropOrphanedRevisions(flows) {
+    let keys;
+    try { keys = this.homey.settings.getKeys() || []; }
+    catch (e) { return 0; }   // not worth failing a refresh over
+    const orphans = keys
+      .filter(key => key.startsWith('revisions_'))
+      .map(key => key.slice('revisions_'.length))
+      .filter(flowId => flowId && !flows[flowId]);
+    if (!orphans.length) return 0;
+    return this._forgetRevisionsOf(orphans);
+  }
+
+  // A flow that no longer exists keeps its revision index in settings and its
+  // files in /userdata for ever. Nothing ever removed either, so every deleted
+  // or rebuilt flow left a little behind.
+  async _forgetRevisionsOf(flowIds) {
+    let dropped = 0;
+    for (const flowId of flowIds) {
+      this.homey.settings.unset(this._revisionKey(flowId));
+      await fs.promises.rm(path.join(REVISION_DIR, flowId), { recursive: true, force: true })
+        .catch(() => {});
+      dropped += 1;
+    }
+    if (dropped) this.log('Dropped stored revisions for', dropped, 'flow(s) that no longer exist');
+    return dropped;
   }
 
   async listFlowRevisions(flowId) {
@@ -683,11 +781,19 @@ class HomeyDocsCompanion extends Homey.App {
       flowId,
       name: current ? current.name : null,
       depth: this._revisionDepth(),
+      mergeWindowSeconds: Math.round(REVISION_MERGE_WINDOW_MS / 1000),
+      note: 'Writes less than ' + Math.round(REVISION_MERGE_WINDOW_MS / 60000) + ' minutes apart '
+        + 'share a revision, which holds the state from before the first of them. `writes` says '
+        + 'how many are folded into each. Entries marked daily are kept as one-per-day archives '
+        + 'beyond the depth cap.',
       revisions: index.map((entry, position) => ({
         revision: position + 1,
         savedAt: entry.ts,
         nameAtSave: entry.name,
-        cards: entry.cards
+        cards: entry.cards,
+        writes: entry.writes || 1,
+        lastWriteAt: entry.lastWriteAt || entry.ts,
+        daily: entry.daily || undefined,
       }))
     };
   }
