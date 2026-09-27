@@ -31,16 +31,36 @@ build overloads it** — is false. Measured against the live Homey:
 | Homey rate-limits the advanced-flow PUT | 25 back-to-back PUTs: 378–1583ms, no 429, no degradation. |
 | The app leaks memory under write load | 125MB RSS / 75MB PSS, in line with every other app installed (Flow Checker 119MB, Button+ 117MB). |
 
-**What the hang actually was:** a transport failure, not the app working. The MCP
-server's SSE stream had no keepalive — it wrote one event and then nothing until a tool
-response, so an idle TCP connection died silently at the router and the server wrote its
-answer into a dead socket. Neither end timed out. The hangs followed a pause (the
-per-turn limit), which is exactly when an idle connection dies, and restarting Claude
-Desktop — which is what cleared it — is exactly the fix for a dead stream.
+**What the hang was not:** the app working. Nothing server-side takes longer than about
+a second under that workload.
+
+**A correction, made after a first pass got this wrong.** The first diagnosis blamed the
+MCP server's SSE stream, which had no keepalive: an idle connection dies silently at a
+router, and the server then writes its answer into a dead socket with neither end timing
+out. That is a real defect and it has been fixed — but **it is not the path Claude
+Desktop uses.** `mcp-remote`, given the configured URL `http://<homey>:8735/mcp`,
+reports `transport strategy: http-first` and connects with
+`StreamableHTTPClientTransport`; running it and watching the counters confirms it
+(`streamableSessions` increments, `sseSessions` does not). The SSE endpoint is served
+for compatibility and is not in use here.
+
+**So the precise mechanism of the four-minute hangs is not established**, and cannot now
+be, because nothing recorded a tool call at the time. What is known: on the streamable
+transport the answer travels back on the request's own socket, so a hang means either
+the server never finished the call or the answer never got back over a connection that
+had gone bad. Both are now instrumented — every call is logged with its duration, every
+undeliverable response is recorded with the tool and session, and each session's idle
+time is reported — so a recurrence will say which.
+
+**What makes the symptom impossible regardless of the cause** is the bounded write: a
+write now answers within 30 seconds saying whether Homey was told, so an indefinite wait
+becomes an explicit error. That is the part a skill should rely on.
 
 **Implication for the skill:** do not teach "avoid large builds because the app can't
 cope". The correct lessons are *use the batch tools because round trips are the
-expensive part*, and *a hung call is a connection problem, not an overloaded Homey*.
+expensive part*, and *a call that does not come back is a transport or client problem,
+not an overloaded Homey* — with the corollary that a write which genuinely fails now
+says so within 30 seconds, so a silent wait is never the app thinking.
 
 Two further defects were found by reading the code, both now fixed: writes to one flow
 were not serialised (two overlapping calls each read the same state and PUT it, and the

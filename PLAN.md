@@ -661,8 +661,9 @@ live Homey:
   The fault is the opposite one, below.
 
 So nothing server-side takes longer than about a second under the exact workload that
-hung for four minutes. The hang was the transport, and two things in `mcp-server.js`
-leave it unguarded:
+hung for four minutes. The hang was therefore not the app working, and two things in
+`mcp-server.js` left the transport unguarded — though see step 8.5, which corrects which
+of them could have been responsible:
 
 - **The SSE stream has no keepalive.** `GET /sse` writes one `endpoint` event and then
   nothing until a tool response. An idle TCP connection dies silently at a router; the
@@ -801,6 +802,55 @@ permission.
   and re-enabled between two reads leaves no trace, and the timestamp is when the
   change was noticed, not when it happened. Homey's own notifications are the
   authoritative record, which is why the scope is worth adding.
+
+### Step 8.5 — The keepalive follow-up, and a correction
+
+Step 8.0 concluded that the four-minute hangs were the SSE stream having no keepalive.
+A follow-up to harden that started by checking the current state, and found the premise
+wrong.
+
+**`mcp-remote` does not use the SSE endpoint.** Given the configured URL
+`http://192.168.1.100:8735/mcp` it reports `Using transport strategy: http-first` and
+`Connected to remote server using StreamableHTTPClientTransport`. Running it and
+watching the counters confirms it: `streamableSessions` goes 0 → 1, `sseSessions` does
+not move. The `/sse` endpoint is served for compatibility with older clients and is not
+on the path Claude Desktop takes.
+
+So the missing SSE keepalive was a real defect — an idle stream died silently and the
+server wrote answers into it — but **it cannot have caused the reported hangs**, and the
+step 8.0 write-up overstated what had been established. The honest position: nothing
+server-side is slow under that workload, nothing recorded a tool call at the time, and
+the precise mechanism is not recoverable. What makes the symptom impossible regardless
+is the 30-second bounded write from step 8.2.
+
+Checking the transport that *is* in use turned up the more interesting bug. **On both
+transports a response could be lost in silence:**
+
+- Over SSE, the `/message` handler took a reference to `session.res`, awaited the tool
+  call, and wrote into that reference afterwards. A session dying inside a slow call —
+  precisely the case under investigation — meant writing into nothing, successfully.
+- Over streamable HTTP, a client that gives up leaves a destroyed socket, and
+  `res.end()` on it also succeeds quietly.
+
+Both now re-check before delivering and record the loss with the tool name, session id
+and how long the call had been running. Verified on each transport by abandoning a
+request mid-call: `responsesLost: 1`, naming `get_trigger_load` at 3431ms (SSE) and
+2405ms (streamable).
+
+Also done: keepalive interval 20s → 15s; TCP keepalive and `TCP_NODELAY` set on every
+connection at the server, so the streamable transport gets them too; a single write path
+for SSE so no failure is swallowed; and `get_diagnostics` now reports each open session's
+age, the time since anything last reached it, a `healthy` flag, and the count and detail
+of responses lost since startup.
+
+**On migrating to Streamable HTTP as the only transport.** It would remove this class of
+problem, and the client is already on it. The advantage is structural: the answer returns
+on the request's own socket, so there is no separate long-lived stream to go stale, and a
+broken connection surfaces to the client as a failed request it can retry rather than as
+an answer that never arrives. Sessions would still be in-memory and still lost on
+restart, but that produces a clean 404 rather than a wait. The remaining work would be
+retiring `GET /sse` and `POST /message` and the session map behind them — perhaps 80
+lines — after checking no other client uses them. Not done here, deliberately.
 
 ## Follow-ups
 
