@@ -1110,6 +1110,7 @@ class HomeyDocsCompanion extends Homey.App {
       const newCard = Object.assign({}, card);
       const cardId = crypto.randomUUID();
       const existing = Object.values(draft.cards);
+      const result = {};
 
       // A note labels the section beside it. It is never connected, and Homey
       // sizes it at render time, so width and height stay null.
@@ -1143,15 +1144,46 @@ class HomeyDocsCompanion extends Homey.App {
           return y < top + this._siblingGapBelow(card) && top < y + height;
         });
 
+        // A note is read as belonging to whichever card it is nearest — that is
+        // how get_flow_summary attributes it, and how a person reads the canvas.
+        // So a position is only good if the anchor is what it lands nearest to.
+        // Placing it merely somewhere clear is not enough: in a dense flow the
+        // gap above a card can be closer to its neighbour than to the card the
+        // note is about, and the note then reads as annotating the wrong thing.
+        const anchorIsNearest = y => {
+          if (!anchorId) return true;
+          const noteCentreX = column + (NOTE_WIDTH_ESTIMATE / 2);
+          const noteCentreY = y + (height / 2);
+          let nearest = null;
+          let nearestDistance = Infinity;
+          for (const [otherId, other] of Object.entries(draft.cards)) {
+            if (!other || other.type === 'note') continue;
+            const dx = ((other.x || 0) + (CARD_WIDTH_ESTIMATE / 2)) - noteCentreX;
+            const dy = ((other.y || 0) + (this._siblingGapBelow(other) / 2)) - noteCentreY;
+            const distance = Math.sqrt((dx * dx) + (dy * dy));
+            if (distance < nearestDistance) { nearestDistance = distance; nearest = otherId; }
+          }
+          return nearest === anchorId && nearestDistance <= NOTE_ATTACH_DISTANCE;
+        };
+
         // Above the card it labels reads best, below is the next choice, and
-        // beyond that step further out. Anywhere clear beats overlapping.
+        // beyond that step further out.
         const below = anchor ? this._siblingGapBelow(anchor) + NOTE_GAP_ABOVE : clearance;
-        let chosen = Math.max(base - clearance, CANVAS_TOP_MARGIN);
+        const candidates = [];
         for (let step = 0; step < 10; step++) {
-          const above = base - clearance - (step * (height + NOTE_GAP_ABOVE));
-          if (free(above)) { chosen = above; break; }
-          const under = base + below + (step * (height + NOTE_GAP_ABOVE));
-          if (free(under)) { chosen = under; break; }
+          candidates.push(base - clearance - (step * (height + NOTE_GAP_ABOVE)));
+          candidates.push(base + below + (step * (height + NOTE_GAP_ABOVE)));
+        }
+
+        let chosen = candidates.find(y => free(y) && anchorIsNearest(y));
+        if (chosen === undefined) {
+          // Nowhere both clear and unambiguous. Take somewhere clear and say so,
+          // rather than silently attaching the note to the wrong card.
+          chosen = candidates.find(free);
+          if (chosen === undefined) chosen = Math.max(base - clearance, CANVAS_TOP_MARGIN);
+          result.warning = 'There was no free space next to that card where this note '
+            + 'would read as belonging to it, so it has been placed nearby but may appear '
+            + 'to annotate a neighbouring card. Check it in the editor.';
         }
         newCard.x = column;
         newCard.y = chosen;
@@ -1200,7 +1232,9 @@ class HomeyDocsCompanion extends Homey.App {
         source[output] = (source[output] || []).concat([cardId]);
         linked = { from: anchorId, output };
       }
-      const result = { addedCardId: cardId, position: { x: newCard.x, y: newCard.y }, linkedFrom: linked };
+      result.addedCardId = cardId;
+      result.position = { x: newCard.x, y: newCard.y };
+      result.linkedFrom = linked;
 
       // A note's position is the only record of what it labels — Homey stores
       // no anchor — so it can only be placed against where its anchor sits
