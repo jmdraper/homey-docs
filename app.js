@@ -902,8 +902,6 @@ class HomeyDocsCompanion extends Homey.App {
       return { error: 'Flow ' + flowId + ' is not an advanced flow (only advanced flows can be edited)' };
     }
 
-    const revision = await this._saveRevision(flowId, flow);
-
     const draft = JSON.parse(JSON.stringify(flow));
     let outcome;
     try {
@@ -918,6 +916,12 @@ class HomeyDocsCompanion extends Homey.App {
     if (problems.length) {
       return { error: 'Refusing to write — the result would be a broken flow', problems };
     }
+
+    // Only once the edit is known to be good. Saving before attempting it meant
+    // a rejected edit still consumed a revision, pushing the one worth keeping
+    // down the stack — so a revert after a failed call restored the state the
+    // failure had left, not the state before the last real change.
+    const revision = await this._saveRevision(flowId, flow);
 
     const body = {};
     for (const field of ADVANCED_FLOW_WRITABLE) {
@@ -2061,17 +2065,29 @@ class HomeyDocsCompanion extends Homey.App {
         return { cardId, distance: Math.sqrt((dx * dx) + (dy * dy)) };
       }).sort((a, b) => a.distance - b.distance);
 
-      const nearest = ranked[0];
-      const runnerUp = ranked[1];
-      const tooFar = !nearest || nearest.distance > NOTE_ATTACH_DISTANCE;
-      const ambiguous = runnerUp && (runnerUp.distance - nearest.distance) < NOTE_ATTACH_MARGIN;
-      if (tooFar || ambiguous) { orphanNotes.push(label); continue; }
-
       // A note at the left margin heads a section and reads correctly above it;
       // one out in the flow annotates a single card and belongs beneath it.
       const heading = (note.x || 0) <= leftEdge;
-      if (!notesByCard.has(nearest.cardId)) notesByCard.set(nearest.cardId, { above: [], below: [] });
-      notesByCard.get(nearest.cardId)[heading ? 'above' : 'below'].push(label);
+
+      let chosen = ranked[0];
+      const runnerUp = ranked[1];
+      const tooFar = !chosen || chosen.distance > NOTE_ATTACH_DISTANCE;
+      let ambiguous = runnerUp && (runnerUp.distance - chosen.distance) < NOTE_ATTACH_MARGIN;
+
+      // A heading placed between two sections is equidistant from both, and
+      // that happens often — it sits below one section and above the one it
+      // names. Direction settles it where distance cannot.
+      if (!tooFar && ambiguous && heading) {
+        const beneath = ranked.filter(entry => (cards[entry.cardId].y || 0) >= (note.y || 0));
+        if (beneath.length && beneath[0].distance <= NOTE_ATTACH_DISTANCE) {
+          chosen = beneath[0];
+          ambiguous = false;
+        }
+      }
+      if (tooFar || ambiguous) { orphanNotes.push(label); continue; }
+
+      if (!notesByCard.has(chosen.cardId)) notesByCard.set(chosen.cardId, { above: [], below: [] });
+      notesByCard.get(chosen.cardId)[heading ? 'above' : 'below'].push(label);
     }
 
     // Cards reached from more than one place get a stable marker, so a
