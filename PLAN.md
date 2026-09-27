@@ -642,18 +642,24 @@ Spotted while working; none blocking, all deferred deliberately.
   was reported indefinitely. Fixed — null now means "could not read", `[]` means
   "no variables".
 
-- **Three flows still drift under relayout.** Positioning reads the current
-  arrangement, so its output would position differently again. `_layoutCards` now
-  iterates until an arrangement repeats and keeps the flattest member of the cycle,
-  which settled 98 of 101 flows. `Patio lights`, `Computer states` and one other
-  never repeat within 64 passes — they drift rather than cycle, so they fall back to
-  the flattest arrangement seen, which is stable enough in practice but is not a
-  fixed point. The underlying cause is in `_positionCards`, not in the note handling.
-- **Reserving note space costs ~15% connector travel** on flows that have notes, and
-  nothing on flows that don't. Deliberate: the alternative is notes squeezed into
-  whatever gap the packing left, which is how they ended up attributed to the wrong
-  card. Worth revisiting if a smaller reservation can still win the nearest-card
-  comparison by `NOTE_ATTACH_MARGIN`.
+- **`_overlapCount` over-reports and is only safe as a relative measure.** Card
+  heights are estimated from the arguments, so it counts 1714 overlaps across the
+  user's own hand-drawn flows, which look fine in the editor. `_layoutCards` only
+  ever uses it to compare two arrangements of the *same* flow, where the same
+  estimate applies to both. Do not report the number to anyone.
+- **Long notes are expensive.** A note's height is estimated from its text, and the
+  layout holds that much room beside the card it annotates, so three explanatory
+  sentences stacked in one column add several hundred pixels and every connector
+  into that column has to reach further. The Ensuite humidity rebuild carries four
+  notes of 100-120px and comes out at 4772 travel against 1980 with the notes
+  stripped. The user's own version of the same flow uses seven notes of the minimum
+  80px, spread over two columns, and lands at 3920. Keep notes short, and prefer a
+  short note on a sparse column to a long one in the deepest column.
+- **The arrangement search is capped at 32.** Thirteen flows drift rather than
+  settle and would otherwise burn the whole budget — at 400 the largest flow took
+  2.2s, which is too slow for a device-side call. At 32 the slowest is 137ms and
+  nothing moves on a second relayout. The cap is a bound on quality, not on
+  correctness; raising it did not improve any measured score.
 
 ### Deferred from step 3
 
