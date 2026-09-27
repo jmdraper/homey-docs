@@ -1139,15 +1139,20 @@ class HomeyDocsCompanion extends Homey.App {
         const placed = Object.values(draft.cards).filter(c => c && c.type !== 'note');
         const sharing = placed.filter(c => (c.x || 0) === (draft.cards[anchorId].x || 0));
         if (placed.length > 2 && sharing.length > placed.length / 2) {
+          // Colour it red. A warning in the result reaches only the assistant
+          // that made the call, and the app log is not somewhere anyone looks;
+          // the canvas is where this will be noticed, and red already means
+          // "needs attention" in flows written here.
+          const asked = newCard.color;
+          newCard.color = 'red';
+          result.colour = { requested: asked, applied: 'red' };
           result.warning = 'This flow does not look laid out yet — most of its cards share '
             + 'one column — so this note has been placed against a position that is about to '
-            + 'change. Call relayout_flow first, then add notes, or this one may end up '
-            + 'labelling the wrong section.';
-          // Also to the app log: the result above only reaches the assistant
-          // that made the call, and whether the user hears about it is then
-          // that assistant's choice.
-          this.error('Note added to "' + draft.name + '" before the flow was laid out — it may '
-            + 'end up labelling the wrong section. Run relayout_flow, then re-add the note.');
+            + 'change, and may end up labelling the wrong section. It has been coloured red to '
+            + 'mark it for attention. Run relayout_flow, then delete and re-add this note'
+            + (asked && asked !== 'red' ? ' as ' + asked + '.' : '.');
+          this.error('Note added to "' + draft.name + '" before the flow was laid out. '
+            + 'Coloured red; run relayout_flow, then re-add it.');
         }
       }
       return result;
