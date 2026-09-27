@@ -1,6 +1,6 @@
 # Homey Docs Companion — Development Plan
 
-Status: steps 1–7 built; step 7 awaiting on-device testing. Built one step at a time, in order.
+Status: steps 1–7 built and tested on the Homey. Built one step at a time, in order.
 
 ## Context
 
@@ -449,7 +449,7 @@ logic that only ran for newly added cards could not tidy a flow that already exi
   It cannot be prevented — position is the only anchor Homey stores — so the note is
   coloured **red**, matching the convention that red means "change this soon".
 
-## Step 7 — Trace behaviour, and canvas notes as the annotation layer ✅ built
+## Step 7 — Trace behaviour, and canvas notes as the annotation layer ✅ done
 
 ### Where knowledge lives
 
@@ -613,10 +613,13 @@ Against the finished tool set. It must teach:
   what it goes on to control).
 - `add_flow_note` places a note beside a named card with no overlap; the note appears
   in the Homey editor, is captured in the revision stack, and can be reverted.
-  **Not yet tested on-device** — needs an install.
+  ✅ Verified on the Homey against `Ensuite humidity (rebuilt by Claude)`: four notes
+  added from named anchors, all four read back on the intended card, no overlaps, and
+  three consecutive `relayout_flow` calls moved nothing.
 - `get_flow_summary` shows notes inline under the correct card across a sample of real
-  flows, checked against the editor. ✅ 477 of 517 notes attach; the inline note on the
-  reference flow lands on the nested `ANY` it describes.
+  flows, checked against the editor. ✅ 515 of 521 notes attach after a relayout (485 in
+  the hand-drawn originals); the inline note on the reference flow lands on the nested
+  `ANY` it describes.
 - `list_folders` works. ✅ already true.
 
 ## Follow-ups

@@ -62,7 +62,9 @@ saved description goes stale silently, and a stale description is worse than non
 something the wiring cannot: why this test is here, what breaks without it, which
 other flow it must not fight with, why the obvious simpler version does not work.
 Never restate the wiring — the summary already shows it. A useful test: if a routine
-rewire would make the note false, it is a bad note. Keep them to a sentence or two.
+rewire would make the note false, it is a bad note. Keep them to one short sentence —
+the layout holds space beside a card for the note on it, so a long note pushes that
+whole column apart and every connector into it has further to travel.
 
 **Anything not about one specific flow goes in my own notes, not Homey.** Design that
 spans flows, decisions and their reasoning, dead ends, device quirks, the backlog —
