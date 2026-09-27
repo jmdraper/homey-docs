@@ -693,6 +693,115 @@ Two further defects found by reading, both of which make a long build worse:
   the acceptance criterion for the trigger-load analysis is not there to run against.
 
 
+### Step 8.2 — What was built
+
+**Bulk structural edits.** `apply_cards(flowId, cards, connections)` adds any
+number of cards and the connections between them in one read-modify-write, one
+revision, all or nothing; cards name each other with local refs, and anything
+that is not a ref is read as an existing card id, so a batch can hang off what is
+already there. `copy_cards(fromFlowId, toFlowId, …)` copies a group between
+flows, keeping arguments, ownerUri, relative positions and internal wiring under
+fresh ids, with `sectionNoteId` selecting everything under a yellow heading note,
+`removeFromSource` making it a move, and `dryRun` reporting the selection before
+anything is written.
+
+Two things this turned up that the brief did not anticipate:
+
+- **A card id lives in four places, not one.** The output arrays, an ALL gate's
+  `input` list, a card's `droptoken`, and `[[trigger::<id>::…]]` tokens embedded
+  in argument text. 476 cards here carry the last kind. Remapping only the
+  connections would produce a section that looks right in the editor and has
+  quietly lost its data flow.
+- **A section is a band, not a subtree.** Heading notes sit at the left margin,
+  which is how `get_flow_summary` already tells a heading from a label, and
+  consecutive headings divide the canvas into bands — the same grouping the
+  layout code uses for independent behaviours. Selecting the band and then
+  following the wiring out of it, but never into another band, matches how a
+  person reads the canvas. It also means the topmost heading often names the flow
+  rather than the whole of it: on *Scullery Button+ controller* the "Button+
+  controller" note selects 47 of 73 cards, because there are four more headings
+  below it. The result lists the other sections for exactly that reason.
+
+**Revisions.** Writes to a flow less than two minutes apart share one revision,
+which is the first — the stored file is untouched and only the count of writes
+folded into it goes up — so it holds the state from before the run of edits
+began. Beyond the per-flow cap, one revision per day is kept: the oldest of that
+day. `list_flow_revisions` reports the merge count. Revision stores for flows
+that no longer exist are dropped on refresh; twelve were being kept here for five
+surviving flows.
+
+**Timeouts and retries.** Writes to one flow queue, so two overlapping calls no
+longer race. Every write answers within 30s, saying which phase it reached and
+whether the PUT was sent; where the timeout lands before the PUT the call is
+genuinely abandoned, with the check in the same synchronous breath as sending, so
+"nothing was written" is true rather than hopeful. `add_card`, `apply_cards` and
+`copy_cards` take a `requestId`; a failure that demonstrably wrote nothing is not
+remembered, so a real retry still retries. `connect_cards` reports
+`alreadyConnected` / `alreadyDisconnected` and writes nothing.
+
+**Snapshot freshness.** `search_flows`, `trace_behaviour` and
+`get_cross_references` check whether Homey has moved before answering, re-read
+what changed, and report `snapshotAge`. The check costs about 260ms, is
+rate-limited to once every ten seconds and deduplicated while one is in flight. A
+check that finds nothing changed counts as confirming the snapshot, so the age
+reported is the age of the last agreement with Homey rather than of the last
+write.
+
+**Trigger load.** `get_trigger_load(flowId?)` reads the rate off the trigger
+cards. Ranked on `certainPerHour` — the triggers that state their own rate —
+because ranking on the upper bound ranks on guesses about how chatty a device is,
+and a flow with twenty capability triggers then outranks one with six timers a
+minute apart, which is the case it was built to find.
+
+The feedback-loop check went through two versions. Flagging any flow that
+triggers on something it also writes flagged **fifty** flows, because that is the
+ordinary shape of a lights flow: trigger on the light turning on, then set its
+dim level. The distinction that matters is whether writing the thing would set
+the trigger off again. "When the light turns on" is an edge — writing on to an
+already-on light fires nothing. "When X changed", a variable, a FlowBits flag or
+signal fire on any new value. Restricting it to those brings it to sixteen flows,
+all genuine.
+
+**Notifications.** `get_notifications` reads Homey's own notifications, where
+"**Dehumidifier drying** has been disabled, because the Flow executed too many
+times" appears — naming the trigger card responsible. Ten of them are still on
+this Homey from 26 Sep 02:26. It needs `homey.notifications.readonly`, which
+neither the app's own token nor the current flow-scoped Personal Access Token
+carries, so the tool says exactly which scope to add and where. It also returns
+flow enable/disable transitions the app records for itself, which need no extra
+permission.
+
+### Step 8.3 — Measured against the brief's acceptance criteria
+
+- **"Recreating the ~70-card layout takes one or a few calls, not ~80. One
+  revision. `get_flow_summary` matches the source card for card."** ✅ The 73-card
+  *Scullery Button+ controller* is reproduced by a single `copy_cards` call in
+  1.4s as one revision, and the two summaries are identical line for line. The
+  same build through `add_card` is 70 calls and 72 seconds.
+- **"`get_trigger_load` ranks the drying flow's pre-split state near the top and
+  names the six per-minute timers."** ✅ on the substance, with a caveat on the
+  fixture. The pre-split state is **not recoverable** — the drying flow's revision
+  index is empty, and Homey exposes no flow version history through the API. Run
+  against a faithful reconstruction (six `every 1 minute` triggers on one canvas,
+  built with `apply_cards`), it ranks **#2 of 115** at an exact 360/h and the flag
+  names all six.
+- **"`get_logs` can fetch 23:55–00:30 UTC unfiltered."** ✅ 77 entries.
+
+### Step 8.4 — Left undone, deliberately
+
+- **`withStartCard: false` cannot create an empty flow.** Homey refuses one
+  outright — "Advanced Flow is empty, add at least one Flow card". The flag is
+  kept but refuses on its own with that explanation; the real answer is to build
+  the flow with `apply_cards` or `copy_cards`, which remove the placeholder.
+- **Capability-change rates are a guess.** A `measure_*_changed` trigger is given
+  1–360/h and marked unknown. Homey Insights holds the real report rate per
+  device and would turn the widest part of the estimate into a measurement. Worth
+  doing; not done here.
+- **The flow enable/disable log is only as good as the polling.** A flow disabled
+  and re-enabled between two reads leaves no trace, and the timestamp is when the
+  change was noticed, not when it happened. Homey's own notifications are the
+  authoritative record, which is why the scope is worth adding.
+
 ## Follow-ups
 
 Spotted while working; none blocking, all deferred deliberately.

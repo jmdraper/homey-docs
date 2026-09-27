@@ -471,6 +471,45 @@ const TOOLS = [
     annotations: { readOnlyHint: false },
   },
   {
+    name: 'get_trigger_load',
+    description: 'Estimate how often each flow fires, from its trigger cards alone — no '
+      + 'execution history is involved. Use it when Homey has disabled a flow for executing too '
+      + 'many times, or before adding another timer to a busy canvas. An interval trigger states '
+      + 'its own rate and is exact; a capability "changed" trigger depends on how chatty the '
+      + 'device is, which nothing in the flow says, so it is given a wide range and marked '
+      + 'unknown. The part worth acting on is `flagged`: more than one interval trigger at a '
+      + 'minute or finer on one canvas, and flows triggered by something they also write, which '
+      + 'can restart themselves. Omit flowId to rank every flow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'One flow, or a prefix of its id. Omit to rank all of them.' },
+        limit: { type: 'integer', description: 'How many flows to return when ranking. Default 20, max 100.' },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'get_notifications',
+    description: "Homey's own notifications, newest first — including \"<flow> has been disabled, "
+      + 'because the Flow executed too many times\", which names the trigger card responsible and '
+      + 'is otherwise reachable only as a push notification on a phone. Also returns the flow '
+      + 'enable/disable transitions this app noticed for itself, which need no extra permission. '
+      + 'Reading Homey\'s own notifications needs a Personal Access Token carrying '
+      + 'homey.notifications.readonly; without it the transitions still come back and the result '
+      + 'says what to add.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: { type: 'string', description: 'ISO 8601 datetime — only at or after this.' },
+        until: { type: 'string', description: 'ISO 8601 datetime — only at or before this.' },
+        search: { type: 'string', description: 'Case-insensitive substring filter on the text and the owner.' },
+        limit: { type: 'integer', description: 'Default 100, max 500.' },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
     name: 'get_diagnostics',
     description: 'Report the companion app’s own health: API reachability, snapshot counts, which Homey endpoints resolved, and how many flow card titles and folder names were looked up. Use when data looks wrong or incomplete — for example if card titles appear as raw ids.',
     inputSchema: { type: 'object', properties: {} },
@@ -1022,6 +1061,14 @@ class HomeyMcpServer {
         case 'create_advanced_flow':
           return this._text(await app.createAdvancedFlow(args.name, args.folder, {
             withStartCard: args.withStartCard,
+          }));
+
+        case 'get_trigger_load':
+          return this._text(await app.getTriggerLoad(args.flowId, { limit: args.limit }));
+
+        case 'get_notifications':
+          return this._text(await app.getNotifications({
+            since: args.since, until: args.until, search: args.search, limit: args.limit,
           }));
 
         case 'get_diagnostics':

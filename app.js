@@ -200,6 +200,10 @@ const TRACEABLE_BUCKETS = {
 
 const TRACE_DEFAULT_DEPTH = 3;
 
+// How many flow enable/disable transitions to keep. Small: this is a breadcrumb
+// trail for "when did that get turned off", not a history.
+const FLOW_STATE_LOG_LIMIT = 200;
+
 // Addresses that cannot be pointed at this Homey by an attacker's DNS: IPv4 and
 // IPv6 literals, localhost, and mDNS .local names (resolved by mDNS, not DNS).
 const UNREBINDABLE_HOST_RE = /^(?:\[[0-9a-f:]+\]|\d{1,3}(?:\.\d{1,3}){3}|localhost|[a-z0-9-]+\.local)$/i;
@@ -405,13 +409,17 @@ class HomeyDocsCompanion extends Homey.App {
     });
   }
 
-  _apiRequest(method, path, body) {
+  _apiRequest(method, path, body, options) {
     const url = `${this._baseUrl}/api${path}`;
     // getLocalUrl() returns http:// or https:// depending on how the app is
     // running — picking the wrong client throws "Protocol not supported"
     const client = url.startsWith('https:') ? https : http;
     const payload = body === undefined ? null : JSON.stringify(body);
-    const writeToken = method === 'GET' ? null : this._writeToken();
+    // Writes always need the Personal Access Token. A few reads do too — Homey's
+    // notifications need a scope the app's own token does not carry — so a
+    // caller can ask for it on a GET as well.
+    const preferWriteToken = method !== 'GET' || !!(options && options.preferWriteToken);
+    const writeToken = preferWriteToken ? this._writeToken() : null;
     const headers = { Authorization: `Bearer ${writeToken || this._token}` };
     if (payload !== null) {
       headers['Content-Type'] = 'application/json';
@@ -632,6 +640,7 @@ class HomeyDocsCompanion extends Homey.App {
   async _refreshSnapshot() {
     const flows = await this._fetchAllFlows();
     if (flows) {
+      this._noteFlowStateChanges(this.snapshot.flows || {}, flows);
       this.snapshot.flows = flows;
       // Only when the read succeeded. Pruning on a failed read would read as
       // "every flow has been deleted" and throw away all the history at once.
@@ -716,6 +725,7 @@ class HomeyDocsCompanion extends Homey.App {
         return { checked: true, changed: 0 };
       }
 
+      this._noteFlowStateChanges(before, flows);
       this.snapshot.flows = flows;
       this.snapshot.refreshed_at = new Date().toISOString();
       await this._saveState();
@@ -1441,7 +1451,15 @@ class HomeyDocsCompanion extends Homey.App {
   async _resyncFlow(flowId) {
     try {
       const fresh = await this._apiGet('/manager/flow/advancedflow/' + flowId);
-      if (fresh) this.snapshot.flows[flowId] = this._flowMeta(fresh, true);
+      if (fresh) {
+        const meta = this._flowMeta(fresh, true);
+        // Log the transition here too, so a flow disabled through this app is
+        // recorded alongside the ones Homey disables by itself — otherwise the
+        // resync below hides the change from the next snapshot comparison.
+        this._noteFlowStateChanges({ [flowId]: this.snapshot.flows[flowId] || meta },
+          { [flowId]: meta });
+        this.snapshot.flows[flowId] = meta;
+      }
       await this._saveState();
       // The cache is dropped at once, so the next reader recomputes; only the
       // expensive page rebuild is deferred
@@ -2907,10 +2925,12 @@ class HomeyDocsCompanion extends Homey.App {
         otherSections.push({
           sectionNoteId: noteId.slice(0, 6),
           heading: String(source.cards[noteId].value).replace(/\s+/g, ' ').trim(),
+          y: source.cards[noteId].y || 0,
         });
       }
-      otherSections.sort((a, b) =>
-        (source.cards[a.sectionNoteId] ? 0 : 0) || a.heading.localeCompare(b.heading));
+      // Canvas order, so the list reads the way the flow does
+      otherSections.sort((a, b) => a.y - b.y);
+      for (const entry of otherSections) delete entry.y;
     }
 
     const summary = {
@@ -3214,6 +3234,385 @@ class HomeyDocsCompanion extends Homey.App {
         }
         return result;
       });
+  }
+
+
+  // ─── Trigger load ────────────────────────────────────────────────────────────
+
+  // Homey disables a flow that fires too often, and the only notice of it is a
+  // push notification. Working out which flow is at risk meant reading every
+  // canvas: the six "every 1 minute" triggers that got Dehumidifier drying
+  // disabled were plain enough once seen and invisible until then. This reads
+  // the rate off the cards instead.
+  //
+  // The estimates are honest about what they are. An interval trigger states
+  // its own rate and is exact. A capability "changed" trigger depends entirely
+  // on how chatty the device is, which nothing in the flow says, so it is given
+  // a wide range and marked unknown rather than guessed at precisely.
+  _classifyTrigger(card, titles) {
+    const id = String(card.id || '');
+    const args = card.args || {};
+    const label = this._cardLabel(card, titles);
+    const at = (kind, min, max, confidence, basis, extra) => Object.assign({
+      kind, perHour: { min, max }, confidence, basis, label,
+    }, extra || {});
+
+    if (id === 'homey:manager:cron:every_nth') {
+      const every = Number(args.n) || 1;
+      const unit = String(args.type || 'minute');
+      const seconds = ({ second: 1, minute: 60, hour: 3600, day: 86400 })[unit] || 60;
+      const period = every * seconds;
+      const rate = 3600 / period;
+      return at('interval', rate, rate, 'exact',
+        'every ' + every + ' ' + unit + (every === 1 ? '' : 's'),
+        { intervalSeconds: period });
+    }
+    if (id === 'homey:manager:cron:time_exactly' || id === 'homey:manager:cron:time_exactly_day') {
+      return at('schedule', 1 / 24, 1 / 24, 'exact',
+        'once a day at ' + (args.time || 'a fixed time'));
+    }
+    if (id === 'homey:manager:cron:sunrise' || id === 'homey:manager:cron:sunset') {
+      return at('schedule', 1 / 24, 1 / 24, 'exact', 'once a day, at ' + id.split(':').pop());
+    }
+
+    const device = id.match(/^homey:device:([0-9a-f-]{36}):(.+)$/);
+    if (device) {
+      const meta = (this.snapshot.devices || {})[device[1]];
+      const deviceName = meta ? meta.name : 'an unknown device';
+      if (/_changed$/.test(device[2])) {
+        // The one that bites. A measure_* capability on a chatty sensor can
+        // report every few seconds, and nothing on the canvas says so.
+        return at('capability change', 1, 360, 'unknown',
+          'fires on every reported change of ' + device[2].replace(/_changed$/, '')
+            + ' on ' + deviceName + ' — the rate is the device\'s, not the flow\'s',
+          { device: deviceName, capability: device[2].replace(/_changed$/, '') });
+      }
+      return at('device event', 0, 12, 'estimate',
+        'fires when ' + deviceName + ' reports ' + device[2], { device: deviceName });
+    }
+
+    if (id === 'homey:manager:logic:variable_changed') {
+      return at('logic event', 0, 60, 'unknown',
+        'fires whenever the variable changes, so its rate is whatever writes it');
+    }
+    if (id.startsWith('homey:app:com.basmilius.flowbits:')) {
+      return at('FlowBits event', 0, 60, 'unknown',
+        'fires on a FlowBits event, so its rate is whatever raises it');
+    }
+    if (id.startsWith('homey:app:nl.fellownet.chronograph:')) {
+      return at('timer event', 0, 30, 'unknown',
+        'fires when a Chronograph timer does, so its rate is whatever starts it');
+    }
+    if (id.startsWith('homey:manager:presence:')) {
+      return at('presence', 0, 4, 'estimate', 'fires as people come and go');
+    }
+    if (id.startsWith('homey:manager:alarms:')) {
+      return at('alarm', 0, 2, 'estimate', 'fires when an alarm is due');
+    }
+    return at('app event', 0, 30, 'unknown',
+      'an app card; nothing in the flow says how often it fires');
+  }
+
+  // What a trigger card listens to, but ONLY when writing the same thing would
+  // set it off again. That distinction is the whole point.
+  //
+  // "When the light turns on" is an edge: an action turning an already-on light
+  // on changes nothing and fires nothing, so a flow doing both is not a loop —
+  // it is what almost every lights flow looks like, and treating it as one
+  // flagged fifty flows here and buried the real ones. "When the temperature
+  // changes" and "when the variable changes" fire on ANY new value, so a flow
+  // that writes them can genuinely set itself off.
+  _retriggerKey(card) {
+    const id = String(card.id || '');
+    const args = card.args || {};
+
+    const device = id.match(/^homey:device:([0-9a-f-]{36}):(.+)$/);
+    if (device) {
+      if (!/_changed$/.test(device[2])) return null;
+      return 'device:' + device[1] + ':' + device[2].replace(/_changed$/, '');
+    }
+    if (id === 'homey:manager:logic:variable_changed') {
+      const variable = args.variable && (args.variable.id || args.variable.name);
+      return variable ? 'variable:' + variable : null;
+    }
+    const flowbits = id.match(/^homey:app:com\.basmilius\.flowbits:(.+)$/);
+    if (flowbits) {
+      const [, kind] = flowbits;
+      const named = family => {
+        const holder = args[family];
+        const name = holder && (holder.name || holder.id);
+        return name ? 'flowbits:' + family + ':' + name : null;
+      };
+      if (/^flag_/.test(kind)) return named('flag');
+      if (/^label_/.test(kind)) return named('label');
+      if (/^mode_group_/.test(kind)) return named('group');
+      if (/^signal_/.test(kind)) return named('signal');
+      if (/^event_/.test(kind)) return named('event');
+    }
+    return null;
+  }
+
+  // What an action card writes, in the same vocabulary.
+  _writeKey(card) {
+    const id = String(card.id || '');
+    const args = card.args || {};
+
+    const device = id.match(/^homey:device:([0-9a-f-]{36}):(.+)$/);
+    if (device) {
+      // An action names the capability it sets, give or take the on/off pair
+      const ALIASES = { on: 'onoff', off: 'onoff', onoff: 'onoff', toggle: 'onoff' };
+      return 'device:' + device[1] + ':' + (ALIASES[device[2]] || device[2]);
+    }
+    if (/^homey:manager:logic:variable_set/.test(id)) {
+      const variable = args.variable && (args.variable.id || args.variable.name);
+      return variable ? 'variable:' + variable : null;
+    }
+    const flowbits = id.match(/^homey:app:com\.basmilius\.flowbits:(.+)$/);
+    if (flowbits) {
+      const [, kind] = flowbits;
+      const named = family => {
+        const holder = args[family];
+        const name = holder && (holder.name || holder.id);
+        return name ? 'flowbits:' + family + ':' + name : null;
+      };
+      if (/^flag_/.test(kind)) return named('flag');
+      if (/^label_/.test(kind)) return named('label');
+      if (/^mode_group_/.test(kind)) return named('group');
+      if (/^signal_/.test(kind)) return named('signal');
+      if (/^event_/.test(kind)) return named('event');
+    }
+    return null;
+  }
+
+  // A flow that writes something it is re-triggered by can set itself off.
+  _feedbackLoops(cards, titles) {
+    const triggers = new Map();
+    const writes = new Map();
+    for (const card of Object.values(cards)) {
+      if (!card) continue;
+      if (card.type === 'trigger') {
+        const key = this._retriggerKey(card);
+        if (key && !triggers.has(key)) triggers.set(key, card);
+      } else if (card.type === 'action') {
+        const key = this._writeKey(card);
+        if (key && !writes.has(key)) writes.set(key, card);
+      }
+    }
+    const loops = [];
+    for (const [key, trigger] of triggers) {
+      if (!writes.has(key)) continue;
+      loops.push({
+        triggeredBy: this._cardLabel(trigger, titles),
+        andWrites: this._cardLabel(writes.get(key), titles),
+      });
+    }
+    return loops;
+  }
+
+  async getTriggerLoad(flowId, options) {
+    const opts = options || {};
+    const freshness = await this._freshness();
+    const titles = await this._fetchFlowCardTitles();
+    const folders = await this._fetchFolderNames();
+    const report = [];
+    for (const [id, meta] of Object.entries(this.snapshot.flows || {})) {
+      if (flowId && id !== flowId && !id.startsWith(flowId)) continue;
+      if (!meta.isAdvanced) {
+        // A basic flow has exactly one trigger, held in its own field
+        const trigger = (meta.cards_snapshot || {}).trigger;
+        if (!trigger) continue;
+        const classified = this._classifyTrigger(trigger, titles);
+        report.push({
+          flowId: id, name: meta.name, type: 'basic', enabled: meta.enabled,
+          folder: meta.folder ? (folders[meta.folder] || meta.folder) : null,
+          certainPerHour: classified.confidence === 'exact' ? classified.perHour.min : 0,
+          estimatedPerHour: { min: classified.perHour.min, max: classified.perHour.max },
+          triggers: [classified], flags: [],
+        });
+        continue;
+      }
+
+      const triggers = [];
+      for (const [cardId, card] of Object.entries(meta.cards_snapshot || {})) {
+        if (!card || card.type !== 'trigger') continue;
+        triggers.push(Object.assign({ cardId: cardId.slice(0, 8) },
+          this._classifyTrigger(card, titles)));
+      }
+      if (!triggers.length) continue;
+
+      const min = triggers.reduce((total, t) => total + t.perHour.min, 0);
+      const max = triggers.reduce((total, t) => total + t.perHour.max, 0);
+      // What the flow is KNOWN to do: the triggers that state their own rate.
+      // This is the number to rank on. Ranking on the upper bound ranks on
+      // speculation about how chatty a device is, and a flow with twenty
+      // capability triggers then outranks one with six timers a minute apart —
+      // which is the case this was built to find.
+      const certain = triggers
+        .filter(t => t.confidence === 'exact')
+        .reduce((total, t) => total + t.perHour.min, 0);
+
+      const flags = [];
+      const fast = triggers.filter(t => t.kind === 'interval' && t.intervalSeconds <= 60);
+      if (fast.length > 1) {
+        flags.push(fast.length + ' interval triggers at a minute or finer on one canvas ('
+          + fast.map(t => t.basis).join(', ') + '). Every one of them runs the whole flow. '
+          + 'This is the shape that gets a flow disabled for executing too many times — '
+          + 'consolidate them onto a single timer.');
+      }
+      const unknown = triggers.filter(t => t.confidence === 'unknown');
+      if (unknown.length >= 4) {
+        flags.push(unknown.length + ' triggers whose rate depends on something outside the flow. '
+          + 'The total above is a bound, not a measurement.');
+      }
+      for (const loop of this._feedbackLoops(meta.cards_snapshot || {}, titles)) {
+        flags.push('Feedback loop: triggered by "' + loop.triggeredBy + '", and writes the same '
+          + 'thing with "' + loop.andWrites + '". That trigger fires on any new value, so this '
+          + 'flow can set itself off.');
+      }
+      if (!meta.enabled) flags.push('This flow is currently DISABLED.');
+
+      report.push({
+        flowId: id, name: meta.name, type: 'advanced', enabled: meta.enabled,
+        folder: meta.folder ? (folders[meta.folder] || meta.folder) : null,
+        certainPerHour: Math.round(certain * 100) / 100,
+        estimatedPerHour: { min: Math.round(min * 100) / 100, max: Math.round(max * 100) / 100 },
+        triggerCount: triggers.length,
+        triggers: triggers.sort((a, b) => b.perHour.max - a.perHour.max),
+        flags,
+      });
+    }
+
+    if (flowId && !report.length) {
+      return { error: 'No flow found for ' + flowId + ', or it has no trigger cards' };
+    }
+
+    report.sort((a, b) => (b.certainPerHour || 0) - (a.certainPerHour || 0)
+      || b.estimatedPerHour.max - a.estimatedPerHour.max
+      || b.estimatedPerHour.min - a.estimatedPerHour.min);
+
+    const limit = flowId ? report.length : Math.min(opts.limit || 20, 100);
+    return Object.assign({
+      method: 'Static analysis of the trigger cards — no execution history is involved. An '
+        + 'interval trigger states its own rate and is exact; a capability "changed" trigger '
+        + 'depends on how often the device reports, which nothing in the flow says, so it is '
+        + 'given a wide range and marked unknown. Ranked by certainPerHour, the part that is '
+        + 'actually known, because ranking on the upper bound ranks on guesses about how chatty '
+        + 'a device is. Read estimatedPerHour as bounds, and `flagged` as the part worth acting '
+        + 'on.',
+      flowsAnalysed: report.length,
+      returned: Math.min(report.length, limit),
+    }, freshness, {
+      flagged: report.filter(entry => entry.flags.some(f => /interval triggers|Feedback loop/.test(f)))
+        .map(entry => ({ name: entry.name, flowId: entry.flowId, flags: entry.flags })),
+      flows: report.slice(0, limit),
+    });
+  }
+
+  // Homey's own notifications — which is where "this flow has been disabled,
+  // because the Flow executed too many times" appears, naming the trigger card
+  // responsible. Nothing else reports that event.
+  //
+  // Reading them needs homey.notifications.readonly, which neither the app's
+  // own token nor a flow-scoped Personal Access Token carries, so this says
+  // exactly what to add rather than failing opaquely.
+  async getNotifications(options) {
+    const opts = options || {};
+    const bound = (name, value) => {
+      if (!value) return null;
+      const at = new Date(value);
+      if (Number.isNaN(at.getTime())) throw new Error(name + ' is not a valid ISO 8601 datetime');
+      return at;
+    };
+    let since;
+    let until;
+    try { since = bound('since', opts.since); until = bound('until', opts.until); }
+    catch (e) { return { error: e.message }; }
+
+    const result = { flowStateChanges: this._flowStateChanges(since, until) };
+
+    let data;
+    try {
+      data = await this._apiRequest('GET', '/manager/notifications/notification', undefined,
+        { preferWriteToken: true });
+    } catch (e) {
+      const missingScope = /missing scopes|403/i.test(String(e.message));
+      result.notifications = null;
+      result.notificationsError = missingScope
+        ? 'Homey refused to hand over its notifications. Reading them needs the '
+          + '"homey.notifications.readonly" scope, which neither the app\'s own token nor the '
+          + 'Personal Access Token in this app\'s settings carries. Create or edit a Personal '
+          + 'Access Token in the Homey web app (Settings → API Keys) with Notifications read '
+          + 'access as well as Flow, and paste it into "Personal Access Token" in this app\'s '
+          + 'settings. The flow enable/disable transitions below are recorded by this app '
+          + 'itself and need no extra permission. (' + e.message + ')'
+        : 'Could not read notifications: ' + e.message;
+      return result;
+    }
+
+    let list = Object.values(data || {})
+      .map(entry => ({
+        id: entry.id,
+        at: entry.dateCreated,
+        owner: entry.ownerName || entry.ownerUri,
+        ownerUri: entry.ownerUri,
+        text: String(entry.excerpt || '').replace(/\*\*/g, ''),
+      }))
+      .sort((a, b) => String(b.at).localeCompare(String(a.at)));
+
+    const held = list.length;
+    const oldest = list.length ? list[list.length - 1].at : null;
+    if (since) list = list.filter(entry => new Date(entry.at) >= since);
+    if (until) list = list.filter(entry => new Date(entry.at) <= until);
+    if (opts.search) {
+      const needle = String(opts.search).toLowerCase();
+      list = list.filter(entry => entry.text.toLowerCase().includes(needle)
+        || String(entry.owner).toLowerCase().includes(needle));
+    }
+
+    result.held = held;
+    result.oldestHeld = oldest;
+    result.matched = list.length;
+    result.notifications = list.slice(0, Math.min(opts.limit || 100, 500));
+    result.flowDisables = list.filter(entry => /disabled, because the Flow executed too many/i.test(entry.text));
+    if (result.flowDisables.length) {
+      result.flowDisableNote = 'Homey disabled these flows itself for firing too often. The card '
+        + 'id in the message is the trigger that did it. get_trigger_load explains why.';
+    }
+    return result;
+  }
+
+  // Flow enable/disable transitions this app noticed for itself, which needs no
+  // extra permission. Only as good as how often the snapshot is compared — a
+  // flow disabled and re-enabled between two reads leaves no trace.
+  _flowStateChanges(since, until) {
+    const log = this.homey.settings.get('flow_state_log') || [];
+    return log.filter(entry => {
+      const at = new Date(entry.at);
+      if (since && at < since) return false;
+      if (until && at > until) return false;
+      return true;
+    });
+  }
+
+  _noteFlowStateChanges(before, after) {
+    const changes = [];
+    for (const [id, meta] of Object.entries(after)) {
+      const was = before[id];
+      if (!was || was.enabled === meta.enabled) continue;
+      changes.push({
+        at: new Date().toISOString(), flowId: id, name: meta.name,
+        from: was.enabled ? 'enabled' : 'disabled',
+        to: meta.enabled ? 'enabled' : 'disabled',
+        noticedBy: 'the companion app comparing snapshots, so the time is when it was noticed, '
+          + 'not necessarily when it happened',
+      });
+    }
+    if (!changes.length) return;
+    const log = (this.homey.settings.get('flow_state_log') || []).concat(changes);
+    this.homey.settings.set('flow_state_log', log.slice(-FLOW_STATE_LOG_LIMIT));
+    for (const change of changes) {
+      this.log('Flow "' + change.name + '" went from ' + change.from + ' to ' + change.to);
+    }
   }
 
   // ─── Tracing behaviour across flows ──────────────────────────────────────────
