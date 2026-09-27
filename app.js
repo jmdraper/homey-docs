@@ -1143,6 +1143,11 @@ class HomeyDocsCompanion extends Homey.App {
             + 'one column — so this note has been placed against a position that is about to '
             + 'change. Call relayout_flow first, then add notes, or this one may end up '
             + 'labelling the wrong section.';
+          // Also to the app log: the result above only reaches the assistant
+          // that made the call, and whether the user hears about it is then
+          // that assistant's choice.
+          this.error('Note added to "' + draft.name + '" before the flow was laid out — it may '
+            + 'end up labelling the wrong section. Run relayout_flow, then re-add the note.');
         }
       }
       return result;
