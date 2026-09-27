@@ -1244,13 +1244,14 @@ class HomeyDocsCompanion extends Homey.App {
   async _answerWithin(phase, work) {
     let timer = null;
     const expired = Symbol('expired');
+    // Homey's own timer, like every other in this app, so it is cleaned up if
+    // the app stops while a write is in flight
     const timeout = new Promise(resolve => {
-      timer = setTimeout(() => resolve(expired), WRITE_TIMEOUT_MS);
-      if (timer.unref) timer.unref();
+      timer = this.homey.setTimeout(() => resolve(expired), WRITE_TIMEOUT_MS);
     });
 
     const result = await Promise.race([work, timeout]);
-    clearTimeout(timer);
+    this.homey.clearTimeout(timer);
     if (result !== expired) return result;
 
     // Saying "nothing was written" is only honest if the write is also stopped.
