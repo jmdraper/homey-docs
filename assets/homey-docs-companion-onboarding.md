@@ -1,32 +1,43 @@
 # Homey Docs Companion — Working with Claude
 
-The companion app exposes your Homey Pro to Claude over MCP. Instead of maintaining
-a separate folder of documentation that slowly drifts out of date, Claude reads your
-live configuration whenever you ask it something.
+The companion app exposes your Homey Pro to Claude over MCP: it can read your live
+configuration, follow behaviour across flows, and — once you allow it — edit advanced
+flows and write notes onto their canvases.
 
 ---
 
-## What you'll be able to do
+## Where knowledge lives
 
-- Ask what a flow does, in plain English, without opening the flow editor
-- Find every flow that touches a given variable, FlowBits event, timer or label
-- Trace behaviour that spans several flows at once
-- Work out why something fired — or why it didn't
-- Audit for broken flows, orphaned variables, and duplicated logic
+Three kinds of knowledge, each kept where its source of truth naturally sits.
 
-Nothing is written to disk and nothing drifts: every answer comes from the current
-state of your Homey.
+**Wiring — what is connected to what.** Read live, every time. Never written down.
+A description of wiring is out of date the moment anything is rewired, and this app
+exists so that nothing has to be kept in step by hand.
+
+**Why a section of a flow is built the way it is.** A note card on that flow's canvas,
+beside the section it explains. Notes are part of the flow, so they are visible in the
+Homey app, editable by hand, and included in flow backups.
+
+**Everything else** — cross-flow design, decisions and the reasoning behind them,
+approaches you tried and abandoned, notes about the house and its devices, conventions,
+the backlog — lives outside Homey, wherever you keep your own notes. This app neither
+stores it nor knows about it.
 
 ---
 
 ## Prerequisites
 
-Before pasting the prompt below, confirm:
+1. **Homey Docs Companion** installed and running on your Homey Pro
+2. **MCP server** configured in your AI tool — the viewer's Setup panel walks through it
+3. You can call `list_flows_metadata` and get valid JSON back
 
-1. **Homey Docs Companion** is installed and running on your Homey Pro
-2. **MCP server** is configured in your AI tool — the viewer's Setup panel walks
-   through this
-3. You can call `list_flows_metadata` and get back a valid JSON response
+For editing, two further deliberate steps, both in the app's settings:
+
+4. **Allow AI assistants to edit flows** turned on
+5. A **Personal Access Token** with Flows access pasted in — the app's own token can
+   read flows but not change them
+
+Leave either unset and everything stays read-only.
 
 ---
 
@@ -38,95 +49,119 @@ Paste everything between the `---` markers into Claude.
 
 ```
 I've connected you to my Homey Pro through the Homey Docs Companion MCP server.
-You can read my flows, devices, variables and zones directly. I'd like you to get
-oriented before I start asking questions.
+Before I start asking questions, get oriented — and read these working rules first,
+because they matter more than the tool list.
 
-## About my setup
+## Working rules
 
-My flows, devices and variables are all my own — please don't assume anything about
-what they do or how they're named. Read my actual Homey data before drawing any
-conclusions, and tell me when you're inferring rather than reading.
+**Read wiring live. Never write it down.** If you want to know what a flow does, call
+get_flow_summary. Do not record what it does in a note, a file, or anywhere else. A
+saved description goes stale silently, and a stale description is worse than none.
 
-## How to explore efficiently
+**Notes explain why, not what.** When you write a note onto a flow, it should say
+something the wiring cannot: why this test is here, what breaks without it, which
+other flow it must not fight with, why the obvious simpler version does not work.
+Never restate the wiring — the summary already shows it. A useful test: if a routine
+rewire would make the note false, it is a bad note. Keep them to a sentence or two.
 
-Full Advanced Flow JSON is expensive — every card is a UUID and every connection is
-an array of UUIDs. Work from cheap to expensive:
+**Anything not about one specific flow goes in my own notes, not Homey.** Design that
+spans flows, decisions and their reasoning, dead ends, device quirks, the backlog —
+tell me and I will file it. Do not invent a place to keep it.
 
-1. `list_flows_metadata` — every flow with name, enabled, broken, card count, folder.
-   Start here for the shape of my setup.
-2. `list_folders` — folder names, so you can group related behaviour.
-3. `get_cross_references` — the index of which flows read, write, or trigger on each
-   variable, FlowBits event, label, set, and timer. This is usually the fastest way
-   to answer "what touches X?" without reading a single flow.
-4. `list_variables`, `list_devices`, `list_zones` — names, types, current values,
-   rooms. Needed to make sense of card arguments.
-5. Only then pull specific flows: `get_flows_by_ids` for advanced flows (fetch 3–6
-   related ones at once), `get_basic_flows_by_ids` for basic flows.
+**Say when you are inferring.** My flows are my own; do not assume what they do from
+their names.
 
-Avoid `get_all_advanced_flows` unless I explicitly ask for a complete audit — it will
-consume a very large amount of context.
+## Explore from cheap to expensive
 
-## Reading flow cards
+1. `list_flows_metadata` — every flow with name, folder, enabled, broken, card count.
+2. `list_folders` — I group flows by area, so the folder is a strong hint.
+3. `get_cross_references` — the index of which flows read, write or trigger on each
+   device, variable, FlowBits event, mode, flag, timer and signal. Usually the fastest
+   way to answer "what touches X?" without reading a flow at all.
+4. `search_flows` — find flows by what they contain, rather than guessing names.
+5. `trace_behaviour` — when something spans flows, this follows it. Give it any name —
+   a device, variable, flow, or FlowBits entity — and it returns what affects it and
+   what it affects. Start at depth 3 and raise it only if the answer looks cut off.
+6. `get_flow_summary` — one flow, resolved and readable, with the author's notes in
+   place. Prefer it to get_advanced_flow, which is raw ids and costs far more to read.
 
-Card IDs look like `homey:app:com.example:some_card`. Call `get_app_actions` to get
-human-readable titles for every installed app's triggers, conditions and actions, and
-use it to translate card IDs rather than guessing from the ID string.
+Avoid `get_all_advanced_flows` unless I ask for a full audit; it is very large.
 
-Advanced Flow cards carry their connections inline: `outputTrue`, `outputFalse`,
-`outputSuccess` and `outputError` each hold the IDs of the cards they lead to. Follow
-those to understand execution order — the card list alone is unordered.
+## Reading a flow
+
+Card ids look like `homey:app:com.example:some_card`. `get_app_actions` gives readable
+titles for every installed app's cards.
+
+Advanced flow cards carry their connections inline — `outputTrue`, `outputFalse`,
+`outputSuccess`, `outputError` each hold the ids of the cards they lead to. Follow
+those for execution order; the card list alone is unordered.
+
+Notes already on the canvas are the author's own explanation. Read them before
+inferring intent, and treat a red note as something I mean to change soon.
+
+## Editing, if it is turned on
+
+Every edit saves a revision first, so anything can be undone with revert_flow. Even so:
+
+- Tell me what you intend to change and why, and wait, unless I have already said go.
+- `set_flow_enabled(false)` is the reversible way to stop a flow. There is no delete
+  tool, by design — recreating a flow gives it a new id and breaks everything that
+  triggers it.
+- Get card ids from `get_flow_summary` with `withCardIds: true`.
+- After building or restructuring a flow, call `relayout_flow` — then add notes. A
+  note records only its position, so one added before the cards are placed can end up
+  labelling the wrong section.
+- `remove_card` needs `confirm: true`. Ask me first.
 
 ## What I'd like from you now
 
-1. Survey my setup and tell me roughly how it's organised — how many flows, how
-   they're grouped into folders, which areas of the home they cover.
-2. Flag anything that looks like a problem: flows marked broken, flows that are
-   disabled but look intentional, variables nothing reads, obvious duplication.
-3. Give me a short list of the things you'd want to understand better, so I can tell
-   you which matter.
+1. Survey my setup: roughly how many flows, how they are grouped, which areas of the
+   house they cover.
+2. Flag anything that looks wrong: broken flows, flows disabled that look like they
+   should not be, variables nothing reads, obvious duplication between flows.
+3. Tell me which parts you would want to understand better, and I will point you at
+   the ones that matter.
 
-Don't write any documentation files. I'll ask you questions directly from here.
+Don't write any documentation files, and don't write notes onto flows yet.
 ```
 
 ---
 
 ## After first run
 
-From this point on, just ask. Useful shapes of question:
+Ask directly. Useful shapes of question:
 
 - *"What turns on the hall lights, and under what conditions?"*
-- *"Which flows write to the `HolidayMode` variable?"*
-- *"Why might the bedroom heating have come on at 3am?"* — pair this with
-  `get_logs` if you have the Simple (Sys) Log app installed
-- *"Is anything still referencing the old porch sensor I removed?"*
-- *"Show me every flow that runs between midnight and 6am."*
+- *"What would break if I deleted this variable?"* — `trace_behaviour` answers this
+- *"Why might the bedroom heating have come on at 3am?"* — pair with `get_logs` if the
+  Simple (Sys) Log app is installed
+- *"Is anything still referencing the porch sensor I removed?"*
+- *"Add a note to this flow explaining why the delay is there."*
 
-Claude reads the current state each time, so answers stay correct as you change
-things. If you've just edited a flow and want to be certain the cached index is
-current, ask it to call `refresh_snapshot` first — otherwise the cache is at most
-five minutes old.
+Claude reads the current state each time, so answers stay correct as you change things.
+If you have just edited a flow and want certainty the cached index is current, ask it
+to call `refresh_snapshot` — otherwise the cache is at most five minutes old.
 
 ---
 
-## Where to see the cross-references yourself
+## Seeing the same picture yourself
 
-The same index Claude uses is browsable at `http://[homey-ip]:8734/`, or via GitHub
-Pages if you've set that up. It shows every variable, FlowBits event, label, timer
-and flow trigger, with the flows that use each one and what they do with it — reads,
-writes, triggers on, fires, checks.
+The cross-reference index Claude uses is browsable at `http://[homey-ip]:8734/`. It
+lists every device, variable, FlowBits entity, timer and flow trigger, with the flows
+that use each one and what they do with it.
 
-Use the viewer when you want to see the shape of things yourself, and Claude when you
-want an explanation.
+Use the viewer to see the shape of things yourself, and Claude when you want an
+explanation or a change.
 
 ---
 
 ## Tips
 
-- **Be specific about scope.** "Explain my heating" will pull a lot of flows.
-  "Explain how the upstairs thermostat decides its setpoint" will pull a few.
-- **Name things exactly.** Variable and flow names are matched literally; if you're
-  unsure of a name, ask Claude to list the candidates first.
-- **Ask for the reasoning.** "Walk me through the card path" gets you the execution
-  order, not just a summary.
-- **Correct it.** If Claude infers something wrong about your intent, say so — it's
-  reading structure, not your reasons for building it that way.
+- **Be specific about scope.** "Explain my heating" pulls a lot of flows. "Explain how
+  the upstairs thermostat decides its setpoint" pulls a few.
+- **Ask for the reasoning**, not just the summary — "walk me through the card path".
+- **Correct it.** If it infers something wrong about your intent, say so. It reads
+  structure; it cannot read why you built things that way — which is exactly what the
+  notes on the canvas are for.
+- **Ask it to write a note** when it works something out that you would otherwise have
+  to rediscover. That is the one thing worth persisting, and it belongs on the flow.

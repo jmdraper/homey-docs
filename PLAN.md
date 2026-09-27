@@ -1,6 +1,6 @@
 # Homey Docs Companion — Development Plan
 
-Status: steps 1–6 complete. Built one step at a time, in order.
+Status: steps 1–7 built; step 7 awaiting on-device testing. Built one step at a time, in order.
 
 ## Context
 
@@ -449,7 +449,7 @@ logic that only ran for newly added cards could not tidy a flow that already exi
   It cannot be prevented — position is the only anchor Homey stores — so the note is
   coloured **red**, matching the convention that red means "change this soon".
 
-## Step 7 — Trace behaviour, and canvas notes as the annotation layer
+## Step 7 — Trace behaviour, and canvas notes as the annotation layer ✅ built
 
 ### Where knowledge lives
 
@@ -598,11 +598,16 @@ Against the finished tool set. It must teach:
 
 ### Done when
 
-- `trace_behaviour` explains a multi-flow behaviour in a single call.
+- `trace_behaviour` explains a multi-flow behaviour in a single call. ✅ verified
+  offline against live data: tracing the FlowBits flag "Ensuite dark" returns the flow
+  that sets it (and what that flow reads to decide) and the flow that checks it (and
+  what it goes on to control).
 - `add_flow_note` places a note beside a named card with no overlap; the note appears
   in the Homey editor, is captured in the revision stack, and can be reverted.
+  **Not yet tested on-device** — needs an install.
 - `get_flow_summary` shows notes inline under the correct card across a sample of real
-  flows, checked against the editor.
+  flows, checked against the editor. ✅ 477 of 517 notes attach; the inline note on the
+  reference flow lands on the nested `ANY` it describes.
 - `list_folders` works. ✅ already true.
 
 ## Follow-ups
