@@ -1031,8 +1031,11 @@ class HomeyMcpServer {
           return this._text(await app._refreshSnapshot());
 
         case 'get_cross_references': {
-          const xref = await app.getCachedCrossReferences();
-          return this._text(args.type ? { [args.type]: xref[args.type] } : xref);
+          const xref = await app.getCachedCrossReferences({ checkFreshness: true });
+          const { _freshness, ...buckets } = xref;
+          return this._text(args.type
+            ? Object.assign({ [args.type]: buckets[args.type] }, _freshness)
+            : Object.assign({}, buckets, _freshness));
         }
 
         default:

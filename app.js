@@ -9,6 +9,14 @@ const path = require('path');
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
+// How often a read may check whether the snapshot has fallen behind Homey. The
+// check is one GET of all flows and a hash per flow; the expensive part — the
+// cross-reference rebuild and the viewer page — only runs when something has
+// actually changed. Ten seconds is short enough that a hand edit in the flow
+// editor is picked up before the next question about it, and long enough that
+// a burst of searches costs one check rather than twenty.
+const SNAPSHOT_FRESHEN_MIN_MS = 10000;
+
 // Writable fields on an advanced flow. id, uri and triggerable are read-only,
 // and broken is derived by Homey, so sending them back invites a rejection.
 const ADVANCED_FLOW_WRITABLE = ['name', 'enabled', 'folder', 'cards'];
@@ -455,7 +463,7 @@ class HomeyDocsCompanion extends Homey.App {
     const cardCount = flow.cards
       ? Object.keys(flow.cards).length
       : (flow.trigger ? 1 : 0) + (flow.conditions || []).length + (flow.actions || []).length;
-    return {
+    const meta = {
       name: flow.name,
       folder: flow.folder || null,
       enabled: flow.enabled !== false,
@@ -464,6 +472,15 @@ class HomeyDocsCompanion extends Homey.App {
       isAdvanced,
       cards_snapshot: JSON.parse(JSON.stringify(cardPayload))
     };
+    // A digest of everything we hold about the flow, so a re-read can tell in
+    // one comparison whether this flow has changed. Homey offers no signal of
+    // its own — an advanced flow carries no updatedAt and no revision counter,
+    // and the hash this once had was removed with change tracking — so the only
+    // way to know is to look at the payload.
+    meta.hash = crypto.createHash('sha1')
+      .update(JSON.stringify([meta.name, meta.folder, meta.enabled, meta.broken, cardPayload]))
+      .digest('hex').slice(0, 16);
+    return meta;
   }
 
   _deviceMeta(device) {
@@ -633,12 +650,111 @@ class HomeyDocsCompanion extends Homey.App {
     if (zones) this.snapshot.zones = zones;
 
     if (!this.snapshot.initialised_at) this.snapshot.initialised_at = new Date().toISOString();
+    this.snapshot.refreshed_at = new Date().toISOString();
+    this._freshenedAtMs = Date.now();
+    this._verifiedAtMs = Date.now();
 
     await this._saveState();
     this.log(`Snapshot refreshed: ${Object.keys(this.snapshot.flows).length} flows, ${Object.keys(this.snapshot.devices).length} devices, ${Object.keys(this.snapshot.zones).length} zones`);
 
     await this.regenerateXrefPage();
     return { refreshed: true, flows: Object.keys(this.snapshot.flows).length };
+  }
+
+  // How stale the cached picture is, in seconds. Reported by every read that
+  // answers from the snapshot: after Jon edited flows by hand, search_flows
+  // went on calling the new flow disabled and missing its new wiring, with
+  // nothing in the answer to suggest it was describing a Homey from five
+  // minutes ago.
+  _snapshotAge() {
+    const at = this.snapshot.refreshed_at || this.snapshot.initialised_at;
+    const writtenMs = at ? new Date(at).getTime() : 0;
+    // A check that found nothing changed is just as good as a re-read: it
+    // establishes that the cached picture still matches Homey. Reporting the
+    // age of the last WRITE instead would say "47s old" about a snapshot
+    // verified a moment ago, and writing 1.4MB of settings every ten seconds
+    // to move a timestamp would be a poor trade.
+    const knownGoodMs = Math.max(writtenMs, this._verifiedAtMs || 0);
+    if (!knownGoodMs) return null;
+    return Math.max(0, Math.round((Date.now() - knownGoodMs) / 1000));
+  }
+
+  // Bring the snapshot back in line before answering a question from it, doing
+  // only the work that is actually needed. Re-reading the flows is one request;
+  // rebuilding the cross-reference index and the viewer page is the expensive
+  // part, and that only happens when a hash has moved.
+  //
+  // Rate-limited, and deduplicated while one is in flight, so a run of searches
+  // costs one check.
+  async _freshenSnapshot() {
+    if (this._freshening) return this._freshening;
+
+    const sinceLast = Date.now() - (this._freshenedAtMs || 0);
+    if (sinceLast < SNAPSHOT_FRESHEN_MIN_MS) {
+      return { checked: false, becauseCheckedSecondsAgo: Math.round(sinceLast / 1000) };
+    }
+
+    this._freshening = (async () => {
+      const flows = await this._fetchAllFlows();
+      this._freshenedAtMs = Date.now();
+      if (!flows) return { checked: false, error: 'could not re-read the flows from Homey' };
+
+      const before = this.snapshot.flows || {};
+      const changed = [];
+      const added = [];
+      const removed = [];
+      for (const [id, meta] of Object.entries(flows)) {
+        if (!before[id]) added.push(meta.name);
+        else if (before[id].hash !== meta.hash) changed.push(meta.name);
+      }
+      for (const [id, meta] of Object.entries(before)) {
+        if (!flows[id]) removed.push(meta.name);
+      }
+
+      this._verifiedAtMs = Date.now();
+      if (!changed.length && !added.length && !removed.length) {
+        return { checked: true, changed: 0 };
+      }
+
+      this.snapshot.flows = flows;
+      this.snapshot.refreshed_at = new Date().toISOString();
+      await this._saveState();
+      this._xrefCache = null;
+      this._scheduleXrefRebuild();
+      if (removed.length) await this._dropOrphanedRevisions(flows);
+
+      this.log('Snapshot was behind Homey:', changed.length, 'changed,',
+        added.length, 'added,', removed.length, 'removed');
+      return {
+        checked: true,
+        changed: changed.length + added.length + removed.length,
+        changedFlows: changed.length ? changed : undefined,
+        newFlows: added.length ? added : undefined,
+        deletedFlows: removed.length ? removed : undefined,
+      };
+    })();
+
+    try { return await this._freshening; }
+    finally { this._freshening = null; }
+  }
+
+  // What a read should say about the state of its own source.
+  async _freshness() {
+    const check = await this._freshenSnapshot();
+    const freshness = { snapshotAge: this._snapshotAge() };
+    if (check && check.changed) {
+      freshness.rereadBeforeAnswering = check.changed;
+      freshness.changedFlows = check.changedFlows;
+      freshness.newFlows = check.newFlows;
+      freshness.deletedFlows = check.deletedFlows;
+      freshness.note = 'Homey had changed since the last read, so these flows were re-read '
+        + 'before answering. The answer below reflects Homey as it is now.';
+    }
+    if (check && check.error) {
+      freshness.warning = 'Could not check whether Homey has changed (' + check.error
+        + '), so this answer comes from a cache ' + this._snapshotAge() + 's old.';
+    }
+    return freshness;
   }
 
   // ─── Public API (called by api.js) ───────────────────────────────────────────
@@ -3189,6 +3305,7 @@ class HomeyDocsCompanion extends Homey.App {
   }
 
   async traceBehaviour(target, depth, direction) {
+    const freshness = await this._freshness();
     const graph = await this._behaviourGraph();
     const found = this._resolveTraceTarget(target, graph);
     if (found.error) return found;
@@ -3207,6 +3324,13 @@ class HomeyDocsCompanion extends Homey.App {
     const out = [];
     out.push('Trace: ' + (found.flow ? describeFlow(found.flow) : describeEntity(found.node)));
     out.push('Depth ' + maxDepth + '. Upstream is what changes a thing; downstream is what reacts to it.');
+    out.push('Read from a snapshot ' + freshness.snapshotAge + 's old.'
+      + (freshness.rereadBeforeAnswering
+        ? ' ' + freshness.rereadBeforeAnswering + ' flow(s) had changed on Homey and were '
+          + 're-read first: ' + [].concat(freshness.changedFlows || [], freshness.newFlows || [],
+            freshness.deletedFlows || []).join(', ') + '.'
+        : '')
+      + (freshness.warning ? ' ' + freshness.warning : ''));
 
     for (const way of want) {
       out.push('');
@@ -3586,6 +3710,7 @@ class HomeyDocsCompanion extends Homey.App {
   async searchFlows(query, limit) {
     const q = String(query || '').trim().toLowerCase();
     if (!q) return { error: 'query is required' };
+    const freshness = await this._freshness();
     const titles = await this._fetchFlowCardTitles();
     const max = Math.min(limit || 20, 100);
     const results = [];
@@ -3620,7 +3745,9 @@ class HomeyDocsCompanion extends Homey.App {
       }
     }
     results.sort((a, b) => b.matches.length - a.matches.length || a.name.localeCompare(b.name));
-    return { query, matched: results.length, returned: Math.min(results.length, max), results: results.slice(0, max) };
+    return Object.assign({ query, matched: results.length,
+      returned: Math.min(results.length, max) }, freshness,
+    { results: results.slice(0, max) });
   }
 
   async getAppActions() {
@@ -3970,11 +4097,15 @@ function copyPrompt(){
   // a rebuild — reuses whatever regenerateXrefPage() last computed, falling
   // back to a one-off build if the cache hasn't been populated yet (e.g. right
   // after a restart that skipped regeneration because xref_html already existed).
-  async getCachedCrossReferences() {
+  async getCachedCrossReferences(options) {
+    // The viewer rebuilds on its own schedule and does not want a re-read on
+    // every page load; a question asked through the MCP does.
+    const freshness = (options && options.checkFreshness) ? await this._freshness() : null;
     if (!this._xrefCache) {
       this._xrefCache = await this.getCrossReferences();
     }
-    return this._xrefCache;
+    return freshness ? Object.assign({}, this._xrefCache, { _freshness: freshness })
+      : this._xrefCache;
   }
 
   async getCrossReferences() {
