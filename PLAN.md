@@ -1,6 +1,6 @@
 # Homey Docs Companion — Development Plan
 
-Status: steps 1–5 complete. Built one step at a time, in order.
+Status: steps 1–6 complete. Built one step at a time, in order.
 
 ## Context
 
@@ -34,6 +34,8 @@ Three consequences drive the work below:
 | Separate buckets for FlowBits vs Chronograph timers | Different namespaces with colliding names; mirrors the existing `variables` / `bll_variables` precedent |
 | Dispatch FlowBits cards by **card-ID prefix**, not arg shape | `mode_activate` and `cycle` both use `args.name.name` — arg-shape dispatch cannot tell them apart |
 | No flow-deletion tool; deletion stays a human action | Reversal is lossy regardless of backup — a recreated flow gets a new ID, breaking every inbound programmatic trigger |
+| Canvas notes are the annotation layer; no annotation store in app settings | A per-flow cache of "understanding" is the stale-description problem again — wiring should be re-derived live. Most knowledge worth keeping spans flows or is not about flows at all, so a per-flow-id store is the wrong shape. Settings are invisible in the Homey editor, cannot be edited by hand, are lost when the app is uninstalled, and are orphaned when a flow is recreated with a new id — the same argument the plan uses against a deletion tool. Notes are cards, so Flow Version History backs them up; settings it does not. Settings already carry `snapshot` and a ~192KB `xref_html` |
+| Notes attach to cards by geometry, not a stored link | Homey stores no anchor on a note; position is the only signal there is. Attach to the nearest card within a threshold, and leave distant or ambiguous notes as flow-level |
 | Keep a revision *stack* per flow in `/userdata`, not one slot in settings | Agent editing is iterative; a single pre-edit slot is overwritten by the second edit. Settings already carry `snapshot` and `xref_html` and should not hold bulk revisions |
 
 ## Step 1 — Remove change tracking ✅ done
@@ -335,7 +337,7 @@ host to allow is discoverable rather than guessed at.
 that network trust does not cover; a shared secret would add client configuration
 without addressing it.
 
-## Step 6 — Write support for advanced flows
+## Step 6 — Write support for advanced flows ✅ done
 
 **Editing requires a Personal Access Token — a platform constraint, not a choice.**
 The app's own token (`getOwnerApiToken`) carries `homey.flow.readonly` but not
@@ -423,26 +425,185 @@ clobber a write in flight.
 **Docs** — the viewer Setup panel and `README.txt` need the write-mode opt-in explained.
 
 **Done when:** a card argument can be edited through MCP, listed as a revision, and
-reverted to any retained revision, with the viewer reflecting both.
+reverted to any retained revision, with the viewer reflecting both. ✅ Verified on a
+live flow: a log card's text was changed through `update_card_args` (addressed by an
+eight-character id prefix), the change appeared in `get_flow_summary`, a revision was
+written, and `revert_flow` restored the arguments byte-identically.
 
-## Step 7 — Deeper navigation, post-write
+**Also exercised on live flows:** `create_advanced_flow`, `add_card`, `connect_cards`,
+`remove_card`, `set_flow_enabled`, `rename_flow`, `list_flow_revisions`,
+`revert_flow`, and `relayout_flow` — the last added during the step, since placement
+logic that only ran for newly added cards could not tidy a flow that already existed.
 
-Deferred until writes land, because both benefit from the graph and storage work above.
+**Found by testing, beyond the plan:**
+- **ALL cards carry an explicit `input` array** of `"<cardId>::<output>"` entries, one
+  per incoming connection — 257 of 257, no other type has one, and Homey sizes the
+  card from it. The write tools edited output arrays without maintaining it, so
+  connecting anything to a gate left it disagreeing with its own connections. Every
+  write now rebuilds these from the edges before validating.
+- Creating a flow with no cards is rejected (`Advanced Flow is empty`), so
+  `create_advanced_flow` seeds a `start` card.
+- Rebuilding the whole cross-reference page on every write made a 53-write build kill
+  the app; the rebuild is now deferred and coalesced.
+- A note attached before a flow is laid out is filed against a meaningless position.
+  It cannot be prevented — position is the only anchor Homey stores — so the note is
+  coloured **red**, matching the convention that red means "change this soon".
 
-**`trace_behaviour(target)` — transitive dependency walk.** The graph pieces already
-exist: `flow_triggers` maps flow→flow, and the variable/event/mode indices map
-flow→state→flow. Unify them into one graph and walk it transitively, so "what does
-this thermostat variable touch, upstream and downstream" returns a connected subgraph
-rather than a single hop. This is the direct answer to behaviour spread across several
-complex advanced flows.
+## Step 7 — Trace behaviour, and canvas notes as the annotation layer
 
-**`set_flow_note(id, text)` — persistent annotation layer.** Stored in app settings,
-returned inline with every flow read. With the markdown docs system retired, this gives
-Claude somewhere to accumulate understanding across sessions without an external folder
-— a much lighter replacement for what the sync workflow provided.
+### Where knowledge lives
 
-**Done when:** a single call explains a multi-flow behaviour, and notes written in one
-session are visible in the next.
+Three kinds of knowledge, each kept where its source of truth naturally sits:
+
+1. **Wiring, state and mechanical relationships** — read live from Homey through this
+   app (`get_flow_summary`, `search_flows`, `get_cross_references`,
+   `trace_behaviour`). Never cached as prose.
+2. **Why a section of a flow is built the way it is** — a canvas note card on that
+   flow, beside the section it explains. The reference Homey already carries 521 of
+   them, and `get_flow_summary` already surfaces them.
+3. **Cross-flow design, decision history, abandoned approaches, house and device
+   context, conventions, backlog** — kept outside Homey entirely, in the user's
+   NotePlan wiki. This app neither stores nor knows about it.
+
+### A. `trace_behaviour(target)` — unchanged
+
+**Scope, decided before building:** the target may be any named entity — a variable,
+device, flow, or FlowBits event, mode, flag, timer or signal — with the type
+auto-detected from the cross-reference index. It walks both directions to a default
+depth of 3 hops, overridable, and renders an indented text tree in the manner of
+`get_flow_summary`. Bounding by depth is what stops a hub such as a house-state
+variable returning a large fraction of the estate in one call; the text form keeps it
+cheap to read.
+
+Direction is causal rather than structural: a flow that **writes, fires, activates,
+controls or sends** an entity is upstream of it, and one that **reads, checks or
+triggers on** it is downstream. So walking downstream from a variable finds the flows
+that react to it, then whatever those flows go on to change, and so on.
+
+The graph pieces already exist: `flow_triggers` maps flow→flow, and the
+variable/event/mode indices map flow→state→flow. Unify them into one graph and walk it
+transitively, so "what does this thermostat variable touch, upstream and downstream"
+returns a connected subgraph rather than a single hop. This is the direct answer to
+behaviour spread across several complex advanced flows.
+
+### B. Canvas note write tools
+
+Built on the step 6 write path, so each inherits the `writes_enabled` gate, the
+Personal Access Token, a revision snapshot before every write, graph validation,
+post-write re-fetch and cross-reference invalidation, and the MCP annotations.
+
+**The note card's shape**, from all 521 on the reference Homey — inspected, not assumed:
+
+| Field | Value |
+|---|---|
+| `type` | `"note"` |
+| `value` | the text — a **top-level field, not an argument** |
+| `color` | `yellow` (443), `blue` (44), `green` (24), `red` (10) |
+| `x`, `y` | position — the only record of what the note refers to |
+| `width`, `height` | **always `null`**, on every one of the 521; Homey sizes them at render time |
+| `id` | present on 107, always the literal string `"undefined:undefined"` — an editor artefact carrying no meaning |
+
+There is no anchor, parent or link field of any kind. A note floats.
+
+**`update_card_args` cannot edit note text.** Checked rather than assumed: it assigns
+`card.args`, and a note's text is `card.value`. A separate tool is needed.
+
+- `add_flow_note(flowId, text, nearCardId?, color?)` — creates a note card. With
+  `nearCardId`, auto-layout places it beside that card, clear of every other card;
+  without, it goes in free space as a flow-level note. Rejects basic flows with a
+  clear message — they have no canvas.
+- `update_flow_note(flowId, noteCardId, text)` — sets `value`.
+- Removal uses the existing `remove_card` with `confirm: true`.
+
+Placement reuses the geometry already measured for the layout work: a heading note
+sits its own height above the card it labels, and note height is estimated from text
+length, since the stored height is null.
+
+### C. Attach notes to cards in `get_flow_summary`
+
+**Partly built already.** The summary attaches each note to its nearest card and
+prints it as a `#` line at that card's depth. Three things are missing: a distance
+threshold, handling of ambiguity, and note card ids.
+
+Measured across all 521 notes:
+
+| distance from a note to its nearest card | |
+|---|---|
+| min | 60 |
+| median | 80 |
+| 75th percentile | 120 |
+| 90th | 160 |
+| 95th | 233 |
+| max | 3841 |
+
+The long tail is real — some notes sit nowhere near anything. The margin between the
+nearest and second-nearest card has a median of 120, but **58 of 521 (11%) are within
+40px of each other**, so ambiguity has to be handled rather than resolved.
+
+**Measure centre to centre, not between bounding boxes.** Bounding boxes were tried
+first, as originally specified, and are worse: the gap between two rectangles
+saturates at zero the moment they overlap, so a note sitting among several cards ties
+with all of them at distance 0 and attaches to none. On the reference flow the blue
+note beside the nested `ANY` tied with four cards at 0, 0, 12 and 20. Centres separate
+the same case cleanly — 117 against a runner-up at 278 — and pick the card a reader
+would.
+
+Settled values, measured over 517 notes with centre distance:
+
+| | |
+|---|---|
+| median distance to nearest card | 100 |
+| 95th percentile | 238 |
+| max | 3841 |
+| notes within 20px of two cards | 25 (5%) |
+
+- **Threshold 240**, just above the 95th percentile. Beyond it a note is flow-level
+  and listed after the tree.
+- **Ambiguous when the two nearest cards are within 20px of each other** — 5% of
+  notes, genuine ties. Left at flow level rather than guessed at.
+- A note renders with its card wherever that card is rendered — including once only,
+  where the card appears in a convergent section rendered once.
+- **Headings render above their card, inline notes beneath it.** A note at the left
+  margin heads a section and reads correctly above it; one out in the flow annotates a
+  single card and belongs under it. The original brief said beneath in both cases,
+  which reads wrongly for headings.
+- With `withCardIds`, each note's own card id is printed so it can be edited.
+
+**Result on live data: 477 of 517 notes attach, 40 stay flow-level.**
+
+### D. Folders
+
+**`list_folders` is already fixed.** It returned `HTTP 404 for /manager/flow/folder`;
+the working endpoint is `/manager/flow/flowfolder`, found while building step 4. It
+and the summary's folder-name resolution now share a resolver that probes candidates,
+and the summary renders `folder: Upstairs` on-device rather than a uuid. Verified
+again before this revision: 17 folders returned. Nothing outstanding.
+
+`folder` is already in `ADVANCED_FLOW_WRITABLE`, so `set_flow_folder(flowId,
+folderId)` is a thin wrapper on the step 6 write path. Folder creation and deletion
+stay human actions, for the reason flow deletion does.
+
+### E. Rewrite the onboarding doc
+
+Against the finished tool set. It must teach:
+
+- **Read wiring live; never persist a description of it.** A cached description is the
+  stale-documentation problem this whole plan exists to escape.
+- **Write canvas notes to explain *why*, not *what*.** Short, beside the section they
+  explain, never restating wiring the summary already shows. A note that a routine
+  rewire would falsify is a bad note.
+- **Cross-flow and non-Homey context lives outside this app**, in the user's wiki.
+- **Navigate before fetching**: `search_flows`, `get_cross_references` and
+  `trace_behaviour` before pulling whole flows.
+
+### Done when
+
+- `trace_behaviour` explains a multi-flow behaviour in a single call.
+- `add_flow_note` places a note beside a named card with no overlap; the note appears
+  in the Homey editor, is captured in the revision stack, and can be reverted.
+- `get_flow_summary` shows notes inline under the correct card across a sample of real
+  flows, checked against the editor.
+- `list_folders` works. ✅ already true.
 
 ## Follow-ups
 
@@ -455,10 +616,11 @@ Spotted while working; none blocking, all deferred deliberately.
 - ~~Step 5 must also cover the xref server on port 8734.~~ **Done** — both servers are
   guarded, with same-origin POSTs permitted on the viewer and no Origin accepted at
   all on MCP.
-- **The onboarding doc needs another pass after steps 4 and 6.** It was rewritten for
-  live querying, but its prompt can only teach Claude about tools that exist today —
-  `get_flow_summary`, `search_flows`, and the write tools will each change the advice
-  it gives.
+- **The onboarding doc is rewritten as part of step 7, not before.** It was rewritten
+  once for live querying, but its prompt can only teach what exists at the time. Steps
+  4 and 6 have since added `get_flow_summary`, `search_flows` and the write tools, and
+  step 7 adds the note tools and `trace_behaviour` — so it is rewritten once, at the
+  end, against the finished set. See step 7E for what it must teach.
 - ~~Confirm whether Better Logic Library is actually installed.~~ **Resolved.** BLL is
   installed and responding; it returned `[]` because it genuinely had no variables.
   The `no usable data` log was a bug: `_toArray` treated an empty collection as a

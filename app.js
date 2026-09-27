@@ -28,6 +28,12 @@ const ADVANCED_FLOW_WRITABLE = ['name', 'enabled', 'folder', 'cards'];
 // compact pills. Spacing left edge to left edge by one constant therefore
 // leaves a wide card almost touching its child while a pill sits marooned.
 // These are the gaps measured per parent type on this Homey.
+// Rough extents for measuring how near a note is to a card. Card width is
+// effectively fixed — the parent-to-child gap is 440 whatever the card holds —
+// and a note is roughly that wide too.
+const CARD_WIDTH_ESTIMATE = 400;
+const NOTE_WIDTH_ESTIMATE = 400;
+
 const CARD_GAP_X_BY_TYPE = {
   start: 160,
   all: 180,
@@ -66,6 +72,17 @@ const NOTE_HEIGHT_PER_CHARS = 40;
 const NOTE_HEIGHT_MAX = 200;
 // Breathing room between a heading note and whatever sits above it
 const NOTE_GAP_ABOVE = 40;
+// How close a note must be to a card before it is taken to be about that card,
+// measured centre to centre. Distance between bounding boxes was tried first
+// and is worse: it saturates at zero the moment two boxes overlap, so a note
+// sitting among several cards ties with all of them and attaches to none.
+// Centres separate them. Over 517 notes the median is 100 and the 95th
+// percentile 238, with a tail to 3841 — notes near nothing in particular.
+const NOTE_ATTACH_DISTANCE = 240;
+// And how much closer it must be to that card than to the next. Only 25 of the
+// 517 are within 20px of two cards; those are genuine ties and guessing
+// between them is worse than leaving the note at flow level.
+const NOTE_ATTACH_MARGIN = 20;
 
 const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
 const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
@@ -81,6 +98,34 @@ const DEFAULT_REVISION_DEPTH = 10;
 // repeats it for each one. Coalesce them into a single rebuild once the writes
 // stop.
 const XREF_REBUILD_DEBOUNCE_MS = 4000;
+
+// A flow that writes, fires or controls something is upstream of it; one that
+// reads, checks or triggers on it is downstream. Tracing follows cause rather
+// than structure, so "what does this affect" and "what affects this" are
+// answerable separately.
+const PRODUCING_ROLES = new Set([
+  'writes', 'fires', 'activates', 'deactivates', 'toggles', 'clears', 'sends',
+  'starts', 'stops', 'controls', 'advances',
+]);
+const CONSUMING_ROLES = new Set([
+  'reads', 'checks', 'triggers_on', 'triggered_by', 'received_by', 'cleared_by',
+  'started_by', 'bll_coding',
+]);
+
+// Buckets that describe an entity flows act on. flow_triggers and trigger_tokens
+// are excluded: the first is flow-to-flow and handled directly, the second keys
+// on opaque card ids.
+const TRACEABLE_BUCKETS = {
+  devices: 'device', variables: 'variable', bll_variables: 'BLL variable',
+  timers: 'Chronograph timer', flowbits_events: 'FlowBits event',
+  flowbits_labels: 'FlowBits label', flowbits_sets: 'FlowBits set',
+  flowbits_signals: 'FlowBits signal', flowbits_modes: 'FlowBits mode',
+  flowbits_mode_groups: 'FlowBits mode group', flowbits_timers: 'FlowBits timer',
+  flowbits_flags: 'FlowBits flag', flowbits_cycles: 'FlowBits cycle',
+  flowbits_sliders: 'FlowBits slider', flowbits_windows: 'no-repeat window',
+};
+
+const TRACE_DEFAULT_DEPTH = 3;
 
 // Addresses that cannot be pointed at this Homey by an attacker's DNS: IPv4 and
 // IPv6 literals, localhost, and mDNS .local names (resolved by mDNS, not DNS).
@@ -1075,13 +1120,32 @@ class HomeyDocsCompanion extends Homey.App {
       }
 
       if (isNote && typeof newCard.x !== 'number') {
-        // Sit above the card it heads, at the same left edge
         const anchor = anchorId ? draft.cards[anchorId] : null;
-        newCard.x = anchor ? (anchor.x || 0) : 0;
-        const clearance = this._noteHeight(newCard) + NOTE_GAP_ABOVE;
-        newCard.y = anchor
-          ? (anchor.y || 0) - clearance
-          : (existing.length ? Math.min.apply(null, existing.map(c => c.y || 0)) - clearance : 0);
+        const height = this._noteHeight(newCard);
+        const clearance = height + NOTE_GAP_ABOVE;
+        const column = anchor ? (anchor.x || 0) : 0;
+        const base = anchor ? (anchor.y || 0)
+          : (existing.length ? Math.min.apply(null, existing.map(c => c.y || 0)) : 0);
+
+        // Is this rectangle clear of every card already placed?
+        const free = y => !existing.some(card => {
+          if (Math.abs((card.x || 0) - column) >= CARD_GAP_X) return false;
+          const top = card.y || 0;
+          return y < top + this._siblingGapBelow(card) && top < y + height;
+        });
+
+        // Above the card it labels reads best, below is the next choice, and
+        // beyond that step further out. Anywhere clear beats overlapping.
+        const below = anchor ? this._siblingGapBelow(anchor) + NOTE_GAP_ABOVE : clearance;
+        let chosen = base - clearance;
+        for (let step = 0; step < 10; step++) {
+          const above = base - clearance - (step * (height + NOTE_GAP_ABOVE));
+          if (free(above)) { chosen = above; break; }
+          const under = base + below + (step * (height + NOTE_GAP_ABOVE));
+          if (free(under)) { chosen = under; break; }
+        }
+        newCard.x = column;
+        newCard.y = chosen;
       } else if (typeof newCard.x !== 'number' || typeof newCard.y !== 'number') {
         if (anchorId) {
           const source = draft.cards[anchorId];
@@ -1567,6 +1631,203 @@ class HomeyDocsCompanion extends Homey.App {
     });
   }
 
+  async addFlowNote(flowId, text, nearCardId, colour) {
+    if (!text || !String(text).trim()) return { error: 'text is required — a note with no words says nothing' };
+    return this.addCard(flowId, {
+      type: 'note',
+      value: String(text).trim(),
+      color: colour || 'yellow',
+    }, nearCardId);
+  }
+
+  async updateFlowNote(flowId, noteCardId, text) {
+    if (!text || !String(text).trim()) return { error: 'text is required' };
+    return this._mutateAdvancedFlow(flowId, 'rewrote a note', draft => {
+      const found = this._resolveCardId(draft.cards, noteCardId);
+      if (found.error) return found;
+      const card = draft.cards[found.cardId];
+      // A note's text is `value`, a top-level field, so update_card_args cannot
+      // reach it — which is why this tool exists rather than reusing that one.
+      if (card.type !== 'note') {
+        return { error: 'Card ' + found.cardId + ' is a ' + card.type + ' card, not a note. '
+          + 'Use update_card_args to change a card\'s arguments.' };
+      }
+      const before = card.value;
+      card.value = String(text).trim();
+      return { noteCardId: found.cardId, textBefore: before, textAfter: card.value };
+    });
+  }
+
+  async setFlowFolder(flowId, folderId) {
+    const folders = await this._fetchFolderNames();
+    if (folderId && !folders[folderId]) {
+      return { error: 'No folder with id ' + folderId + '. Call list_folders to see them.' };
+    }
+    const where = folderId ? 'folder "' + folders[folderId] + '"' : 'no folder';
+    return this._mutateAdvancedFlow(flowId, 'moved to ' + where, draft => {
+      draft.folder = folderId || null;
+      return { folder: folderId || null, folderName: folderId ? folders[folderId] : null };
+    });
+  }
+
+  // ─── Tracing behaviour across flows ──────────────────────────────────────────
+
+  // The cross-reference index is already a bipartite graph — flows on one side,
+  // the things they touch on the other — it has simply never been walked.
+  async _behaviourGraph() {
+    const xref = await this.getCachedCrossReferences();
+    const entities = new Map();
+    const flows = new Map();
+
+    const flowNode = (flowId, flowName) => {
+      if (!flows.has(flowId)) {
+        const meta = (this.snapshot.flows || {})[flowId];
+        flows.set(flowId, {
+          id: flowId,
+          name: (meta && meta.name) || flowName || flowId,
+          enabled: meta ? meta.enabled : true,
+          links: [],
+        });
+      }
+      return flows.get(flowId);
+    };
+
+    for (const [bucket, kind] of Object.entries(TRACEABLE_BUCKETS)) {
+      for (const [key, entry] of Object.entries(xref[bucket] || {})) {
+        if (!entry || !entry.flows) continue;
+        const id = bucket + '::' + key;
+        const node = {
+          id, kind,
+          label: entry.name || key,
+          zone: entry.zone || null,
+          links: [],
+        };
+        entities.set(id, node);
+
+        for (const [flowId, use] of Object.entries(entry.flows)) {
+          const flow = flowNode(flowId, use.flowName);
+          const roles = use.roles || [];
+          const produces = roles.some(role => PRODUCING_ROLES.has(role));
+          const consumes = roles.some(role => CONSUMING_ROLES.has(role));
+          node.links.push({ flow: flow.id, roles, produces, consumes });
+          flow.links.push({ entity: id, roles, produces, consumes });
+        }
+      }
+    }
+
+    // Flows that start other flows programmatically are a direct edge
+    for (const [flowId, entry] of Object.entries(xref.flow_triggers || {})) {
+      const flow = flowNode(flowId, entry.flowName);
+      for (const [callerId, caller] of Object.entries(entry.calledBy || {})) {
+        flowNode(callerId, caller.flowName).starts = (flowNode(callerId, caller.flowName).starts || []).concat([flowId]);
+        flow.startedBy = (flow.startedBy || []).concat([callerId]);
+      }
+    }
+
+    return { entities, flows };
+  }
+
+  _resolveTraceTarget(query, graph) {
+    const needle = String(query || '').trim().toLowerCase();
+    if (!needle) return { error: 'target is required' };
+
+    const matches = [];
+    for (const node of graph.entities.values()) {
+      const label = String(node.label).toLowerCase();
+      if (label === needle) matches.unshift({ node, exact: true });
+      else if (label.includes(needle)) matches.push({ node, exact: false });
+    }
+    for (const flow of graph.flows.values()) {
+      const name = String(flow.name).toLowerCase();
+      if (name === needle) matches.unshift({ flow, exact: true });
+      else if (name.includes(needle)) matches.push({ flow, exact: false });
+    }
+
+    if (!matches.length) return { error: 'Nothing called "' + query + '" appears in any flow.' };
+    const exact = matches.filter(m => m.exact);
+    if (exact.length === 1) return exact[0];
+    if (matches.length === 1) return matches[0];
+
+    const pool = exact.length ? exact : matches;
+    if (pool.length === 1) return pool[0];
+    return {
+      error: '"' + query + '" matches ' + pool.length + ' things; name one exactly.',
+      candidates: pool.slice(0, 12).map(m => m.flow
+        ? 'flow "' + m.flow.name + '"'
+        : graph.entities.get(m.node.id).kind + ' "' + m.node.label + '"'),
+    };
+  }
+
+  async traceBehaviour(target, depth, direction) {
+    const graph = await this._behaviourGraph();
+    const found = this._resolveTraceTarget(target, graph);
+    if (found.error) return found;
+
+    const maxDepth = Math.min(Math.max(parseInt(depth, 10) || TRACE_DEFAULT_DEPTH, 1), 6);
+    const want = direction === 'upstream' || direction === 'downstream' ? [direction] : ['downstream', 'upstream'];
+
+    const describeEntity = node => node.kind + ' "' + node.label + '"' + (node.zone ? ' [' + node.zone + ']' : '');
+    const describeFlow = flow => 'flow "' + flow.name + '"' + (flow.enabled === false ? ' (disabled)' : '');
+    // Roles read better after the thing they apply to: "flow X — checks", not
+    // "checks by flow X"
+    const withRoles = (text, roles) => (roles && roles.length)
+      ? text + '  — ' + roles.map(role => role.replace(/_/g, ' ')).join(', ')
+      : text;
+
+    const out = [];
+    out.push('Trace: ' + (found.flow ? describeFlow(found.flow) : describeEntity(found.node)));
+    out.push('Depth ' + maxDepth + '. Upstream is what changes a thing; downstream is what reacts to it.');
+
+    for (const way of want) {
+      out.push('');
+      out.push(way === 'downstream' ? 'DOWNSTREAM — what this affects' : 'UPSTREAM — what affects this');
+      const seen = new Set();
+      const lines = [];
+
+      // From an entity, step to the flows on the matching side of it; from a
+      // flow, step to the entities it touches on that side. The two alternate.
+      const walkEntity = (node, level, prefix) => {
+        const key = 'e:' + node.id;
+        if (seen.has(key)) { lines.push('  '.repeat(level) + withRoles(describeEntity(node), prefix) + '  (shown above)'); return; }
+        seen.add(key);
+        lines.push('  '.repeat(level) + withRoles(describeEntity(node), prefix));
+        if (level >= maxDepth) return;
+        for (const link of node.links) {
+          const relevant = way === 'downstream' ? link.consumes : link.produces;
+          if (!relevant) continue;
+          const flow = graph.flows.get(link.flow);
+          if (flow) walkFlow(flow, level + 1, link.roles);
+        }
+      };
+
+      const walkFlow = (flow, level, prefix) => {
+        const key = 'f:' + flow.id;
+        if (seen.has(key)) { lines.push('  '.repeat(level) + withRoles(describeFlow(flow), prefix) + '  (shown above)'); return; }
+        seen.add(key);
+        lines.push('  '.repeat(level) + withRoles(describeFlow(flow), prefix));
+        if (level >= maxDepth) return;
+        for (const link of flow.links) {
+          const relevant = way === 'downstream' ? link.produces : link.consumes;
+          if (!relevant) continue;
+          const node = graph.entities.get(link.entity);
+          if (node) walkEntity(node, level + 1, link.roles);
+        }
+        const chained = way === 'downstream' ? (flow.starts || []) : (flow.startedBy || []);
+        for (const otherId of chained) {
+          const other = graph.flows.get(otherId);
+          if (other) walkFlow(other, level + 1, [way === 'downstream' ? 'starts' : 'started by']);
+        }
+      };
+
+      if (found.flow) walkFlow(found.flow, 0, []);
+      else walkEntity(found.node, 0, []);
+
+      out.push(...(lines.length > 1 ? lines.slice(1) : ['  (nothing)']));
+    }
+
+    return out.join('\n');
+  }
+
   // ─── Flow summaries and search ───────────────────────────────────────────────
 
   // Homey registers every flow card with a human title. Resolving card ids this
@@ -1778,28 +2039,39 @@ class HomeyDocsCompanion extends Homey.App {
     // note's rectangle rather than its corner treats all three the same, so no
     // directional assumption is needed.
     const positioned = Object.entries(cards).filter(([, c]) => c.type !== 'note');
+    const leftEdge = positioned.length
+      ? Math.min.apply(null, positioned.map(([, c]) => c.x || 0)) : 0;
     const notesByCard = new Map();
     const orphanNotes = [];
-    for (const note of (notes || [])) {
+
+    for (const [noteId, note] of Object.entries(cards)) {
+      if (!note || note.type !== 'note') continue;
       const text = String(note.value).replace(/\s+/g, ' ').trim();
-      const left = note.x || 0;
-      const top = note.y || 0;
-      const right = left + (note.width || 0);
-      const bottom = top + (note.height || 0);
-      let best = null;
-      let bestDistance = Infinity;
-      for (const [cardId, card] of positioned) {
-        const cx = card.x || 0;
-        const cy = card.y || 0;
-        // Gap between the card's anchor and the note's rectangle, zero on overlap
-        const dx = cx < left ? left - cx : cx > right ? cx - right : 0;
-        const dy = cy < top ? top - cy : cy > bottom ? cy - bottom : 0;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-        if (distance < bestDistance) { bestDistance = distance; best = cardId; }
-      }
-      if (!best) { orphanNotes.push(text); continue; }
-      if (!notesByCard.has(best)) notesByCard.set(best, []);
-      notesByCard.get(best).push(text);
+      const label = (showIds ? noteId.slice(0, this._shortIdLength(cards)) + ' ' : '') + '# ' + text;
+
+      // Centre to centre. A note's width and height are null — Homey sizes it
+      // at render time — so both are estimated, the note's from its text and a
+      // card's from its arguments.
+      const noteX = (note.x || 0) + (NOTE_WIDTH_ESTIMATE / 2);
+      const noteY = (note.y || 0) + (this._noteHeight(note) / 2);
+
+      const ranked = positioned.map(([cardId, card]) => {
+        const dx = ((card.x || 0) + (CARD_WIDTH_ESTIMATE / 2)) - noteX;
+        const dy = ((card.y || 0) + (this._siblingGapBelow(card) / 2)) - noteY;
+        return { cardId, distance: Math.sqrt((dx * dx) + (dy * dy)) };
+      }).sort((a, b) => a.distance - b.distance);
+
+      const nearest = ranked[0];
+      const runnerUp = ranked[1];
+      const tooFar = !nearest || nearest.distance > NOTE_ATTACH_DISTANCE;
+      const ambiguous = runnerUp && (runnerUp.distance - nearest.distance) < NOTE_ATTACH_MARGIN;
+      if (tooFar || ambiguous) { orphanNotes.push(label); continue; }
+
+      // A note at the left margin heads a section and reads correctly above it;
+      // one out in the flow annotates a single card and belongs beneath it.
+      const heading = (note.x || 0) <= leftEdge;
+      if (!notesByCard.has(nearest.cardId)) notesByCard.set(nearest.cardId, { above: [], below: [] });
+      notesByCard.get(nearest.cardId)[heading ? 'above' : 'below'].push(label);
     }
 
     // Cards reached from more than one place get a stable marker, so a
@@ -1839,9 +2111,11 @@ class HomeyDocsCompanion extends Homey.App {
       } else {
         rendered.set(id, null);
       }
-      for (const note of (notesByCard.get(id) || [])) lines.push(gutter + pad + '# ' + note);
+      const attached = notesByCard.get(id) || { above: [], below: [] };
+      for (const note of attached.above) lines.push(gutter + pad + note);
       const idPrefix = showIds ? id.slice(0, idLength) + '  ' : '';
       lines.push(idPrefix + head + tag + this._cardLabel(card, titles));
+      for (const note of attached.below) lines.push(gutter + pad + '  ' + note);
       for (const [key, label] of OUTPUTS) {
         const children = card[key] || [];
         if (!children.length) continue;
@@ -1858,10 +2132,10 @@ class HomeyDocsCompanion extends Homey.App {
 
     // Notes anchored to cards no tree reaches would otherwise vanish
     const stranded = [];
-    for (const [cardId, texts] of notesByCard) {
-      if (!rendered.has(cardId)) stranded.push(...texts);
+    for (const [cardId, attached] of notesByCard) {
+      if (!rendered.has(cardId)) stranded.push(...attached.above, ...attached.below);
     }
-    for (const note of stranded.concat(orphanNotes)) lines.push('# ' + note);
+    for (const note of stranded.concat(orphanNotes)) lines.push(note);
     return lines;
   }
 

@@ -147,6 +147,59 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
+    name: 'trace_behaviour',
+    description: 'Follow a behaviour across flows. Give the name of anything — a device, variable, flow, or FlowBits event, mode, flag, timer or signal — and it returns what affects it (upstream) and what it affects (downstream), walking flow to flow through the things they share. Use it when a behaviour spans several flows and the cross-reference index only shows one hop.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'Name of a device, variable, flow, or FlowBits entity' },
+        depth: { type: 'integer', description: 'How many hops to follow. Default 3, max 6. Raise it only if the answer looks cut off — a busy variable reaches much of the estate.' },
+        direction: { type: 'string', enum: ['both', 'upstream', 'downstream'], description: 'Default both.' },
+      },
+      required: ['target'],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'add_flow_note',
+    description: 'Write a note onto a flow\'s canvas. Notes are where an explanation belongs: say WHY a section is built as it is, not what it does — the summary already shows the wiring, and a note restating it goes stale the moment anything is rewired. Keep it short. Pass nearCardId to place it beside a particular card; add notes after relayout_flow, not before.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string' },
+        text: { type: 'string', description: 'The note text. Short, and about intent rather than mechanism.' },
+        nearCardId: { type: 'string', description: 'Card to place the note beside. Omit for a flow-level note.' },
+        color: { type: 'string', enum: ['yellow', 'blue', 'green', 'red'], description: 'Default yellow. Red conventionally means "change this soon".' },
+      },
+      required: ['flowId', 'text'],
+    },
+    annotations: { readOnlyHint: false },
+  },
+  {
+    name: 'update_flow_note',
+    description: 'Rewrite the text of an existing note card. Note text is not a card argument, so update_card_args cannot change it. Get note ids from get_flow_summary with withCardIds.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string' },
+        noteCardId: { type: 'string' },
+        text: { type: 'string' },
+      },
+      required: ['flowId', 'noteCardId', 'text'],
+    },
+    annotations: { readOnlyHint: false, idempotentHint: true },
+  },
+  {
+    name: 'set_flow_folder',
+    description: 'Move a flow into a folder, or pass no folderId to take it out of one. Folder ids come from list_folders. Creating and deleting folders stays a manual action.',
+    inputSchema: {
+      type: 'object',
+      properties: { flowId: { type: 'string' }, folderId: { type: 'string' } },
+      required: ['flowId'],
+    },
+    annotations: { readOnlyHint: false, idempotentHint: true },
+  },
+  {
     name: 'list_flow_revisions',
     description: 'List the saved pre-edit copies of a flow, newest first. Every edit saves one automatically. Use the revision number with revert_flow — but call this again first if anything has been written since, because revision 1 is always the most recent save and the numbers shift down as new ones are added.',
     inputSchema: {
@@ -657,6 +710,21 @@ class HomeyMcpServer {
 
         case 'get_app_actions':
           return this._text(await app.getAppActions());
+
+        case 'trace_behaviour': {
+          if (!args.target) throw new Error('target is required');
+          const trace = await app.traceBehaviour(args.target, args.depth, args.direction);
+          return typeof trace === 'string' ? this._raw(trace) : this._text(trace);
+        }
+
+        case 'add_flow_note':
+          return this._text(await app.addFlowNote(args.flowId, args.text, args.nearCardId, args.color));
+
+        case 'update_flow_note':
+          return this._text(await app.updateFlowNote(args.flowId, args.noteCardId, args.text));
+
+        case 'set_flow_folder':
+          return this._text(await app.setFlowFolder(args.flowId, args.folderId));
 
         case 'list_flow_revisions':
           return this._text(await app.listFlowRevisions(args.flowId));
