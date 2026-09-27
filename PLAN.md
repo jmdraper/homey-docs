@@ -912,6 +912,59 @@ keepalive frames and answers in 116ms — but neither was the cause. The lesson 
 keeping is procedural: when a client hangs, the client's log is evidence, and it is not
 on the device.
 
+### Step 8.7 — Three loose ends from the log analysis
+
+**Was the app crashing, or was that a deploy?** Both, one each.
+
+- The restart before 10:46 UTC fits a deploy: the last commit of the morning was
+  10:28:49Z, and nothing was committed or modified afterwards.
+- The 11:34:48Z outage — `ECONNREFUSED`, so the process was genuinely down — has no
+  deploy behind it. Nothing was committed after 10:28 and no file in the working tree
+  was touched between 10:28:50Z and 11:45Z. The app record read `crashedCount: 1` at
+  13:41 the next day, and reinstalling resets that counter to 0 (verified: it is 0
+  now, after this session's installs). So the single crash it was counting belongs to
+  the installation that was live at 11:34.
+
+**The cause of that crash is not recoverable** — `crashedMessage` was null, there was no
+error handler, and the app log does not survive a restart. Homey raised no crash
+notification either; the only apps-manager notification that day was an IcalCalendar
+update. What can be done is to make the next one legible, and that is now in place: a
+synchronous write to `/userdata/last-crash.json` on the way down, reported by
+`get_diagnostics` with the build that produced it.
+
+Two bugs in that handler, both found by deliberately crashing the app rather than by
+reading the code:
+
+- `process.on` registers *behind* the Homey SDK's own handler, which stops the process
+  first — so the handler never ran at all. `prependListener` goes in front. It also no
+  longer calls `process.exit`, so the SDK's handler still runs afterwards and reports
+  the crash exactly as before.
+- `record()` gathered `process.memoryUsage()` before writing, and that throws
+  `ENOENT: uv_resident_set_memory` inside Homey's app sandbox, so the handler died
+  before recording anything. Nothing optional happens before the write now.
+
+Worth noting for later: with the handler working, a deliberate unhandled rejection no
+longer takes the app down — Homey tolerates it. So whatever crashed the app on 27 Sep
+was probably an uncaught exception rather than a rejection. The handler covers both.
+
+**Session adoption fixed the hang but not the stale tool list.** A client that survives
+our restart keeps the tool list it cached beforehand, which is exactly how Claude
+Desktop came to offer `get_changelog` long after that tool was removed. An adopted
+session is now sent `notifications/tools/list_changed` on its next response, delivered
+as an SSE-framed POST response — this server answers `GET /mcp` with 405, so a
+piggybacked response is the only channel available. The `initialize` capabilities now
+declare `tools.listChanged` accordingly.
+
+Verified through the real bridge rather than by inspection: mcp-remote **does** forward
+the notification to the client, it arrives exactly once after a restart, and a freshly
+initialised session is not sent one, having just read the list.
+
+**mcp-remote swallowing transport errors is an upstream bug**, and the log evidence for
+it is unusually clean. A report is written up at `../mcp-remote-issue.md`, ready to
+file: `transport.send()` rejects, mcp-remote logs to its own stderr, and no JSON-RPC
+error reaches the client, which then waits out its 240s timeout against silence. The
+fix upstream is to return a JSON-RPC error for any request carrying an `id`.
+
 ## Follow-ups
 
 Spotted while working; none blocking, all deferred deliberately.
