@@ -314,7 +314,7 @@ const TOOLS = [
   },
   {
     name: 'relayout_flow',
-    description: 'Reposition every card in an advanced flow onto a tidy grid, following the spacing the rest of this Homey uses. Cards keep their connections and arguments; only coordinates change. Note cards are left where they are, since they are positioned beside what they describe.',
+    description: 'Reposition every card in an advanced flow onto a tidy grid, following the spacing the rest of this Homey uses. Cards keep their connections and arguments; only coordinates change. Canvas notes move too, into space held for them beside the card each one annotates — which card that is comes from where the note currently sits, so a note that is already beside the wrong card stays with it. Running this twice changes nothing the second time.',
     inputSchema: {
       type: 'object',
       properties: { flowId: { type: 'string' } },
