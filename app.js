@@ -1375,14 +1375,14 @@ class HomeyDocsCompanion extends Homey.App {
     return this._answerWithin(phase, work);
   }
 
-  _abandoned(phase, where) {
+  _abandoned(where) {
     return { error: 'Abandoned while ' + where + ': the caller had already been told this call '
       + 'timed out. Nothing was written.', abandoned: true, timedOut: true, putSent: false };
   }
 
   async _writeAdvancedFlow(flowId, describe, mutate, phase, options) {
     const startedMs = Date.now();
-    if (phase.abandoned) return this._abandoned(phase, 'still queued');
+    if (phase.abandoned) return this._abandoned('still queued');
     phase.name = 'reading the flow';
 
     let flow;
@@ -1439,7 +1439,7 @@ class HomeyDocsCompanion extends Homey.App {
     // The atomic point. Nothing may await between the check and setting
     // putSent, or a timeout landing in the gap would be told nothing was sent
     // while the PUT went out anyway.
-    if (phase.abandoned) return this._abandoned(phase, 'about to write');
+    if (phase.abandoned) return this._abandoned('about to write');
     phase.name = 'writing to Homey';
     phase.putSent = true;
     phase.putAt = new Date().toISOString();
