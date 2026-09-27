@@ -22,10 +22,6 @@ module.exports = {
     return homey.app.getDevices();
   },
 
-  async apps({ homey }) {
-    return homey.app.getApps();
-  },
-
   async zones({ homey }) {
     return homey.app.getZones();
   },

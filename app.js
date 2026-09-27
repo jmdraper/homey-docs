@@ -258,7 +258,7 @@ class HomeyDocsCompanion extends Homey.App {
     this.log('Homey Docs Companion initialising...');
 
     this.snapshot = this.homey.settings.get('snapshot') || {
-      flows: {}, variables: {}, devices: {}, apps: {}, zones: {},
+      flows: {}, variables: {}, devices: {}, zones: {},
       initialised_at: null
     };
     // One-time cleanup: change tracking was removed, so drop its persisted data
@@ -443,10 +443,6 @@ class HomeyDocsCompanion extends Homey.App {
     return { name: v.name, type: v.type, value: v.value };
   }
 
-  _appMeta(app) {
-    return { name: app.name, version: app.version, enabled: app.enabled !== false, crashed: app.crashed || false };
-  }
-
   _zoneMeta(zone) {
     return { name: zone.name, parent: zone.parent || null };
   }
@@ -599,7 +595,7 @@ class HomeyDocsCompanion extends Homey.App {
     const slim = {
       initialised_at: this.snapshot.initialised_at,
       flows: {}, variables: this.snapshot.variables,
-      devices: this.snapshot.devices, apps: this.snapshot.apps, zones: this.snapshot.zones
+      devices: this.snapshot.devices, zones: this.snapshot.zones
     };
     for (const [id, f] of Object.entries(this.snapshot.flows)) {
       const { cards_snapshot, ...rest } = f;
@@ -899,6 +895,27 @@ class HomeyDocsCompanion extends Homey.App {
       this._appIds = null;   // unknown, so skip the check rather than block a write
     }
     return this._appIds;
+  }
+
+  // The installed apps, read live. This used to be held in the snapshot, but
+  // nothing ever filled it: the field was declared, a _appMeta shaper was
+  // written for it, and no polling path ever called either. Reading it fresh
+  // is right anyway — an app that crashed two minutes ago has silently broken
+  // every flow that uses its cards, and a five-minute-old copy would not say so.
+  async listApps() {
+    const apps = await this._apiGet('/manager/apps/app');
+    if (!apps || typeof apps !== 'object') {
+      return { error: 'could not read the installed apps from Homey' };
+    }
+    return Object.entries(apps).map(([id, app]) => {
+      const entry = { id, name: (app && app.name) || id };
+      // Pass through only what Homey actually sent, so a field it stops
+      // returning shows as absent rather than as a confident wrong answer.
+      for (const field of ['version', 'channel', 'origin', 'state', 'enabled', 'crashed']) {
+        if (app && app[field] !== undefined) entry[field] = app[field];
+      }
+      return entry;
+    }).sort((a, b) => a.name.localeCompare(b.name));
   }
 
   // Every write goes through here: gate, read the live flow, keep a copy,
@@ -3361,11 +3378,10 @@ function copyPrompt(){
 
   getVariables() { return this.snapshot.variables; }
   getDevices() { return this.snapshot.devices; }
-  getApps() { return this.snapshot.apps; }
   getZones() { return this.snapshot.zones; }
 
   async resetSnapshot() {
-    this.snapshot = { flows: {}, variables: {}, devices: {}, apps: {}, zones: {}, initialised_at: null };
+    this.snapshot = { flows: {}, variables: {}, devices: {}, zones: {}, initialised_at: null };
     this.homey.settings.set('snapshot', this.snapshot);
     await this._refreshSnapshot();
     return { reset: true, flows: Object.keys(this.snapshot.flows).length, devices: Object.keys(this.snapshot.devices).length };

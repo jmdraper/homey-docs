@@ -142,6 +142,11 @@ const TOOLS = [
     },
   },
   {
+    name: 'list_apps',
+    description: 'The apps installed on Homey, read live — id, name, version and whether each one is running. Worth checking when a flow looks correct but does not fire: a crashed or disabled app breaks every flow that uses its cards, and nothing in the flow itself shows that.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'get_app_actions',
     description: 'Returns human-readable titles for all triggers, conditions, and actions exposed by each installed Homey app, keyed by their full card ID strings. Use this to translate opaque app card IDs into readable labels.',
     inputSchema: { type: 'object', properties: {} },
@@ -707,6 +712,9 @@ class HomeyMcpServer {
           const limit = Math.min(args.limit || 100, 1000);
           return this._text({ count: logs.length, logs: logs.slice(0, limit) });
         }
+
+        case 'list_apps':
+          return this._text(await app.listApps());
 
         case 'get_app_actions':
           return this._text(await app.getAppActions());

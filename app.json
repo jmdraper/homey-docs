@@ -55,10 +55,6 @@
       "method": "GET",
       "path": "/devices"
     },
-    "apps": {
-      "method": "GET",
-      "path": "/apps"
-    },
     "zones": {
       "method": "GET",
       "path": "/zones"
