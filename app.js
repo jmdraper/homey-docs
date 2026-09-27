@@ -65,6 +65,8 @@ const CARD_ROW_GAP_Y = 260;
 const CARD_BAND_GAP_Y = 0;
 // Rounds of candidate layouts to try before settling; convergence is quick
 const LAYOUT_ROUNDS = 6;
+// How many times to re-read the note anchors before accepting a cycle
+const LAYOUT_SETTLE_PASSES = 64;
 // Note height also grows with its text: measured 80 for a short note, rising
 // 20 per 40 characters. A note sits its own height above the card it heads.
 const NOTE_HEIGHT_BASE = 80;
@@ -72,6 +74,10 @@ const NOTE_HEIGHT_PER_CHARS = 40;
 const NOTE_HEIGHT_MAX = 200;
 // Breathing room between a heading note and whatever sits above it
 const NOTE_GAP_ABOVE = 40;
+// A note sits tighter to the card it labels than to anything else — that
+// asymmetry is what makes it read as belonging to that card rather than to
+// whatever is on its other side.
+const NOTE_ATTACH_GAP = 16;
 // Homey's canvas controls float over the top of the flow, so anything up there
 // is hidden at the default scroll position. Flows on this Homey start at y=0,
 // 20, 40 or 60 and none above it — the one exception was a note this app
@@ -1123,6 +1129,7 @@ class HomeyDocsCompanion extends Homey.App {
       }
 
       let anchorId = null;
+      let needsRoom = false;
       if (after) {
         const anchor = this._resolveCardId(draft.cards, after);
         if (anchor.error) return anchor;
@@ -1177,13 +1184,14 @@ class HomeyDocsCompanion extends Homey.App {
 
         let chosen = candidates.find(y => free(y) && anchorIsNearest(y));
         if (chosen === undefined) {
-          // Nowhere both clear and unambiguous. Take somewhere clear and say so,
-          // rather than silently attaching the note to the wrong card.
+          // Nowhere both clear and unambiguous: the flow is packed tightly
+          // enough that every gap beside the anchor reads as belonging to a
+          // neighbour. Put the note somewhere clear for now and mark it to be
+          // laid out again below — this time with the anchor stated outright,
+          // so the packing can open a gap for it rather than squeeze it in.
           chosen = candidates.find(free);
           if (chosen === undefined) chosen = Math.max(base - clearance, CANVAS_TOP_MARGIN);
-          result.warning = 'There was no free space next to that card where this note '
-            + 'would read as belonging to it, so it has been placed nearby but may appear '
-            + 'to annotate a neighbouring card. Check it in the editor.';
+          needsRoom = true;
         }
         newCard.x = column;
         newCard.y = chosen;
@@ -1224,6 +1232,15 @@ class HomeyDocsCompanion extends Homey.App {
       }
 
       draft.cards[cardId] = newCard;
+
+      // Make room. The anchor is passed in explicitly: inferring it from where
+      // the note sits would read back the very position that was the problem.
+      if (needsRoom && anchorId) {
+        this._layoutCards(draft.cards, { [cardId]: anchorId });
+        result.relaidOut = 'There was no gap beside that card wide enough for the note to '
+          + 'read as belonging to it, so the flow has been laid out again to open one. '
+          + 'Other cards will have moved.';
+      }
 
       let linked = null;
       if (anchorId && !isNote) {
@@ -1293,61 +1310,30 @@ class HomeyDocsCompanion extends Homey.App {
     return Array.from(groups.values());
   }
 
-  // Notes label the section beside them, so they have to travel with it.
-  // Their width and height are null — Homey sizes them at render time — so
-  // position is all there is to work with.
-  _captureNoteAnchors(cards, ids, groups) {
+  // Where each note should be re-placed, as the card it belongs to and which
+  // side of that card it sits on. The association comes from the one shared
+  // rule, so a note the summary reports on a card stays on that card.
+  _captureNoteAnchors(cards) {
+    const { attached, headings, nearest } = this._noteAttachments(cards);
     const anchors = {};
-    const leftEdge = Math.min.apply(null, ids.map(id => cards[id].x || 0));
-
-    // The first card of each behaviour, in canvas order
-    const heads = (groups || []).map(group => {
-      const atEdge = group.filter(id => (cards[id].x || 0) === leftEdge);
-      const candidates = atEdge.length ? atEdge : group;
-      return candidates.reduce((top, id) =>
-        ((cards[id].y || 0) < (cards[top].y || 0) ? id : top));
-    });
-
-    for (const [noteId, note] of Object.entries(cards)) {
-      if (!note || note.type !== 'note') continue;
-
-      // A note at the left edge heads a behaviour. Anchoring it to whatever is
-      // nearest is self-reinforcing: once it drifts beside the wrong band it
-      // stays there, because the next pass measures from where it already is.
-      let best = null;
-      if ((note.x || 0) <= leftEdge && heads.length) {
-        const below = heads.filter(id => (cards[id].y || 0) >= (note.y || 0));
-        const pool = below.length ? below : heads;
-        best = pool.reduce((closest, id) =>
-          (Math.abs((cards[id].y || 0) - (note.y || 0))
-            < Math.abs((cards[closest].y || 0) - (note.y || 0)) ? id : closest));
-      } else {
-        let bestDistance = Infinity;
-        for (const id of ids) {
-          const dx = (cards[id].x || 0) - (note.x || 0);
-          const dy = (cards[id].y || 0) - (note.y || 0);
-          const distance = Math.sqrt((dx * dx) + (dy * dy));
-          if (distance < bestDistance) { bestDistance = distance; best = id; }
-        }
-      }
-
-      if (best) {
-        const heading = (note.x || 0) <= leftEdge;
-        anchors[noteId] = {
-          anchor: best,
-          dx: heading ? 0 : (note.x || 0) - (cards[best].x || 0),
-          dy: heading
-            ? -(this._noteHeight(note) + NOTE_GAP_ABOVE)
-            : (note.y || 0) - (cards[best].y || 0)
-        };
-      }
+    // Orphans have no card the summary will name, but leaving them where they
+    // are would strand them as the cards move out from under them, so they
+    // travel with whatever they are nearest.
+    const placement = Object.assign({}, nearest, attached);
+    for (const [noteId, cardId] of Object.entries(placement)) {
+      // A heading names the section beneath it; any other note sits on
+      // whichever side of its card it is already on.
+      const above = headings.has(noteId)
+        || (cards[noteId].y || 0) < (cards[cardId].y || 0);
+      anchors[noteId] = { anchor: cardId, dx: 0, dy: above ? -1 : 1 };
     }
     return anchors;
   }
 
   // Place one column's cards at their preferred positions, clustering those
   // that want the same spot and centring each cluster on it.
-  _placeColumn(cards, members, desired, placedY, columnX) {
+  _placeColumn(cards, members, desired, placedY, columnX, reserve) {
+    const slotFor = id => (reserve && reserve[id]) || { above: 0, below: 0 };
     members.sort((a, b) => desired[a] - desired[b] || (cards[a].y || 0) - (cards[b].y || 0));
 
     const clusters = [];
@@ -1364,24 +1350,32 @@ class HomeyDocsCompanion extends Homey.App {
     let cursor = -Infinity;
     for (const cluster of clusters) {
       const gaps = cluster.ids.map(id => this._siblingGapBelow(cards[id]));
-      const extent = gaps.slice(0, -1).reduce((total, gap) => total + gap, 0);
+      // A card's footprint is its own height plus whatever has been set aside
+      // for the notes that belong to it, so packing leaves them somewhere to go
+      const footprints = cluster.ids.map((id, index) => {
+        const slot = slotFor(id);
+        return slot.above + gaps[index] + slot.below;
+      });
+      const extent = footprints.slice(0, -1).reduce((total, size) => total + size, 0);
       let y = Math.round((cluster.desired - (extent / 2)) / 20) * 20;
       if (y < cursor) y = cursor;
 
       cluster.ids.forEach((id, index) => {
         const card = cards[id];
+        const slot = slotFor(id);
+        y += slot.above;
         if (card.x !== columnX || card.y !== y) moved += 1;
         card.x = columnX;
         card.y = y;
         placedY[id] = y;
-        y += gaps[index];
+        y += gaps[index] + slot.below;
       });
       cursor = y;
     }
     return { moved, bottom: cursor };
   }
 
-  _layoutGroup(cards, group, parents, children, originX, bandTop) {
+  _layoutGroup(cards, group, parents, children, originX, bandTop, reserve) {
     const inGroup = new Set(group);
     const depth = {};
     const visiting = new Set();
@@ -1433,7 +1427,7 @@ class HomeyDocsCompanion extends Homey.App {
           const target = midpointOf(id, side);
           desired[id] = target === null ? (placedY[id] === undefined ? 0 : placedY[id]) : target;
         }
-        const placed = this._placeColumn(cards, columns[column], desired, placedY, columnX[column]);
+        const placed = this._placeColumn(cards, columns[column], desired, placedY, columnX[column], reserve);
         moved += placed.moved;
         bottom = Math.max(bottom, placed.bottom);
       }
@@ -1517,107 +1511,305 @@ class HomeyDocsCompanion extends Homey.App {
 
     let bottom = bandTop;
     for (const id of group) {
-      bottom = Math.max(bottom, (cards[id].y || 0) + this._siblingGapBelow(cards[id]));
+      const slot = (reserve && reserve[id]) || { above: 0, below: 0 };
+      bottom = Math.max(bottom, (cards[id].y || 0) + this._siblingGapBelow(cards[id]) + slot.below);
     }
 
     return { moved, columns: order.length, bottom, lastColumnX: columnX[order[order.length - 1]] };
   }
 
+  // Which card each note belongs to. There is nothing in the file that says —
+  // Homey stores no anchor — so position is the only evidence, and every part
+  // of this app that needs the answer has to derive it the same way. It did
+  // not used to: the summary measured centre to centre while the layout
+  // measured corner to corner, so laying a flow out moved notes to cards the
+  // summary had never said they were on.
+  //
+  // Returns { attached: { noteId: cardId }, headings: Set(noteId),
+  // orphans: [noteId], nearest: { noteId: cardId } } — `nearest` is the raw
+  // winner with no distance or ambiguity test applied, for the layout, which
+  // has to move every note somewhere even when the summary declines to say
+  // what it annotates.
+  _noteAttachments(cards) {
+    const positioned = Object.entries(cards).filter(([, c]) => c && c.type !== 'note');
+    const leftEdge = positioned.length
+      ? Math.min.apply(null, positioned.map(([, c]) => c.x || 0)) : 0;
+    const attached = {};
+    const headings = new Set();
+    const orphans = [];
+    const nearest = {};
+
+    for (const [noteId, note] of Object.entries(cards)) {
+      if (!note || note.type !== 'note') continue;
+
+      // Centre to centre. A note's width and height are null — Homey sizes it
+      // at render time — so both are estimated, the note's from its text and a
+      // card's from its arguments.
+      const noteX = (note.x || 0) + (NOTE_WIDTH_ESTIMATE / 2);
+      const noteY = (note.y || 0) + (this._noteHeight(note) / 2);
+
+      const ranked = positioned.map(([cardId, card]) => {
+        const dx = ((card.x || 0) + (CARD_WIDTH_ESTIMATE / 2)) - noteX;
+        const dy = ((card.y || 0) + (this._siblingGapBelow(card) / 2)) - noteY;
+        return { cardId, distance: Math.sqrt((dx * dx) + (dy * dy)) };
+      }).sort((a, b) => a.distance - b.distance);
+
+      // A note at the left margin heads a section and reads correctly above it;
+      // one out in the flow annotates a single card and belongs beneath it.
+      const heading = (note.x || 0) <= leftEdge;
+      if (heading) headings.add(noteId);
+
+      let chosen = ranked[0];
+      const runnerUp = ranked[1];
+      const tooFar = !chosen || chosen.distance > NOTE_ATTACH_DISTANCE;
+      let ambiguous = runnerUp && (runnerUp.distance - chosen.distance) < NOTE_ATTACH_MARGIN;
+
+      // A heading placed between two sections is equidistant from both, and
+      // that happens often — it sits below one section and above the one it
+      // names. Direction settles it where distance cannot.
+      if (!tooFar && ambiguous && heading) {
+        const beneath = ranked.filter(entry => (cards[entry.cardId].y || 0) >= (note.y || 0));
+        if (beneath.length && beneath[0].distance <= NOTE_ATTACH_DISTANCE) {
+          chosen = beneath[0];
+          ambiguous = false;
+        }
+      }
+      if (chosen) nearest[noteId] = chosen.cardId;
+      if (tooFar || ambiguous) { orphans.push(noteId); continue; }
+      attached[noteId] = chosen.cardId;
+    }
+
+    return { attached, headings, orphans, nearest };
+  }
+
+  // How much room a stack of notes needs on one side of the card it labels.
+  // Not simply their height: get_flow_summary reads a note as belonging to
+  // whichever card is nearest centre to centre, so the card on the far side
+  // has to be pushed back far enough to lose that comparison — and by more
+  // than NOTE_ATTACH_MARGIN, or the summary calls the note ambiguous and
+  // files it at flow level instead. Assumes the shortest possible neighbour,
+  // since which card lands there is not known until the layout has run.
+  _noteStackDepth(cards, cardId, noteIds) {
+    if (!noteIds.length) return 0;
+    let stack = 0;
+    let outermost = 0;
+    for (const noteId of noteIds) {
+      outermost = this._noteHeight(cards[noteId]);
+      stack += outermost + NOTE_ATTACH_GAP;
+    }
+    const separation = Math.max(NOTE_GAP_ABOVE,
+      stack - outermost
+        + (this._siblingGapBelow(cards[cardId]) / 2)
+        - (CARD_GAP_Y_BARE / 2)
+        + NOTE_ATTACH_MARGIN);
+    return stack + separation;
+  }
+
+  // Lay out a flow's cards. knownAnchors maps a note id to the card it belongs
+  // to, for callers that know the association rather than having to guess it
+  // from where the note currently sits.
+  //
+  // One pass is not enough. Positioning reads the current arrangement — which
+  // behaviour sits above which, which card each note belongs to — so its
+  // output is a new arrangement that would position differently again. Most
+  // flows reach a point where nothing more moves after two passes, a few
+  // oscillate between two or three arrangements for ever, and the difference
+  // matters because the user runs this by hand and expects a second run to be
+  // a no-op. So iterate until an arrangement repeats, then, where that repeat
+  // is a cycle rather than a fixed point, take the cycle's member with the
+  // lowest key. Which one that is doesn't matter; that it is the same one
+  // whichever member the flow is currently sitting on does.
+  _layoutCards(cards, knownAnchors) {
+    const ids = Object.keys(cards).filter(id => cards[id] && cards[id].type !== 'note');
+    if (!ids.length) return { error: 'this flow has no cards to lay out' };
+
+    const before = this._copyPositions(cards);
+    const key = state => JSON.stringify(Object.keys(state).sort()
+      .map(id => [id, state[id].x, state[id].y]));
+
+    const seen = [];
+    let state = cards;
+    for (let pass = 0; pass < LAYOUT_SETTLE_PASSES; pass++) {
+      const anchors = this._captureNoteAnchors(state);
+      for (const [noteId, anchorId] of Object.entries(knownAnchors || {})) {
+        // An anchor the caller states is authoritative: reading it back off the
+        // note's position cannot repair a note that is already misplaced,
+        // because it reads the same position that misplaced it.
+        if (state[noteId] && state[anchorId]) {
+          anchors[noteId] = { anchor: anchorId, dx: 0, dy: -1 };
+        }
+      }
+
+      const next = this._copyPositions(state);
+      const result = this._positionCards(next, anchors);
+      if (result && result.error) return result;
+
+      const k = key(next);
+      const repeat = seen.findIndex(entry => entry.key === k);
+      if (repeat >= 0) {
+        const chosen = seen.slice(repeat).reduce((a, b) =>
+          (a.travel < b.travel || (a.travel === b.travel && a.key <= b.key) ? a : b));
+        return this._finishLayout(cards, before, chosen);
+      }
+      seen.push({ key: k, cards: next, result, travel: this._flowTravel(next) });
+      state = next;
+    }
+    // No repeat inside the budget: a handful of flows drift rather than cycle.
+    // Take the flattest arrangement seen, which at least does not depend on
+    // how far the budget happened to reach.
+    return this._finishLayout(cards, before, seen.reduce((a, b) =>
+      (a.travel < b.travel || (a.travel === b.travel && a.key <= b.key) ? a : b)));
+  }
+
+  // The same measure the per-behaviour packing minimises, over the whole flow:
+  // how far the connectors have to travel vertically. Used to choose between
+  // arrangements the layout will not settle between on its own.
+  _flowTravel(cards) {
+    let total = 0;
+    for (const card of Object.values(cards)) {
+      if (!card || card.type === 'note') continue;
+      for (const output of CARD_OUTPUTS) {
+        for (const childId of (card[output] || [])) {
+          const child = cards[childId];
+          if (child) total += Math.abs((child.y || 0) - (card.y || 0));
+        }
+      }
+    }
+    return total;
+  }
+
+  _finishLayout(cards, before, chosen) {
+    this._adoptPositions(cards, chosen.cards);
+    let moved = 0;
+    for (const [id, card] of Object.entries(cards)) {
+      if (!before[id]) continue;
+      if (card.x !== before[id].x || card.y !== before[id].y) moved++;
+    }
+    return Object.assign({}, chosen.result, { cardsRepositioned: moved });
+  }
+
+  _copyPositions(cards) {
+    const copy = {};
+    for (const [id, card] of Object.entries(cards)) copy[id] = Object.assign({}, card);
+    return copy;
+  }
+
+  _adoptPositions(cards, from) {
+    for (const [id, card] of Object.entries(from)) {
+      if (!cards[id]) continue;
+      cards[id].x = card.x;
+      cards[id].y = card.y;
+    }
+  }
+
+  // One pass: position every card and drop the notes into the space held for
+  // them, given a fixed idea of which card each note belongs to.
+  _positionCards(cards, noteAnchors) {
+    const ids = Object.keys(cards).filter(id => cards[id] && cards[id].type !== 'note');
+    if (!ids.length) return { error: 'this flow has no cards to lay out' };
+
+    const parents = {};
+    const children = {};
+    for (const id of ids) { parents[id] = []; children[id] = []; }
+    for (const id of ids) {
+      for (const output of CARD_OUTPUTS) {
+        for (const child of (cards[id][output] || [])) {
+          if (parents[child]) { parents[child].push(id); children[id].push(child); }
+        }
+      }
+    }
+
+    const groups = this._connectedGroups(ids, parents, children);
+    // Keep the author's top-to-bottom ordering of behaviours
+    groups.sort((a, b) =>
+      Math.min.apply(null, a.map(id => cards[id].y || 0))
+      - Math.min.apply(null, b.map(id => cards[id].y || 0)));
+
+    const originX = Math.min.apply(null, ids.map(id => cards[id].x || 0));
+    const originY = Math.min.apply(null, ids.map(id => cards[id].y || 0));
+    // Finish with the flow's topmost element clear of the canvas controls.
+    // Preserving wherever it currently starts would keep any drift it has
+    // already accumulated, and the origin carries no meaning of its own.
+    const topBefore = CANVAS_TOP_MARGIN;
+
+    // Set aside room beside each annotated card before anything is placed.
+    // Notes were previously squeezed in afterwards, which works only where
+    // the layout happens to have left a gap — and a note with nowhere to go
+    // ends up nearer some other card, so it reads as annotating that one.
+    const reserve = {};
+    for (const [noteId, anchor] of Object.entries(noteAnchors)) {
+      const slot = reserve[anchor.anchor]
+        || (reserve[anchor.anchor] = { above: 0, below: 0, aboveNotes: [], belowNotes: [] });
+      if (anchor.dy <= 0) slot.aboveNotes.push(noteId);
+      else slot.belowNotes.push(noteId);
+    }
+    for (const [cardId, slot] of Object.entries(reserve)) {
+      slot.above = this._noteStackDepth(cards, cardId, slot.aboveNotes);
+      slot.below = this._noteStackDepth(cards, cardId, slot.belowNotes);
+    }
+
+    let moved = 0;
+    let widest = 0;
+    let bandTop = originY;
+    const laidOut = [];
+    for (const group of groups) {
+      const laid = this._layoutGroup(cards, group, parents, children, originX, bandTop, reserve);
+      laidOut.push({ group, laid });
+      moved += laid.moved;
+      widest = Math.max(widest, laid.columns);
+      bandTop = laid.bottom + CARD_BAND_GAP_Y;
+    }
+
+    // Right-align the last column of every behaviour. Bands end at different
+    // depths, so their final cards otherwise land a little apart — close
+    // enough to read as a mistake rather than a choice.
+    const finalX = Math.max.apply(null, laidOut.map(entry => entry.laid.lastColumnX));
+    for (const entry of laidOut) {
+      if (entry.laid.lastColumnX === finalX) continue;
+      for (const id of entry.group) {
+        if (cards[id].x === entry.laid.lastColumnX) cards[id].x = finalX;
+      }
+    }
+
+    // Drop each note into the space held for it, stacking where a card has
+    // more than one. Its position is then guaranteed to be the gap belonging
+    // to that card, which is what makes it read as annotating it.
+    for (const [cardId, slot] of Object.entries(reserve)) {
+      const target = cards[cardId];
+      if (!target) continue;
+
+      let y = (target.y || 0) - NOTE_ATTACH_GAP;
+      for (const noteId of slot.aboveNotes.slice().reverse()) {
+        y -= this._noteHeight(cards[noteId]);
+        cards[noteId].x = target.x || 0;
+        cards[noteId].y = y;
+        y -= NOTE_ATTACH_GAP;
+      }
+      let below = (target.y || 0) + this._siblingGapBelow(target) + NOTE_ATTACH_GAP;
+      for (const noteId of slot.belowNotes) {
+        cards[noteId].x = target.x || 0;
+        cards[noteId].y = below;
+        below += this._noteHeight(cards[noteId]) + NOTE_ATTACH_GAP;
+      }
+    }
+
+    const topAfter = Math.min.apply(null, Object.values(cards).map(card => card.y || 0));
+    const correction = topBefore - topAfter;
+    if (correction !== 0) {
+      for (const card of Object.values(cards)) card.y = (card.y || 0) + correction;
+    }
+
+    return {
+      cardsRepositioned: moved,
+      independentBehaviours: groups.length,
+      widestBehaviour: widest,
+      notesMoved: Object.keys(noteAnchors).length
+    };
+  }
+
   async relayoutFlow(flowId) {
-    return this._mutateAdvancedFlow(flowId, 'repositioned the cards', draft => {
-      const cards = draft.cards;
-      const ids = Object.keys(cards).filter(id => cards[id] && cards[id].type !== 'note');
-      if (!ids.length) return { error: 'this flow has no cards to lay out' };
-
-      const parents = {};
-      const children = {};
-      for (const id of ids) { parents[id] = []; children[id] = []; }
-      for (const id of ids) {
-        for (const output of CARD_OUTPUTS) {
-          for (const child of (cards[id][output] || [])) {
-            if (parents[child]) { parents[child].push(id); children[id].push(child); }
-          }
-        }
-      }
-
-      const groups = this._connectedGroups(ids, parents, children);
-      // Keep the author's top-to-bottom ordering of behaviours
-      groups.sort((a, b) =>
-        Math.min.apply(null, a.map(id => cards[id].y || 0))
-        - Math.min.apply(null, b.map(id => cards[id].y || 0)));
-
-      const noteAnchors = this._captureNoteAnchors(cards, ids, groups);
-
-      const originX = Math.min.apply(null, ids.map(id => cards[id].x || 0));
-      const originY = Math.min.apply(null, ids.map(id => cards[id].y || 0));
-      // Finish with the flow's topmost element clear of the canvas controls.
-      // Preserving wherever it currently starts would keep any drift it has
-      // already accumulated, and the origin carries no meaning of its own.
-      const topBefore = CANVAS_TOP_MARGIN;
-
-      // A note heading a band sits above that band's first card, so the band
-      // has to start low enough to leave room for it — otherwise the note
-      // lands on the band above.
-      const headroomFor = group => {
-        const members = new Set(group);
-        let clearance = 0;
-        for (const [noteId, anchor] of Object.entries(noteAnchors)) {
-          if (!members.has(anchor.anchor) || anchor.dy >= 0) continue;
-          clearance = Math.max(clearance, this._noteHeight(cards[noteId]) + NOTE_GAP_ABOVE);
-        }
-        return clearance;
-      };
-
-      let moved = 0;
-      let widest = 0;
-      let bandTop = originY;
-      const laidOut = [];
-      for (const group of groups) {
-        bandTop += headroomFor(group);
-        const laid = this._layoutGroup(cards, group, parents, children, originX, bandTop);
-        laidOut.push({ group, laid });
-        moved += laid.moved;
-        widest = Math.max(widest, laid.columns);
-        bandTop = laid.bottom + CARD_BAND_GAP_Y;
-      }
-
-      // Right-align the last column of every behaviour. Bands end at different
-      // depths, so their final cards otherwise land a little apart — close
-      // enough to read as a mistake rather than a choice.
-      const finalX = Math.max.apply(null, laidOut.map(entry => entry.laid.lastColumnX));
-      for (const entry of laidOut) {
-        if (entry.laid.lastColumnX === finalX) continue;
-        for (const id of entry.group) {
-          if (cards[id].x === entry.laid.lastColumnX) cards[id].x = finalX;
-        }
-      }
-
-      for (const [noteId, anchor] of Object.entries(noteAnchors)) {
-        const target = cards[anchor.anchor];
-        if (!target) continue;
-        const note = cards[noteId];
-        let dy = anchor.dy;
-        // A note above its card must clear the card's own height, whatever
-        // offset it was stored with
-        const clearance = this._noteHeight(note) + NOTE_GAP_ABOVE;
-        if (dy < 0 && dy > -clearance) dy = -clearance;
-        note.x = (target.x || 0) + anchor.dx;
-        note.y = (target.y || 0) + dy;
-      }
-
-      const topAfter = Math.min.apply(null, Object.values(cards).map(card => card.y || 0));
-      const correction = topBefore - topAfter;
-      if (correction !== 0) {
-        for (const card of Object.values(cards)) card.y = (card.y || 0) + correction;
-      }
-
-      return {
-        cardsRepositioned: moved,
-        independentBehaviours: groups.length,
-        widestBehaviour: widest,
-        notesMoved: Object.keys(noteAnchors).length
-      };
-    });
+    return this._mutateAdvancedFlow(flowId, 'repositioned the cards',
+      draft => this._layoutCards(draft.cards));
   }
 
   async createAdvancedFlow(name, folder) {
@@ -2081,53 +2273,17 @@ class HomeyDocsCompanion extends Homey.App {
     // layouts the note for the upper branch sits under it. Measuring from the
     // note's rectangle rather than its corner treats all three the same, so no
     // directional assumption is needed.
-    const positioned = Object.entries(cards).filter(([, c]) => c.type !== 'note');
-    const leftEdge = positioned.length
-      ? Math.min.apply(null, positioned.map(([, c]) => c.x || 0)) : 0;
+    const { attached, headings, orphans } = this._noteAttachments(cards);
+    const noteLabel = noteId => (showIds
+      ? noteId.slice(0, this._shortIdLength(cards)) + ' ' : '')
+      + '# ' + String(cards[noteId].value).replace(/\s+/g, ' ').trim();
+
     const notesByCard = new Map();
-    const orphanNotes = [];
-
-    for (const [noteId, note] of Object.entries(cards)) {
-      if (!note || note.type !== 'note') continue;
-      const text = String(note.value).replace(/\s+/g, ' ').trim();
-      const label = (showIds ? noteId.slice(0, this._shortIdLength(cards)) + ' ' : '') + '# ' + text;
-
-      // Centre to centre. A note's width and height are null — Homey sizes it
-      // at render time — so both are estimated, the note's from its text and a
-      // card's from its arguments.
-      const noteX = (note.x || 0) + (NOTE_WIDTH_ESTIMATE / 2);
-      const noteY = (note.y || 0) + (this._noteHeight(note) / 2);
-
-      const ranked = positioned.map(([cardId, card]) => {
-        const dx = ((card.x || 0) + (CARD_WIDTH_ESTIMATE / 2)) - noteX;
-        const dy = ((card.y || 0) + (this._siblingGapBelow(card) / 2)) - noteY;
-        return { cardId, distance: Math.sqrt((dx * dx) + (dy * dy)) };
-      }).sort((a, b) => a.distance - b.distance);
-
-      // A note at the left margin heads a section and reads correctly above it;
-      // one out in the flow annotates a single card and belongs beneath it.
-      const heading = (note.x || 0) <= leftEdge;
-
-      let chosen = ranked[0];
-      const runnerUp = ranked[1];
-      const tooFar = !chosen || chosen.distance > NOTE_ATTACH_DISTANCE;
-      let ambiguous = runnerUp && (runnerUp.distance - chosen.distance) < NOTE_ATTACH_MARGIN;
-
-      // A heading placed between two sections is equidistant from both, and
-      // that happens often — it sits below one section and above the one it
-      // names. Direction settles it where distance cannot.
-      if (!tooFar && ambiguous && heading) {
-        const beneath = ranked.filter(entry => (cards[entry.cardId].y || 0) >= (note.y || 0));
-        if (beneath.length && beneath[0].distance <= NOTE_ATTACH_DISTANCE) {
-          chosen = beneath[0];
-          ambiguous = false;
-        }
-      }
-      if (tooFar || ambiguous) { orphanNotes.push(label); continue; }
-
-      if (!notesByCard.has(chosen.cardId)) notesByCard.set(chosen.cardId, { above: [], below: [] });
-      notesByCard.get(chosen.cardId)[heading ? 'above' : 'below'].push(label);
+    for (const [noteId, cardId] of Object.entries(attached)) {
+      if (!notesByCard.has(cardId)) notesByCard.set(cardId, { above: [], below: [] });
+      notesByCard.get(cardId)[headings.has(noteId) ? 'above' : 'below'].push(noteLabel(noteId));
     }
+    const orphanNotes = orphans.map(noteLabel);
 
     // Cards reached from more than one place get a stable marker, so a
     // cross-reference points at one specific card rather than at a label that
