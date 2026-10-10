@@ -143,6 +143,45 @@ const TOOLS = [
     },
   },
   {
+    name: 'list_insights',
+    description: 'List the Insights logs Homey keeps — its own history of device capability values '
+      + 'and Logic variables — with the owning device or variable, capability, type, units and '
+      + 'decimals. Use it to find what can be charted with get_insights. Unfiltered the list runs to '
+      + 'over a thousand logs, so give a target. A device or variable with no log is reported as such.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'Case-insensitive substring of a device or variable name, capability, log title or id. A device id works too.' },
+        type: { type: 'string', enum: ['number', 'boolean'], description: 'Only logs of this type.' },
+        limit: { type: 'integer', description: 'Maximum logs to return. Default 100, max 1000.' },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'get_insights',
+    description: 'History of one Insights log, read live. Number logs return [time, value] pairs and '
+      + 'a summary (first, last, min and max with times, mean, count). Each value is Homey\'s '
+      + 'average over one step, so a brief spike is smoothed out at coarse steps. The finest resolution that '
+      + 'reaches since is chosen, and long windows are thinned keeping each slice\'s min and max. '
+      + 'Boolean logs return transitions with what caused each one (usually the flow), and the time '
+      + 'spent true. Times are ISO 8601 at Homey\'s local time, with the offset. With no since, the '
+      + 'last 24 hours.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'Device or variable name (exact match preferred, then substring), a device id, or a full log id.' },
+        capability: { type: 'string', description: 'The capability, e.g. measure_humidity. Needed when the device logs more than one; without it the choices are returned.' },
+        since: { type: 'string', description: 'ISO 8601 datetime — only at or after this. Include the offset (Z or +01:00).' },
+        until: { type: 'string', description: 'ISO 8601 datetime — only at or before this.' },
+        resolution: { type: 'string', description: 'Override the chosen window: lastHour (5 s steps), last6Hours (1 min), last24Hours (5 min), last7Days or last14Days (1 h), last31Days (6 h), today (5 min), last3Months (6 h) or last6Months (1 week). The last two are calendar months ending at the start of this month. Ignored for boolean logs.' },
+        maxPoints: { type: 'integer', description: 'Most values or transitions to return. Default 200, min 10, max 2000.' },
+      },
+      required: ['target'],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
     name: 'list_apps',
     description: 'The apps installed on Homey, read live — id, name, version and whether each one is running. Worth checking when a flow looks correct but does not fire: a crashed or disabled app breaks every flow that uses its cards, and nothing in the flow itself shows that.',
     inputSchema: { type: 'object', properties: {} },
@@ -980,6 +1019,15 @@ class HomeyMcpServer {
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   }
 
+  // JSON with every innermost array or object on one line. Two hundred
+  // [time, value] pairs indented the usual way run to eight hundred lines.
+  _compact(data) {
+    const text = JSON.stringify(data, null, 2)
+      .replace(/([[{])\n\s+([^[\]{}]*?)\n\s*([\]}])/g,
+        (match, open, body, close) => open + body.replace(/\n\s*/g, ' ') + close);
+    return { content: [{ type: 'text', text }] };
+  }
+
   // Pre-formatted text — JSON-encoding it would bury the layout in \n escapes
   _raw(text) {
     return { content: [{ type: 'text', text: String(text) }] };
@@ -1150,6 +1198,20 @@ class HomeyMcpServer {
           }
           result.logs = logs.slice(0, limit);
           return this._text(result);
+        }
+
+        case 'list_insights':
+          return this._compact(await app.listInsights({
+            target: args.target, type: args.type, limit: args.limit,
+          }));
+
+        case 'get_insights': {
+          if (!args.target) throw new Error('target is required');
+          return this._compact(await app.getInsights({
+            target: args.target, capability: args.capability,
+            since: args.since, until: args.until,
+            resolution: args.resolution, maxPoints: args.maxPoints,
+          }));
         }
 
         case 'list_apps':

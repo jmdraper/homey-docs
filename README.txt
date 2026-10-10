@@ -39,6 +39,8 @@ AI ASSISTANT INTEGRATION (MCP)
 
 An MCP (Model Context Protocol) server runs on Homey and gives AI assistants such as Claude direct read access to your flows, devices, variables, and zones. Once connected, you can ask your AI to explain what a flow does, trace behaviour across several flows, or find what still references something you removed. Answers come from your live configuration each time, so there is no separate documentation to keep up to date.
 
+The assistant can also read Insights, Homey's own history of device values and Logic variables. list_insights shows which logs exist. get_insights returns one log over a window you choose: a number log comes with a summary of first, last, lowest, highest and average, and an on/off log comes as the moments it changed, what changed it, and how long it was on. This access is read-only; nothing in Insights is changed or deleted.
+
 Setup takes three steps — all explained in the viewer's Setup panel:
 1. Install mcp-remote on your Mac or PC (one-time)
 2. Add a short config entry to Claude Desktop

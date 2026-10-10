@@ -210,6 +210,32 @@ const TRACE_DEFAULT_DEPTH = 3;
 // trail for "when did that get turned off", not a history.
 const FLOW_STATE_LOG_LIMIT = 200;
 
+// Insights only serves fixed windows, each ending now. Measured on a real Homey
+// in Oct 2026 — the reference names the parameter but lists no values. Finest
+// first, so the first window that reaches back far enough is the one to use.
+const INSIGHTS_ROLLING = [
+  { id: 'lastHour', spanMs: 3600e3, stepMs: 5e3 },
+  { id: 'last6Hours', spanMs: 6 * 3600e3, stepMs: 60e3 },
+  { id: 'last24Hours', spanMs: 24 * 3600e3, stepMs: 300e3 },
+  { id: 'last7Days', spanMs: 7 * 86400e3, stepMs: 3600e3 },
+  { id: 'last14Days', spanMs: 14 * 86400e3, stepMs: 3600e3 },
+  { id: 'last31Days', spanMs: 31 * 86400e3, stepMs: 6 * 3600e3 },
+];
+
+// The longer resolutions are calendar windows that end at the start of the
+// current month, so on their own they never reach the present. last3Months has
+// the same 6-hour step as last31Days, which is what lets the two be joined.
+const INSIGHTS_LONG = 'last3Months';
+
+// A window is generated a moment after the caller worked out its since, so
+// "6 hours ago" lands a few seconds before the start of last6Hours. A margin of
+// the span stops that tipping it into a window four times coarser.
+const INSIGHTS_REACH_MARGIN = 0.02;
+
+const INSIGHTS_DEFAULT_SPAN_MS = 24 * 3600e3;
+const INSIGHTS_DEFAULT_POINTS = 200;
+const INSIGHTS_LIST_DEFAULT = 100;
+
 // Addresses that cannot be pointed at this Homey by an attacker's DNS: IPv4 and
 // IPv6 literals, localhost, and mDNS .local names (resolved by mDNS, not DNS).
 const UNREBINDABLE_HOST_RE = /^(?:\[[0-9a-f:]+\]|\d{1,3}(?:\.\d{1,3}){3}|localhost|[a-z0-9-]+\.local)$/i;
@@ -3748,28 +3774,68 @@ class HomeyDocsCompanion extends Homey.App {
     return { entities, flows };
   }
 
-  _resolveTraceTarget(query, graph) {
+  // How a name given by a person is turned into one thing: an exact name wins,
+  // case-insensitively, and only when there is none does a substring count.
+  // Returns every item at the best level found, so one is an answer and several
+  // are candidates for the caller to list.
+  _matchByName(query, items, nameOf) {
     const needle = String(query || '').trim().toLowerCase();
-    if (!needle) return { error: 'target is required' };
-
-    const matches = [];
-    for (const node of graph.entities.values()) {
-      const label = String(node.label).toLowerCase();
-      if (label === needle) matches.unshift({ node, exact: true });
-      else if (label.includes(needle)) matches.push({ node, exact: false });
+    if (!needle) return [];
+    const exact = [];
+    const partial = [];
+    for (const item of items) {
+      const name = String(nameOf(item) || '').toLowerCase();
+      if (name === needle) exact.push(item);
+      else if (name.includes(needle)) partial.push(item);
     }
-    for (const flow of graph.flows.values()) {
-      const name = String(flow.name).toLowerCase();
-      if (name === needle) matches.unshift({ flow, exact: true });
-      else if (name.includes(needle)) matches.push({ flow, exact: false });
+    return exact.length ? exact : partial;
+  }
+
+  // For a name that matched nothing: the few that look most like it, so a typo
+  // or a half-remembered name gets an answer rather than a dead end.
+  _closestNames(query, names, limit) {
+    const needle = String(query || '').trim().toLowerCase();
+    const words = needle.split(/[^a-z0-9]+/).filter(Boolean);
+    const distance = (a, b) => {
+      let row = Array.from({ length: b.length + 1 }, (_, i) => i);
+      for (let i = 1; i <= a.length; i++) {
+        const next = [i];
+        for (let j = 1; j <= b.length; j++) {
+          next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        }
+        row = next;
+      }
+      return row[b.length];
+    };
+    // A word counts as shared when it is close to one in the name, so a typo
+    // ("Sculery") still finds the room it was meant for
+    const closeness = (a, b) => 1 - distance(a, b) / Math.max(a.length, b.length, 1);
+    const scored = [];
+    for (const name of new Set(names.filter(Boolean))) {
+      const lower = name.toLowerCase();
+      const nameWords = lower.split(/[^a-z0-9]+/).filter(Boolean);
+      const shared = words.reduce((total, word) => {
+        const best = Math.max(0, ...nameWords.map(other => closeness(word, other)));
+        return total + (best >= 0.75 ? best : 0);
+      }, 0);
+      const similarity = 1 - distance(needle, lower) / Math.max(needle.length, lower.length, 1);
+      scored.push({ name, score: shared + similarity });
     }
+    return scored.sort((a, b) => b.score - a.score)
+      .slice(0, limit || 5)
+      .map(entry => entry.name);
+  }
 
-    if (!matches.length) return { error: 'Nothing called "' + query + '" appears in any flow.' };
-    const exact = matches.filter(m => m.exact);
-    if (exact.length === 1) return exact[0];
-    if (matches.length === 1) return matches[0];
+  _resolveTraceTarget(query, graph) {
+    if (!String(query || '').trim()) return { error: 'target is required' };
 
-    const pool = exact.length ? exact : matches;
+    const items = [
+      ...Array.from(graph.entities.values(), node => ({ node, name: node.label })),
+      ...Array.from(graph.flows.values(), flow => ({ flow, name: flow.name })),
+    ];
+    const pool = this._matchByName(query, items, item => item.name);
+
+    if (!pool.length) return { error: 'Nothing called "' + query + '" appears in any flow.' };
     if (pool.length === 1) return pool[0];
     return {
       error: '"' + query + '" matches ' + pool.length + ' things; name one exactly.',
@@ -3855,6 +3921,532 @@ class HomeyDocsCompanion extends Homey.App {
     }
 
     return out.join('\n');
+  }
+
+  // ─── Insights (history) ──────────────────────────────────────────────────────
+
+  // Homey's own time series of capability values and Logic variables, read live
+  // through the Web API. The Apps SDK's homey.insights is no use here: it only
+  // reaches logs this app owns. Read-only — nothing here deletes or edits a log.
+
+  _timezone() {
+    try { return this.homey.clock.getTimezone() || 'Europe/London'; }
+    catch (e) { return 'Europe/London'; }
+  }
+
+  // ISO 8601 at Homey's local time, with the offset: 2026-10-10T08:21:22+01:00.
+  // The same instant as get_logs' UTC timestamps and parsed the same way, but it
+  // reads as the time on the clock, which is what a question about last night
+  // is asked in.
+  _localIso(at) {
+    const date = new Date(at);
+    try {
+      const parts = {};
+      const format = new Intl.DateTimeFormat('en-GB', {
+        timeZone: this._timezone(), hourCycle: 'h23',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+      });
+      for (const part of format.formatToParts(date)) parts[part.type] = part.value;
+      const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day,
+        +parts.hour, +parts.minute, +parts.second);
+      const offset = Math.round((asUtc - Math.floor(date.getTime() / 1000) * 1000) / 60000);
+      const pad = n => String(n).padStart(2, '0');
+      return parts.year + '-' + parts.month + '-' + parts.day
+        + 'T' + parts.hour + ':' + parts.minute + ':' + parts.second
+        + (offset < 0 ? '-' : '+') + pad(Math.floor(Math.abs(offset) / 60)) + ':' + pad(Math.abs(offset) % 60);
+    } catch (e) {
+      return date.toISOString();
+    }
+  }
+
+  _duration(ms) {
+    const minutes = Math.round(ms / 60000);
+    if (ms < 60000) return Math.round(ms / 1000) + ' s';
+    if (minutes < 60) return minutes + ' min';
+    const hours = Math.floor(minutes / 60);
+    if (hours < 48) return hours + ' h' + (minutes % 60 ? ' ' + (minutes % 60) + ' min' : '');
+    return Math.floor(hours / 24) + ' d' + (hours % 24 ? ' ' + (hours % 24) + ' h' : '');
+  }
+
+  // Every Insights log, tied to the device or variable that owns it. Homey's
+  // ownerName is no help for variables — it says "Logic", or nothing — and
+  // homey-api has deprecated it, so owners are named from the live device and
+  // variable lists instead. Devices and variables with no log are kept as well,
+  // because "Homey does not log that" is an answer worth being able to give.
+  async _insightsCatalogue() {
+    const [logs, devices, variables] = await Promise.all([
+      this._apiGet('/manager/insights/log'),
+      this._apiGet('/manager/devices/device').catch(() => null),
+      this._apiGet('/manager/logic/variable').catch(() => null),
+    ]);
+
+    const owners = new Map();
+    for (const [id, device] of Object.entries(devices || {})) {
+      const key = 'homey:device:' + id;
+      owners.set(key, {
+        key, kind: 'device', id, name: device.name,
+        capabilities: device.capabilities || [], logs: [],
+      });
+    }
+    for (const [id, variable] of Object.entries(variables || {})) {
+      const key = 'homey:manager:logic:' + id;
+      owners.set(key, { key, kind: 'variable', id, name: variable.name, variableType: variable.type, logs: [] });
+    }
+
+    const all = [];
+    for (const entry of Array.isArray(logs) ? logs : Object.values(logs || {})) {
+      if (!entry || !entry.id) continue;
+      const ownerUri = entry.ownerUri || entry.id.split(':', 3).join(':');
+      const isVariable = ownerUri === 'homey:manager:logic';
+      const isDevice = ownerUri.startsWith('homey:device:');
+      const key = isVariable ? ownerUri + ':' + entry.ownerId : ownerUri;
+
+      let owner = owners.get(key);
+      if (!owner) {
+        // A log outlives what it records: a deleted device or variable keeps
+        // its history. Only called deleted when the live list was actually read.
+        if (isVariable) {
+          owner = { key, kind: 'variable', id: entry.ownerId, name: entry.title, deleted: !!variables };
+        } else if (isDevice) {
+          const id = ownerUri.slice('homey:device:'.length);
+          owner = { key, kind: 'device', id, name: entry.ownerName || 'device ' + id.slice(0, 8), deleted: !!devices };
+        } else {
+          owner = { key, kind: 'homey', id: ownerUri, name: entry.ownerName || ownerUri.split(':').pop() };
+        }
+        owner.logs = [];
+        owners.set(key, owner);
+      }
+
+      const log = {
+        id: entry.id, owner,
+        capability: isVariable ? null : (entry.ownerId || entry.id.split(':').slice(3).join(':')),
+        title: entry.title || null,
+        type: entry.type,
+        units: entry.units || null,
+        decimals: typeof entry.decimals === 'number' ? entry.decimals : null,
+        titleTrue: entry.titleTrue || null,
+        titleFalse: entry.titleFalse || null,
+      };
+      owner.logs.push(log);
+      all.push(log);
+    }
+    return { logs: all, owners: Array.from(owners.values()) };
+  }
+
+  _describeInsightsLog(log) {
+    const out = { id: log.id, owner: log.owner.name, kind: log.owner.kind };
+    if (log.capability) out.capability = log.capability;
+    if (log.title) out.title = log.title;
+    out.type = log.type;
+    if (log.units) out.units = log.units;
+    if (log.decimals !== null) out.decimals = log.decimals;
+    if (log.owner.deleted) out.deleted = true;
+    return out;
+  }
+
+  _describeInsightsOwner(owner) {
+    return owner.kind + ' "' + owner.name + '"' + (owner.deleted ? ' (deleted)' : '');
+  }
+
+  // Names, ids and capabilities, resolved the way trace_behaviour resolves
+  // names. Returns { log } or an explanation with something to choose from.
+  _resolveInsightsTarget(catalogue, target, capability) {
+    const given = String(target || '').trim();
+    if (!given) return { error: 'target is required' };
+
+    const exactLog = catalogue.logs.find(log => log.id === given);
+    if (exactLog) return { log: exactLog };
+
+    const byKey = new Map(catalogue.owners.map(owner => [owner.key, owner]));
+    let owner = byKey.get(given) || byKey.get('homey:device:' + given)
+      || byKey.get('homey:manager:logic:' + given);
+
+    if (!owner) {
+      let pool = this._matchByName(given, catalogue.owners, o => o.name);
+      // A variable deleted and re-created under the same name leaves two owners
+      // of that name; the live one with a log is the one meant
+      if (pool.length > 1) {
+        const live = pool.filter(o => !o.deleted && o.logs.length);
+        if (live.length === 1) pool = live;
+      }
+      if (pool.length > 1) {
+        return {
+          error: '"' + given + '" matches ' + pool.length + ' things; name one exactly.',
+          candidates: pool.slice(0, 12).map(o => this._describeInsightsOwner(o)),
+        };
+      }
+      owner = pool[0];
+    }
+
+    if (!owner) {
+      // App and system logs have no owner worth naming, only a title
+      const titled = this._matchByName(given, catalogue.logs, log => log.title);
+      if (titled.length === 1) return { log: titled[0] };
+      if (titled.length > 1) {
+        return {
+          error: '"' + given + '" matches the title of ' + titled.length + ' logs; give the log id.',
+          candidates: titled.slice(0, 12).map(log => this._describeInsightsLog(log)),
+        };
+      }
+      return {
+        error: 'Nothing in Insights, and no device or variable on Homey, is called "' + given + '".',
+        closestMatches: this._closestNames(given, catalogue.owners.map(o => o.name), 6),
+      };
+    }
+
+    const logged = owner.logs.map(log => log.capability || log.title);
+
+    if (!owner.logs.length) {
+      if (owner.kind === 'variable') {
+        return {
+          error: 'Variable "' + owner.name + '" (' + (owner.variableType || 'unknown type') + ') is not '
+            + 'logged in Insights. Homey logs number variables, and only some boolean ones; it never '
+            + 'logs text variables.',
+        };
+      }
+      return { error: this._describeInsightsOwner(owner) + ' has no Insights logs at all.' };
+    }
+
+    if (owner.kind === 'variable') return { log: owner.logs[0] };
+    if (owner.logs.length === 1 && (!capability || owner.logs[0].capability === capability)) {
+      return { log: owner.logs[0] };
+    }
+
+    if (!capability) {
+      return {
+        error: this._describeInsightsOwner(owner) + ' has ' + owner.logs.length
+          + ' logged capabilities; say which one with capability.',
+        candidates: owner.logs.map(log => this._describeInsightsLog(log)),
+      };
+    }
+
+    const wanted = String(capability).trim();
+    let pool = owner.logs.filter(log => log.capability === wanted);
+    if (!pool.length) pool = this._matchByName(wanted, owner.logs, log => log.capability);
+    if (!pool.length) pool = this._matchByName(wanted, owner.logs, log => log.title);
+    if (pool.length === 1) return { log: pool[0] };
+    if (pool.length > 1) {
+      return {
+        error: '"' + wanted + '" matches ' + pool.length + ' of ' + owner.name + '\'s logs; name one exactly.',
+        candidates: pool.map(log => this._describeInsightsLog(log)),
+      };
+    }
+    // Some capabilities are simply not logged, which is different from a
+    // capability the device does not have
+    const has = (owner.capabilities || []).includes(wanted);
+    return {
+      error: has
+        ? owner.name + ' has ' + wanted + ', but Homey does not log that capability to Insights.'
+        : owner.name + ' has no capability "' + wanted + '".',
+      logged,
+    };
+  }
+
+  _insightsBound(name, value) {
+    if (value === undefined || value === null || value === '') return null;
+    const at = new Date(value);
+    if (Number.isNaN(at.getTime())) {
+      throw new Error(name + ' is not a valid ISO 8601 datetime: ' + JSON.stringify(value));
+    }
+    return at;
+  }
+
+  async listInsights(options) {
+    const opts = options || {};
+    const limit = Math.min(Math.max(parseInt(opts.limit, 10) || INSIGHTS_LIST_DEFAULT, 1), 1000);
+    const catalogue = await this._insightsCatalogue();
+    let logs = catalogue.logs;
+    if (opts.type) logs = logs.filter(log => log.type === opts.type);
+
+    const result = {};
+    if (opts.target) {
+      const needle = String(opts.target).trim().toLowerCase();
+      logs = logs.filter(log => [log.owner.name, log.capability, log.title, log.id]
+        .some(text => text && String(text).toLowerCase().includes(needle)));
+      if (!logs.length) {
+        const unlogged = this._matchByName(opts.target,
+          catalogue.owners.filter(owner => !owner.logs.length), owner => owner.name);
+        if (unlogged.length) {
+          result.notLogged = unlogged.slice(0, 12).map(owner => this._describeInsightsOwner(owner)
+            + (owner.variableType ? ' (' + owner.variableType + ')' : '')
+            + ' exists but has no Insights log');
+        } else {
+          result.closestMatches = this._closestNames(opts.target, catalogue.owners.map(o => o.name), 6);
+        }
+      }
+    }
+
+    const kindOrder = { device: 0, variable: 1, homey: 2 };
+    logs = logs.slice().sort((a, b) => (kindOrder[a.owner.kind] - kindOrder[b.owner.kind])
+      || String(a.owner.name).localeCompare(String(b.owner.name))
+      || String(a.capability || a.title).localeCompare(String(b.capability || b.title)));
+
+    result.count = logs.length;
+    result.returned = Math.min(logs.length, limit);
+    if (logs.length > limit) {
+      result.truncated = logs.length + ' logs matched; the first ' + limit + ' are returned. '
+        + 'Give a target or type to narrow it, or raise limit.';
+    }
+    result.logs = logs.slice(0, limit).map(log => this._describeInsightsLog(log));
+    return result;
+  }
+
+  async getInsights(options) {
+    const opts = options || {};
+    let since;
+    let until;
+    try {
+      since = this._insightsBound('since', opts.since);
+      until = this._insightsBound('until', opts.until);
+    } catch (e) {
+      return { error: e.message };
+    }
+    if (since && until && since > until) return { error: 'since is later than until, so the window is empty' };
+    const maxPoints = Math.min(Math.max(parseInt(opts.maxPoints, 10) || INSIGHTS_DEFAULT_POINTS, 10), 2000);
+
+    const catalogue = await this._insightsCatalogue();
+    const found = this._resolveInsightsTarget(catalogue, opts.target, opts.capability);
+    if (!found.log) return found;
+    const log = found.log;
+
+    const header = { log: log.id, owner: log.owner.name, kind: log.owner.kind };
+    if (log.owner.deleted) header.deleted = true;
+    if (log.capability) header.capability = log.capability;
+    if (log.title) header.title = log.title;
+    header.type = log.type;
+    if (log.units) header.units = log.units;
+    header.timezone = this._timezone();
+
+    const path = '/manager/insights/log/' + log.id.split(':', 3).join(':') + '/' + log.id + '/entry';
+    return log.type === 'boolean'
+      ? this._booleanInsights(log, header, path, since, until, maxPoints)
+      : this._numberInsights(log, header, path, since, until, maxPoints, opts.resolution);
+  }
+
+  // Number logs come in fixed windows of evenly spaced buckets. The finest
+  // window that still reaches since is used; beyond 31 days, last3Months and
+  // last31Days are joined, which works because both use a 6-hour step.
+  async _numberInsights(log, header, path, since, until, maxPoints, resolution) {
+    const now = Date.now();
+    let plan;
+    if (resolution) {
+      plan = [String(resolution)];
+    } else {
+      // With no since the default is a day, unless until is further back than that
+      const reach = since
+        || (until && now - until.getTime() > INSIGHTS_DEFAULT_SPAN_MS ? until : null);
+      if (!reach) {
+        plan = ['last24Hours'];
+      } else {
+        const back = now - reach.getTime();
+        const fit = INSIGHTS_ROLLING.find(window => back <= window.spanMs * (1 + INSIGHTS_REACH_MARGIN));
+        plan = fit ? [fit.id] : [INSIGHTS_LONG, 'last31Days'];
+      }
+    }
+
+    let windows;
+    try {
+      windows = await Promise.all(plan.map(id => this._apiGet(path + '?resolution=' + encodeURIComponent(id))));
+    } catch (e) {
+      if (resolution && /resolution/i.test(e.message)) {
+        return {
+          error: 'Homey rejected resolution "' + resolution + '". ' + e.message,
+          knownResolutions: INSIGHTS_ROLLING.map(window => window.id)
+            .concat(['today', INSIGHTS_LONG, 'last6Months']),
+        };
+      }
+      throw e;
+    }
+
+    // Later windows win where they overlap: last31Days is the fresher of the two
+    const byTime = new Map();
+    let servedStart = Infinity;
+    let servedEnd = -Infinity;
+    let stepMs = null;
+    for (const window of windows) {
+      if (!window) continue;
+      for (const entry of window.values || []) {
+        const t = Date.parse(entry.t);
+        if (Number.isFinite(t)) byTime.set(t, entry.v);
+      }
+      if (window.start) servedStart = Math.min(servedStart, Date.parse(window.start));
+      if (window.end) servedEnd = Math.max(servedEnd, Date.parse(window.end));
+      if (window.step) stepMs = window.step;
+    }
+    const points = Array.from(byTime, ([t, v]) => ({ t, v })).sort((a, b) => a.t - b.t);
+
+    const from = since ? since.getTime() : -Infinity;
+    const to = until ? until.getTime() : Infinity;
+    const inWindow = points.filter(p => p.t >= from && p.t <= to);
+    const droppedBefore = points.filter(p => p.t < from).length;
+    const droppedAfter = points.filter(p => p.t > to).length;
+    const valued = inWindow.filter(p => typeof p.v === 'number');
+
+    const decimals = log.decimals !== null ? log.decimals : 2;
+    const round = (value, places) => Math.round(value * 10 ** places) / 10 ** places;
+    const stepLabel = stepMs ? this._duration(stepMs) : 'unknown';
+
+    const result = Object.assign({}, header, {
+      resolution: plan.join(' + '),
+      step: stepLabel,
+      from: valued.length ? this._localIso(valued[0].t) : null,
+      to: valued.length ? this._localIso(valued[valued.length - 1].t) : null,
+    });
+
+    if (droppedBefore || droppedAfter) {
+      result.trimmed = 'Homey served ' + this._localIso(servedStart) + ' to ' + this._localIso(servedEnd)
+        + ' (Insights only serves fixed windows); ' + droppedBefore + ' bucket(s) before since and '
+        + droppedAfter + ' after until were dropped.';
+    }
+    // Within a step of since is the reach margin at work, not a gap worth reporting
+    if (since && since.getTime() < servedStart - (stepMs || 0)) {
+      const reachedLongest = plan.includes(INSIGHTS_LONG);
+      if (reachedLongest) {
+        // The flag get_logs calls beforeRetention: the window is not empty
+        // because nothing happened, but because nothing older is held
+        result.beforeRetention = 'Insights reaches back only to ' + this._localIso(servedStart)
+          + ' at a step this tool can join to recent data, which is after since. Weekly figures go '
+          + 'further back: pass resolution last6Months to see them.';
+      } else {
+        result.windowNote = 'The ' + plan.join(' + ') + ' window starts at ' + this._localIso(servedStart)
+          + ', ' + this._duration(servedStart - since.getTime()) + ' after since.'
+          + (resolution ? ' Omit resolution to have one chosen that reaches since.' : '');
+      }
+    }
+    if (inWindow.length > valued.length) {
+      result.gaps = (inWindow.length - valued.length) + ' of ' + inWindow.length
+        + ' buckets hold no value (nothing recorded then).';
+    }
+
+    if (!valued.length) {
+      result.summary = null;
+      result.entries = [];
+      return result;
+    }
+
+    let min = valued[0];
+    let max = valued[0];
+    let sum = 0;
+    for (const point of valued) {
+      if (point.v < min.v) min = point;
+      if (point.v > max.v) max = point;
+      sum += point.v;
+    }
+    const first = valued[0];
+    const last = valued[valued.length - 1];
+    result.summary = {
+      first: { at: this._localIso(first.t), value: round(first.v, decimals) },
+      last: { at: this._localIso(last.t), value: round(last.v, decimals) },
+      min: { at: this._localIso(min.t), value: round(min.v, decimals) },
+      max: { at: this._localIso(max.t), value: round(max.v, decimals) },
+      mean: round(sum / valued.length, decimals + 1),
+      count: valued.length,
+    };
+
+    // Keeping the lowest and highest of each bucket, in the order they occurred,
+    // so peaks, troughs and the edges of a plateau survive the thinning
+    let kept = valued;
+    if (valued.length > maxPoints) {
+      const buckets = Math.max(1, Math.floor(maxPoints / 2));
+      const size = valued.length / buckets;
+      kept = [];
+      for (let b = 0; b < buckets; b++) {
+        const slice = valued.slice(Math.floor(b * size), Math.floor((b + 1) * size));
+        if (!slice.length) continue;
+        let lo = slice[0];
+        let hi = slice[0];
+        for (const point of slice) {
+          if (point.v < lo.v) lo = point;
+          if (point.v > hi.v) hi = point;
+        }
+        if (lo === hi) kept.push(lo);
+        else kept.push(...(lo.t < hi.t ? [lo, hi] : [hi, lo]));
+      }
+      result.downsampled = valued.length + ' values thinned to ' + kept.length
+        + ', keeping the minimum and maximum of each of ' + buckets + ' equal slices.';
+    }
+    result.entries = kept.map(point => [this._localIso(point.t), round(point.v, decimals)]);
+    return result;
+  }
+
+  // Boolean logs are not bucketed. Homey keeps each change as an event, with
+  // what caused it, and ignores any resolution — so the window is cut here, and
+  // the state at its start is whatever the last earlier event said.
+  async _booleanInsights(log, header, path, since, until, maxPoints) {
+    const data = await this._apiGet(path);
+    const events = ((data && data.values) || [])
+      .map(entry => ({
+        t: Date.parse(entry.t),
+        v: entry.v,
+        by: entry.originName || entry.originUserName || entry.originClientName || null,
+      }))
+      .filter(entry => Number.isFinite(entry.t))
+      .sort((a, b) => a.t - b.t);
+
+    const now = Date.now();
+    const to = until ? until.getTime() : now;
+    const from = since ? since.getTime() : Math.min(to, now) - INSIGHTS_DEFAULT_SPAN_MS;
+
+    const earlier = events.filter(entry => entry.t <= from);
+    const stateAtStart = earlier.length ? earlier[earlier.length - 1].v : null;
+
+    const transitions = [];
+    let state = stateAtStart;
+    for (const entry of events) {
+      if (entry.t <= from || entry.t > to) continue;
+      if (entry.v === state) continue;
+      transitions.push(entry);
+      state = entry.v;
+    }
+
+    // Time true, counted only over the part of the window whose state is known
+    let trueMs = 0;
+    let cursor = from;
+    let current = stateAtStart;
+    for (const change of transitions) {
+      if (current === true) trueMs += change.t - cursor;
+      cursor = change.t;
+      current = change.v;
+    }
+    if (current === true) trueMs += to - cursor;
+    const knownFrom = stateAtStart === null ? (transitions.length ? transitions[0].t : to) : from;
+    const knownMs = Math.max(0, to - knownFrom);
+
+    const result = Object.assign({}, header, {
+      resolution: 'none: Homey records each change of a boolean log as an event',
+      window: { from: this._localIso(from), to: this._localIso(to) },
+      stateAtStart: stateAtStart === null ? 'unknown' : stateAtStart,
+      transitionCount: transitions.length,
+      timeTrue: this._duration(trueMs),
+      percentTrue: knownMs ? Math.round(trueMs / knownMs * 1000) / 10 : null,
+    });
+    if (log.titleTrue || log.titleFalse) result.states = { true: log.titleTrue, false: log.titleFalse };
+    if (current === true && !until) result.stillTrue = 'True at the end of the window, so timeTrue includes time up to now.';
+
+    if (stateAtStart === null) {
+      const heldFrom = events.length ? this._localIso(events[0].t) : null;
+      result.beforeRetention = heldFrom
+        ? 'Homey holds ' + events.length + ' events for this log, going back only to ' + heldFrom
+          + ', which is after the start of the window. The state before that is unknown, so '
+          + 'timeTrue and percentTrue cover only ' + this._duration(knownMs) + ' of the window.'
+        : 'Homey holds no events for this log.';
+    }
+
+    let shown = transitions;
+    if (transitions.length > maxPoints) {
+      shown = transitions.slice(-maxPoints);
+      result.truncated = transitions.length + ' transitions; the newest ' + maxPoints + ' are returned.';
+    }
+    result.transitions = shown.map(change => {
+      const row = [this._localIso(change.t), change.v];
+      if (change.by) row.push(change.by);
+      return row;
+    });
+    if (shown.length && shown.some(change => change.by)) {
+      result.transitionFormat = '[time, new state, what caused it]';
+    }
+    return result;
   }
 
   // ─── Flow summaries and search ───────────────────────────────────────────────

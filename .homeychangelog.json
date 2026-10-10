@@ -25,5 +25,8 @@
   },
   "1.0.8": {
     "en": "Extended list_devices"
+  },
+  "1.0.9": {
+    "en": "Added Insights history for the AI assistant: list_insights finds the logs Homey keeps for devices and Logic variables, and get_insights returns one log's history over a chosen window, with a summary for number logs and transitions with their cause for on/off logs. Read-only."
   }
 }
