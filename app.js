@@ -111,6 +111,11 @@ const NOTE_ATTACH_DISTANCE = 240;
 // 517 are within 20px of two cards; those are genuine ties and guessing
 // between them is worse than leaving the note at flow level.
 const NOTE_ATTACH_MARGIN = 20;
+// A note at the left margin is read as a section heading — by the summary, by
+// copy_cards and by the person looking at the canvas — so a note about one
+// card that sits in the margin is indented off it by this much. A fifth of a
+// card is enough to read as deliberate and close enough to stay that card's.
+const NOTE_INLINE_INDENT = 40;
 
 const CARD_TYPES = new Set(['trigger', 'condition', 'action', 'all', 'any', 'delay', 'note', 'start']);
 const CARD_OUTPUTS = ['outputTrue', 'outputFalse', 'outputSuccess', 'outputError'];
@@ -894,14 +899,20 @@ class HomeyDocsCompanion extends Homey.App {
   // exactly as written, and only the count of writes folded into it goes up —
   // so it holds the state from before the run of edits began, which is the
   // state anyone reverting a run of edits actually wants.
-  async _saveRevision(flowId, flow) {
+  //
+  // A layout write is the exception, on both sides: it never joins the run
+  // before it, and nothing joins it afterwards. Folded in, it could only be
+  // undone together with whatever functional edits shared its window — which
+  // is how undoing a relayout once also undid a trigger added and one removed.
+  async _saveRevision(flowId, flow, options) {
+    const layout = !!(options && options.layout);
     const dir = path.join(REVISION_DIR, flowId);
     const key = this._revisionKey(flowId);
     const index = this.homey.settings.get(key) || [];
     const nowMs = Date.now();
     const newest = index[0];
 
-    if (newest && !newest.daily
+    if (newest && !newest.daily && !newest.layout && !layout
         && (nowMs - new Date(newest.ts).getTime()) < REVISION_MERGE_WINDOW_MS) {
       newest.writes = (newest.writes || 1) + 1;
       newest.lastWriteAt = new Date(nowMs).toISOString();
@@ -911,13 +922,19 @@ class HomeyDocsCompanion extends Homey.App {
 
     await fs.promises.mkdir(dir, { recursive: true });
     const now = new Date(nowMs).toISOString();
-    const file = now.replace(/[:.]/g, '-') + '.json';
+    let file = now.replace(/[:.]/g, '-') + '.json';
+    // Two revisions in the same millisecond would share a file, and the second
+    // would silently replace the first
+    if (index.some(entry => entry.file === file)) {
+      file = file.replace(/\.json$/, '-' + crypto.randomUUID().slice(0, 8) + '.json');
+    }
     await fs.promises.writeFile(path.join(dir, file), JSON.stringify(flow), 'utf8');
 
     index.unshift({
       file, ts: now, name: flow.name,
       cards: Object.keys(flow.cards || {}).length,
       writes: 1,
+      layout: layout || undefined,
     });
     await this._pruneRevisions(flowId, index);
     this.homey.settings.set(key, index);
@@ -998,8 +1015,9 @@ class HomeyDocsCompanion extends Homey.App {
       mergeWindowSeconds: Math.round(REVISION_MERGE_WINDOW_MS / 1000),
       note: 'Writes less than ' + Math.round(REVISION_MERGE_WINDOW_MS / 60000) + ' minutes apart '
         + 'share a revision, which holds the state from before the first of them. `writes` says '
-        + 'how many are folded into each. Entries marked daily are kept as one-per-day archives '
-        + 'beyond the depth cap.',
+        + 'how many are folded into each. A relayout always has a revision of its own, marked '
+        + 'layout, so reverting it undoes the layout and nothing else. Entries marked daily are '
+        + 'kept as one-per-day archives beyond the depth cap.',
       revisions: index.map((entry, position) => ({
         revision: position + 1,
         savedAt: entry.ts,
@@ -1007,6 +1025,7 @@ class HomeyDocsCompanion extends Homey.App {
         cards: entry.cards,
         writes: entry.writes || 1,
         lastWriteAt: entry.lastWriteAt || entry.ts,
+        layout: entry.layout || undefined,
         daily: entry.daily || undefined,
       }))
     };
@@ -1478,10 +1497,13 @@ class HomeyDocsCompanion extends Homey.App {
     }
 
     const draft = JSON.parse(JSON.stringify(flow));
+    // What the edit turned out to be. A mutation that repositions cards says
+    // so here, because whether it will is often only known once it has run.
+    const write = { layout: !!options.layout };
     let outcome;
     phase.name = 'applying the edit';
     try {
-      outcome = await mutate(draft);
+      outcome = await mutate(draft, write);
     } catch (e) {
       return { error: 'Edit failed: ' + e.message };
     }
@@ -1511,7 +1533,7 @@ class HomeyDocsCompanion extends Homey.App {
     // down the stack — so a revert after a failed call restored the state the
     // failure had left, not the state before the last real change.
     phase.name = 'saving a revision';
-    const revision = await this._saveRevision(flowId, flow);
+    const revision = await this._saveRevision(flowId, flow, { layout: write.layout });
 
     const body = {};
     for (const field of ADVANCED_FLOW_WRITABLE) {
@@ -1542,6 +1564,10 @@ class HomeyDocsCompanion extends Homey.App {
       wrote: true,
       revisionSaved: revision.ts,
       revisionMergedWrites: revision.writes > 1 ? revision.writes : undefined,
+      revisionIsLayoutOnly: write.layout
+        ? 'This call laid the flow out again, so it has a revision of its own: revert_flow with '
+          + 'revision 1 undoes this call and nothing written before it.'
+        : undefined,
       tookMs: Date.now() - startedMs,
       revertWith: 'revert_flow'
     }, outcome || {});
@@ -1733,7 +1759,7 @@ class HomeyDocsCompanion extends Homey.App {
       }
     }
 
-    return this._mutateAdvancedFlow(flowId, 'added a ' + card.type + ' card', draft => {
+    return this._mutateAdvancedFlow(flowId, 'added a ' + card.type + ' card', (draft, write) => {
       const newCard = Object.assign({}, card);
       const cardId = crypto.randomUUID();
       const existing = Object.values(draft.cards);
@@ -1757,41 +1783,64 @@ class HomeyDocsCompanion extends Homey.App {
         anchorId = anchor.cardId;
       }
 
-      if (isNote && typeof newCard.x !== 'number') {
+      // The margin is where section headings live: the summary, copy_cards'
+      // sectionNoteId and the person reading the canvas all take a note there
+      // to head the cards beneath it. Only a flow-level yellow note is placed
+      // there. A note given a card to sit beside is about that card, and in
+      // the margin it would quietly become a heading instead.
+      const positioned = existing.filter(c => c && c.type !== 'note');
+      const leftEdge = positioned.length
+        ? Math.min.apply(null, positioned.map(c => c.x || 0)) : 0;
+      const mayHead = isNote && !anchorId && newCard.color === 'yellow';
+
+      // How a note at a given spot will be read, by the one shared rule
+      const readingAt = (x, y) => {
+        draft.cards[cardId] = Object.assign({}, newCard, { x, y });
+        const { attached, headings } = this._noteAttachments(draft.cards);
+        delete draft.cards[cardId];
+        return { heading: headings.has(cardId), labels: attached[cardId] || null };
+      };
+
+      if (isNote && typeof newCard.x === 'number') {
+        // Placed by the caller. Honoured as given, with one exception: a
+        // coloured note in the margin would read as a heading, and headings
+        // are yellow.
+        if (typeof newCard.y !== 'number') return { error: 'x and y go together — pass both, or neither to have the note placed beside nearCardId' };
+        if (newCard.color !== 'yellow' && newCard.x <= leftEdge) {
+          return { error: 'x ' + newCard.x + ' is in the left margin (x ≤ ' + leftEdge + '), where a '
+            + 'note is read as a section heading, and only yellow notes are headings. Nothing was '
+            + 'written. Use an x greater than ' + leftEdge + ', or make it yellow if it is meant '
+            + 'to head a section.' };
+        }
+      } else if (isNote) {
         const anchor = anchorId ? draft.cards[anchorId] : null;
         const height = this._noteHeight(newCard);
         const clearance = height + NOTE_GAP_ABOVE;
-        const column = anchor ? (anchor.x || 0) : 0;
+        const anchorX = anchor ? (anchor.x || 0) : leftEdge;
+        const column = (mayHead || anchorX > leftEdge) ? anchorX : anchorX + NOTE_INLINE_INDENT;
         const base = anchor ? (anchor.y || 0)
           : (existing.length ? Math.min.apply(null, existing.map(c => c.y || 0)) : 0);
 
-        // Clear of every card already placed, and below the canvas controls
-        const free = y => y >= CANVAS_TOP_MARGIN && !existing.some(card => {
+        const overlapping = y => existing.filter(card => {
           if (Math.abs((card.x || 0) - column) >= CARD_GAP_X) return false;
           const top = card.y || 0;
           return y < top + this._siblingGapBelow(card) && top < y + height;
         });
+        // Clear of every card already placed, and below the canvas controls
+        const free = y => y >= CANVAS_TOP_MARGIN && !overlapping(y).length;
 
         // A note is read as belonging to whichever card it is nearest — that is
         // how get_flow_summary attributes it, and how a person reads the canvas.
-        // So a position is only good if the anchor is what it lands nearest to.
-        // Placing it merely somewhere clear is not enough: in a dense flow the
-        // gap above a card can be closer to its neighbour than to the card the
-        // note is about, and the note then reads as annotating the wrong thing.
-        const anchorIsNearest = y => {
-          if (!anchorId) return true;
-          const noteCentreX = column + (NOTE_WIDTH_ESTIMATE / 2);
-          const noteCentreY = y + (height / 2);
-          let nearest = null;
-          let nearestDistance = Infinity;
-          for (const [otherId, other] of Object.entries(draft.cards)) {
-            if (!other || other.type === 'note') continue;
-            const dx = ((other.x || 0) + (CARD_WIDTH_ESTIMATE / 2)) - noteCentreX;
-            const dy = ((other.y || 0) + (this._siblingGapBelow(other) / 2)) - noteCentreY;
-            const distance = Math.sqrt((dx * dx) + (dy * dy));
-            if (distance < nearestDistance) { nearestDistance = distance; nearest = otherId; }
-          }
-          return nearest === anchorId && nearestDistance <= NOTE_ATTACH_DISTANCE;
+        // So a position is only good if it reads as the anchor's note, and not
+        // as a heading. Placing it merely somewhere clear is not enough: in a
+        // dense flow the gap above a card can be closer to its neighbour than
+        // to the card the note is about, and the note then reads as annotating
+        // the wrong thing.
+        const readsRight = y => {
+          if (mayHead) return true;
+          const reading = readingAt(column, y);
+          if (reading.heading) return false;
+          return !anchorId || reading.labels === anchorId;
         };
 
         // Above the card it labels reads best, below is the next choice, and
@@ -1803,16 +1852,42 @@ class HomeyDocsCompanion extends Homey.App {
           candidates.push(base + below + (step * (height + NOTE_GAP_ABOVE)));
         }
 
-        let chosen = candidates.find(y => free(y) && anchorIsNearest(y));
-        if (chosen === undefined) {
-          // Nowhere both clear and unambiguous: the flow is packed tightly
-          // enough that every gap beside the anchor reads as belonging to a
-          // neighbour. Put the note somewhere clear for now and mark it to be
-          // laid out again below — this time with the anchor stated outright,
-          // so the packing can open a gap for it rather than squeeze it in.
+        let chosen = candidates.find(y => free(y) && readsRight(y));
+        if (chosen === undefined && opts.allowRelayout && anchorId) {
+          // Asked for: put it somewhere clear for now and lay the flow out
+          // again below, with the anchor stated outright, so the packing can
+          // open a gap for it rather than squeeze it in.
           chosen = candidates.find(free);
           if (chosen === undefined) chosen = Math.max(base - clearance, CANVAS_TOP_MARGIN);
           needsRoom = true;
+        } else if (chosen === undefined) {
+          // Nowhere both clear and unambiguous. Moving the rest of the flow to
+          // make room is not this tool's call to make — the flow may have been
+          // arranged by hand — so the note goes where it reads as the anchor's
+          // even if that covers part of another card. An overlap is plain to
+          // see and fixed with one drag; a note in clear space beside the
+          // wrong card reads as being about that card, and nothing says so.
+          chosen = candidates.find(y => y >= CANVAS_TOP_MARGIN && readsRight(y));
+          if (chosen === undefined) {
+            return { error: 'There is no spot beside that card where the note would read as '
+              + 'belonging to it, even overlapping its neighbours, so nothing was written and '
+              + 'nothing was moved. Options: pass x and y to place it yourself; pass '
+              + 'allowRelayout: true to let the whole flow be laid out again to open a gap '
+              + '(every card may move); or add it without nearCardId and drag it into place.' };
+          }
+          const covered = overlapping(chosen);
+          if (covered.length) {
+            const titles = this._cardTitles || { any: {} };
+            result.placement = 'There was no clear gap beside that card, so the note has been '
+              + 'placed where it still reads as that card\'s, partly covering '
+              + covered.slice(0, 3).map(card => (card.type === 'note'
+                ? 'the note "' + String(card.value).replace(/\s+/g, ' ').trim().slice(0, 40) + '"'
+                : this._cardLabel(card, titles))).join('; ')
+              + (covered.length > 3 ? ' and ' + (covered.length - 3) + ' more' : '')
+              + '. No other card was moved. Drag it clear in the editor, or call again with x '
+              + 'and y, or with allowRelayout: true to lay the whole flow out again.';
+            result.overlapsCards = covered.length;
+          }
         }
         newCard.x = column;
         newCard.y = chosen;
@@ -1854,13 +1929,20 @@ class HomeyDocsCompanion extends Homey.App {
 
       draft.cards[cardId] = newCard;
 
-      // Make room. The anchor is passed in explicitly: inferring it from where
-      // the note sits would read back the very position that was the problem.
-      if (needsRoom && anchorId) {
-        this._layoutCards(draft.cards, { [cardId]: anchorId });
+      // Make room — only ever because the caller asked to. The anchor is
+      // passed in explicitly: inferring it from where the note sits would read
+      // back the very position that was the problem.
+      if (needsRoom) {
+        const laidOut = this._layoutCards(draft.cards, { [cardId]: anchorId });
+        if (laidOut && laidOut.error) return laidOut;
+        write.layout = true;
         result.relaidOut = 'There was no gap beside that card wide enough for the note to '
-          + 'read as belonging to it, so the flow has been laid out again to open one. '
-          + 'Other cards will have moved.';
+          + 'read as belonging to it, and allowRelayout was set, so the flow has been laid out '
+          + 'again to open one. Other cards will have moved.';
+        result.cardsRepositioned = laidOut.cardsRepositioned;
+        result.notesMisplaced = laidOut.notesMisplaced;
+        result.misplacedNotes = laidOut.misplacedNotes;
+        result.misplacedNotesAdvice = laidOut.misplacedNotesAdvice;
       }
 
       let linked = null;
@@ -1874,6 +1956,20 @@ class HomeyDocsCompanion extends Homey.App {
       result.addedCardId = cardId;
       result.position = { x: newCard.x, y: newCard.y };
       result.linkedFrom = linked;
+
+      // Say how the note will be read, so a caller can see it landed on the
+      // right card without fetching the summary to check
+      if (isNote) {
+        const { attached, headings } = this._noteAttachments(draft.cards);
+        const labels = attached[cardId];
+        result.readsAs = headings.has(cardId) ? 'a section heading, at the left margin'
+          : labels ? 'a note on ' + this._cardLabel(draft.cards[labels], this._cardTitles || { any: {} })
+            : 'a flow-level note — it is not clearly nearest any one card';
+        if (anchorId && labels !== anchorId) {
+          result.readsAsWarning = 'This note does not read as belonging to the card it was placed '
+            + 'beside. Drag it in the editor, or remove it and add it again with x and y.';
+        }
+      }
 
       // A note's position is the only record of what it labels — Homey stores
       // no anchor — so it can only be placed against where its anchor sits
@@ -1945,9 +2041,9 @@ class HomeyDocsCompanion extends Homey.App {
     for (const [noteId, cardId] of Object.entries(placement)) {
       // A heading names the section beneath it; any other note sits on
       // whichever side of its card it is already on.
-      const above = headings.has(noteId)
-        || (cards[noteId].y || 0) < (cards[cardId].y || 0);
-      anchors[noteId] = { anchor: cardId, dx: 0, dy: above ? -1 : 1 };
+      const heading = headings.has(noteId);
+      const above = heading || (cards[noteId].y || 0) < (cards[cardId].y || 0);
+      anchors[noteId] = { anchor: cardId, dx: 0, dy: above ? -1 : 1, heading };
     }
     return anchors;
   }
@@ -2341,6 +2437,18 @@ class HomeyDocsCompanion extends Homey.App {
     return wrong;
   }
 
+  // Which cards each section heading heads: noteId → Set of card ids, empty
+  // for a heading with nothing beneath it. The same reading copy_cards uses.
+  _headingSections(cards) {
+    const { headings } = this._noteAttachments(cards);
+    const sections = new Map();
+    for (const noteId of headings) {
+      const section = this._sectionOf(cards, noteId);
+      sections.set(noteId, section.ids || new Set());
+    }
+    return sections;
+  }
+
   // Lay out a flow's cards. knownAnchors maps a note id to the card it belongs
   // to, for callers that know the association rather than having to guess it
   // from where the note currently sits.
@@ -2362,6 +2470,7 @@ class HomeyDocsCompanion extends Homey.App {
     if (!ids.length) return { error: 'this flow has no cards to lay out' };
 
     const before = this._copyPositions(cards);
+    const sectionsBefore = this._headingSections(cards);
     const key = state => JSON.stringify(Object.keys(state).sort()
       .map(id => [id, state[id].x, state[id].y]));
     const anchorsFor = state => {
@@ -2371,7 +2480,7 @@ class HomeyDocsCompanion extends Homey.App {
         // note's position cannot repair a note that is already misplaced,
         // because it reads the same position that misplaced it.
         if (state[noteId] && state[anchorId]) {
-          anchors[noteId] = { anchor: anchorId, dx: 0, dy: -1 };
+          anchors[noteId] = { anchor: anchorId, dx: 0, dy: -1, heading: false };
         }
       }
       return anchors;
@@ -2450,28 +2559,78 @@ class HomeyDocsCompanion extends Homey.App {
     // Name them. A count on its own leaves the reader to find the stray note by
     // eye across a canvas that has just moved wholesale, which is the one moment
     // it is hardest to do.
-    const misplaced = best.astray.map(entry => {
-      const note = cards[entry.noteId];
-      const landedOn = entry.landedOn ? cards[entry.landedOn] : null;
+    const titles = this._cardTitles || { any: {} };
+    const describe = (noteId, wanted, landedOnId) => {
+      const note = cards[noteId];
       return {
-        noteId: entry.noteId,
+        noteId,
         text: String((note && note.value) || '').replace(/\s+/g, ' ').trim(),
         colour: (note && note.color) || null,
-        wasBeside: entry.wanted,
-        nowReadsAsLabelling: entry.landedOn
-          ? this._cardLabel(landedOn, this._cardTitles || {})
+        wasBeside: wanted || null,
+        nowReadsAsLabelling: landedOnId
+          ? this._cardLabel(cards[landedOnId], titles)
           : 'nothing — it is too far from any card, so it now reads as a flow-level note',
       };
-    });
+    };
+    const misplaced = best.astray.map(entry => describe(entry.noteId, entry.wanted, entry.landedOn));
+
+    // A heading can keep its nearest card and still head different cards: a
+    // section is the band between one heading and the next, so cards moving
+    // between bands, or two headings ending up stacked, change what every
+    // section contains without any single note looking out of place. Compared
+    // by membership, as copy_cards' sectionNoteId would read it.
+    const sectionsAfter = this._headingSections(cards);
+    const { attached: attachedAfter } = this._noteAttachments(cards);
+    const byNote = new Map(misplaced.map(entry => [entry.noteId, entry]));
+    const name = id => this._cardLabel(cards[id], titles);
+    for (const [noteId, was] of sectionsBefore) {
+      if (!was.size || !cards[noteId]) continue;
+      const now = sectionsAfter.get(noteId);
+      const lost = now ? Array.from(was).filter(id => !now.has(id)) : Array.from(was);
+      const gained = now ? Array.from(now).filter(id => !was.has(id)) : [];
+      if (now && !lost.length && !gained.length) continue;
+
+      let entry = byNote.get(noteId);
+      if (!entry) {
+        entry = describe(noteId, original[noteId] && original[noteId].anchor, attachedAfter[noteId]);
+        byNote.set(noteId, entry);
+        misplaced.push(entry);
+      }
+      entry.section = {
+        cardsBefore: was.size,
+        cardsNow: now ? now.size : 0,
+        noLongerAHeading: now ? undefined : true,
+        lost: lost.length ? lost.slice(0, 6).map(name) : undefined,
+        lostCount: lost.length > 6 ? lost.length : undefined,
+        gained: gained.length ? gained.slice(0, 6).map(name) : undefined,
+        gainedCount: gained.length > 6 ? gained.length : undefined,
+      };
+    }
+    // And the other way round: a note about one card that has ended up in the
+    // margin, where it now reads as heading whatever lies beneath it
+    for (const [noteId, now] of sectionsAfter) {
+      if (sectionsBefore.has(noteId)) continue;
+      let entry = byNote.get(noteId);
+      if (!entry) {
+        entry = describe(noteId, original[noteId] && original[noteId].anchor, attachedAfter[noteId]);
+        byNote.set(noteId, entry);
+        misplaced.push(entry);
+      }
+      entry.section = { cardsBefore: 0, cardsNow: now.size, becameAHeading: true };
+    }
 
     return Object.assign({
       independentBehaviours: null, widestBehaviour: null, notesMoved: null,
     }, best.result, { cardsRepositioned: moved, notesMisplaced: misplaced.length,
       misplacedNotes: misplaced.length ? misplaced : undefined,
       misplacedNotesAdvice: misplaced.length
-        ? 'Each of these now sits nearest a different card than before, so get_flow_summary '
-          + 'will show it under that one. Move or re-add them with add_flow_note, naming the '
-          + 'card each belongs to.'
+        ? 'Each of these now reads differently than before. One without `section` sits nearest '
+          + 'a different card, so get_flow_summary will show it under that one. One with '
+          + '`section` is a heading that now heads a different set of cards — or none, if '
+          + 'noLongerAHeading, or a note that has landed in the margin and become one, if '
+          + 'becameAHeading — so the summary and copy_cards\' sectionNoteId read that part of '
+          + 'the flow differently. Move them by hand, or undo the layout with revert_flow: a '
+          + 'relayout has a revision of its own.'
         : undefined,
       arrangementsTried: seen.size });
   }
@@ -2567,6 +2726,15 @@ class HomeyDocsCompanion extends Homey.App {
     // Drop each note into the space held for it, stacking where a card has
     // more than one. Its position is then guaranteed to be the gap belonging
     // to that card, which is what makes it read as annotating it.
+    //
+    // A note about one card that belongs to a card in the margin is indented
+    // off it. Lined up with the card it would be in the margin too, and read
+    // from then on as heading a section.
+    const noteX = (noteId, target) => {
+      const x = target.x || 0;
+      const heading = noteAnchors[noteId] && noteAnchors[noteId].heading;
+      return (!heading && x <= originX) ? x + NOTE_INLINE_INDENT : x;
+    };
     for (const [cardId, slot] of Object.entries(reserve)) {
       const target = cards[cardId];
       if (!target) continue;
@@ -2574,13 +2742,13 @@ class HomeyDocsCompanion extends Homey.App {
       let y = (target.y || 0) - NOTE_ATTACH_GAP;
       for (const noteId of slot.aboveNotes.slice().reverse()) {
         y -= this._noteHeight(cards[noteId]);
-        cards[noteId].x = target.x || 0;
+        cards[noteId].x = noteX(noteId, target);
         cards[noteId].y = y;
         y -= NOTE_ATTACH_GAP;
       }
       let below = (target.y || 0) + this._siblingGapBelow(target) + NOTE_ATTACH_GAP;
       for (const noteId of slot.belowNotes) {
-        cards[noteId].x = target.x || 0;
+        cards[noteId].x = noteX(noteId, target);
         cards[noteId].y = below;
         below += this._noteHeight(cards[noteId]) + NOTE_ATTACH_GAP;
       }
@@ -2602,7 +2770,7 @@ class HomeyDocsCompanion extends Homey.App {
 
   async relayoutFlow(flowId) {
     return this._mutateAdvancedFlow(flowId, 'repositioned the cards',
-      draft => this._layoutCards(draft.cards));
+      draft => this._layoutCards(draft.cards), { layout: true });
   }
 
   async createAdvancedFlow(name, folder, options) {
@@ -2680,13 +2848,19 @@ class HomeyDocsCompanion extends Homey.App {
     });
   }
 
-  async addFlowNote(flowId, text, nearCardId, colour) {
+  async addFlowNote(flowId, text, nearCardId, colour, options) {
+    const opts = options || {};
     if (!text || !String(text).trim()) return { error: 'text is required — a note with no words says nothing' };
-    return this.addCard(flowId, {
-      type: 'note',
-      value: String(text).trim(),
-      color: colour || 'yellow',
-    }, nearCardId);
+    const given = ['x', 'y'].filter(axis => opts[axis] !== undefined && opts[axis] !== null);
+    if (given.length === 1) return { error: 'x and y go together — pass both, or neither to have the note placed for you' };
+    if (given.some(axis => typeof opts[axis] !== 'number' || !Number.isFinite(opts[axis]))) {
+      return { error: 'x and y must be numbers (canvas coordinates, as get_advanced_flow shows them)' };
+    }
+    const note = { type: 'note', value: String(text).trim(), color: colour || 'yellow' };
+    if (given.length) { note.x = Math.round(opts.x); note.y = Math.round(opts.y); }
+    return this.addCard(flowId, note, nearCardId, {
+      allowRelayout: opts.allowRelayout === true, requestId: opts.requestId,
+    });
   }
 
   async updateFlowNote(flowId, noteCardId, text) {
@@ -3206,7 +3380,7 @@ class HomeyDocsCompanion extends Homey.App {
     for (const ref of refs.keys()) newIds.set(ref, crypto.randomUUID());
 
     return this._mutateAdvancedFlow(flowId,
-      'added ' + cards.length + ' card(s) and ' + links.length + ' connection(s)', draft => {
+      'added ' + cards.length + ' card(s) and ' + links.length + ' connection(s)', (draft, write) => {
         const resolve = given => {
           if (newIds.has(given)) return { cardId: newIds.get(given) };
           const found = this._resolveCardId(draft.cards, given);
@@ -3329,7 +3503,15 @@ class HomeyDocsCompanion extends Homey.App {
         }
         if (opts.relayout) {
           const laidOut = this._layoutCards(draft.cards);
-          if (laidOut && !laidOut.error) result.relayout = laidOut;
+          if (laidOut && !laidOut.error) {
+            write.layout = true;
+            result.relayout = laidOut;
+            // At the top level as well, where relayout_flow reports them, so
+            // a stray note is not missed for being one level down
+            result.notesMisplaced = laidOut.notesMisplaced;
+            result.misplacedNotes = laidOut.misplacedNotes;
+            result.misplacedNotesAdvice = laidOut.misplacedNotesAdvice;
+          }
         } else {
           result.layoutNote = 'Cards were placed below the existing flow in the order the batch '
             + 'implies. Run relayout_flow to tidy the whole canvas.';

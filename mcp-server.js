@@ -207,7 +207,9 @@ const TOOLS = [
   },
   {
     name: 'add_flow_note',
-    description: 'Write a note onto a flow\'s canvas. Notes are where an explanation belongs: say WHY a section is built as it is, not what it does — the summary already shows the wiring, and a note restating it goes stale the moment anything is rewired. Keep it short. Pass nearCardId to place it beside a particular card; add notes after relayout_flow, not before.',
+    description: 'Write a note onto a flow\'s canvas. Notes are where an explanation belongs: say WHY a section is built as it is, not what it does — the summary already shows the wiring, and a note restating it goes stale the moment anything is rewired. Keep it short. '
+      + 'This never moves an existing card or note unless allowRelayout is set. Pass nearCardId to place it beside a particular card: it goes in the nearest clear gap where it reads as that card\'s note, and if there is none it goes where it still reads as that card\'s, partly covering a neighbour, and the result says so (`placement`) — drag it clear, or call again with x and y. `readsAs` says which card the note will be read as labelling. '
+      + 'A note at the left margin is read as a section heading, so a note given nearCardId is always placed to the right of the margin, and only a yellow note may be in the margin at all. To add a section heading, use yellow and either omit nearCardId (it goes at the top) or pass x at the margin and y above the section. Add notes after relayout_flow, not before.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -215,6 +217,9 @@ const TOOLS = [
         text: { type: 'string', description: 'The note text. Short, and about intent rather than mechanism.' },
         nearCardId: { type: 'string', description: 'Card to place the note beside. Omit for a flow-level note.' },
         color: { type: 'string', enum: ['yellow', 'blue', 'green', 'red'], description: 'Default yellow. Red conventionally means "change this soon".' },
+        x: { type: 'number', description: 'Place the note exactly here instead (canvas coordinates, as get_advanced_flow shows them). Pass with y. A non-yellow note is refused in the left margin, where it would read as a heading.' },
+        y: { type: 'number', description: 'Pass with x.' },
+        allowRelayout: { type: 'boolean', description: 'Default false. When there is no clear gap beside nearCardId, lay the whole flow out again to open one. Every card may move, so leave it off for a flow arranged by hand. The relayout gets a revision of its own, and the result lists any note or section heading that now reads differently (notesMisplaced, misplacedNotes).' },
       },
       required: ['flowId', 'text'],
     },
@@ -309,7 +314,8 @@ const TOOLS = [
     name: 'add_card',
     description: 'Add ONE card to an advanced flow. Pass `after` to place and connect it '
       + 'downstream of an existing card; otherwise it is placed below the flow, unconnected. '
-      + 'Coordinates are chosen automatically so cards do not overlap. For more than two or '
+      + 'Coordinates are chosen automatically so cards do not overlap. Existing cards are never '
+      + 'moved unless allowRelayout is set. For more than two or '
       + 'three cards use apply_cards instead, which does the whole batch in one write and one '
       + 'revision — a flow built a card at a time costs a round trip each and a revision each.',
     inputSchema: {
@@ -330,6 +336,11 @@ const TOOLS = [
             + 'type: trigger, delay, all, any, start — outputSuccess only; condition — '
             + 'outputTrue, outputFalse, outputError; action — outputSuccess, outputError. '
             + 'Notes have none and are never connected.',
+        },
+        allowRelayout: {
+          type: 'boolean',
+          description: 'Notes only. Default false. As add_flow_note: when there is no clear gap '
+            + 'beside `after`, lay the whole flow out again to open one, in a revision of its own.',
         },
         requestId: {
           type: 'string',
@@ -379,7 +390,8 @@ const TOOLS = [
           type: 'boolean',
           description: 'Lay the whole flow out afterwards, in the same write. Worth it when the '
             + 'batch builds a flow; it moves existing cards too, so leave it off when adding to '
-            + 'a flow someone has arranged by hand.',
+            + 'a flow someone has arranged by hand. The write then gets a revision of its own, '
+            + 'and notesMisplaced / misplacedNotes list any note or heading that reads differently.',
         },
         requestId: {
           type: 'string',
@@ -477,13 +489,13 @@ const TOOLS = [
   },
   {
     name: 'relayout_flow',
-    description: 'Reposition every card in an advanced flow onto a tidy grid, following the spacing the rest of this Homey uses. Cards keep their connections and arguments; only coordinates change. Canvas notes move too, into space held for them beside the card each one annotates — which card that is comes from where the note currently sits, so a note that is already beside the wrong card stays with it. Running this twice changes nothing the second time.',
+    description: 'Reposition every card in an advanced flow onto a tidy grid, following the spacing the rest of this Homey uses. Cards keep their connections and arguments; only coordinates change. Canvas notes move too, into space held for them beside the card each one annotates — which card that is comes from where the note currently sits, so a note that is already beside the wrong card stays with it. It settles quickly: a second run usually changes nothing, and occasionally nudges a few cards once more, after which further runs change nothing. The result names every note that now reads differently (notesMisplaced, misplacedNotes): one now nearest a different card, and any section heading whose section gained or lost cards. A relayout always gets a revision of its own, so revert_flow undoes it without undoing edits made just before.',
     inputSchema: {
       type: 'object',
       properties: { flowId: { type: 'string' } },
       required: ['flowId'],
     },
-    annotations: { readOnlyHint: false, idempotentHint: true },
+    annotations: { readOnlyHint: false },
   },
   {
     name: 'create_advanced_flow',
@@ -1227,7 +1239,9 @@ class HomeyMcpServer {
         }
 
         case 'add_flow_note':
-          return this._text(await app.addFlowNote(args.flowId, args.text, args.nearCardId, args.color));
+          return this._text(await app.addFlowNote(args.flowId, args.text, args.nearCardId, args.color, {
+            x: args.x, y: args.y, allowRelayout: args.allowRelayout,
+          }));
 
         case 'update_flow_note':
           return this._text(await app.updateFlowNote(args.flowId, args.noteCardId, args.text));
@@ -1267,7 +1281,7 @@ class HomeyMcpServer {
 
         case 'add_card':
           return this._text(await app.addCard(args.flowId, args.card, args.after, {
-            output: args.output, requestId: args.requestId,
+            output: args.output, allowRelayout: args.allowRelayout === true, requestId: args.requestId,
           }));
 
         case 'remove_card':
